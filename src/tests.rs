@@ -905,3 +905,225 @@ fn ui_renders_fan_out_with_independent_per_output_codecs() {
     let tag_count = screen.matches("[x265]").count();
     assert_eq!(tag_count, 1, "exactly one mapped line (out2's) should carry the x265 tag:\n{screen}");
 }
+
+/// Sets up an isolated temp directory with known contents (two matching
+/// files, one non-matching, a subdirectory, and a hidden file) so
+/// path_suggestions' listing/filtering logic can be checked deterministically,
+/// independent of whatever the test runner's actual cwd happens to contain.
+fn make_suggestion_fixture() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tff-test-suggest-{}-{:?}", std::process::id(), std::thread::current().id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("subdir")).unwrap();
+    std::fs::write(dir.join("alpha.mp4"), b"").unwrap();
+    std::fs::write(dir.join("alpha2.txt"), b"").unwrap();
+    std::fs::write(dir.join("beta.mkv"), b"").unwrap();
+    std::fs::write(dir.join(".hidden"), b"").unwrap();
+    dir
+}
+
+/// Listing a directory (trailing slash, empty prefix) should return every
+/// visible entry sorted alphabetically, directories marked with a trailing
+/// slash, and dotfiles hidden by default.
+#[test]
+fn path_suggestions_lists_directory_sorted_with_dirs_marked() {
+    use crate::app::path_suggestions;
+
+    let dir = make_suggestion_fixture();
+    let prefix = format!("{}/", dir.display());
+    let results = path_suggestions(&prefix);
+
+    let expected = vec![
+        format!("{prefix}alpha.mp4"),
+        format!("{prefix}alpha2.txt"),
+        format!("{prefix}beta.mkv"),
+        format!("{prefix}subdir/"),
+    ];
+    assert_eq!(results, expected);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Typing a prefix after the last '/' should filter to matching names only,
+/// still returning the full path (not just the matched suffix) so it can
+/// be used directly as the new buffer value.
+#[test]
+fn path_suggestions_filters_by_prefix_after_last_slash() {
+    use crate::app::path_suggestions;
+
+    let dir = make_suggestion_fixture();
+    let query = format!("{}/al", dir.display());
+    let results = path_suggestions(&query);
+
+    assert_eq!(results, vec![format!("{}/alpha.mp4", dir.display()), format!("{}/alpha2.txt", dir.display())]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dotfiles should stay hidden unless the user is already typing a
+/// dot-prefix, matching familiar shell-completion behavior.
+#[test]
+fn path_suggestions_hides_dotfiles_unless_prefix_starts_with_dot() {
+    use crate::app::path_suggestions;
+
+    let dir = make_suggestion_fixture();
+
+    let plain = path_suggestions(&format!("{}/", dir.display()));
+    assert!(!plain.iter().any(|s| s.ends_with(".hidden")), "dotfile should be hidden by default: {plain:?}");
+
+    let dotted = path_suggestions(&format!("{}/.", dir.display()));
+    assert!(dotted.iter().any(|s| s.ends_with(".hidden")), "dotfile should show once typing a dot: {dotted:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory that doesn't exist (or isn't readable) should produce no
+/// suggestions rather than panicking -- the user might just be mid-typo.
+#[test]
+fn path_suggestions_returns_empty_for_nonexistent_directory() {
+    use crate::app::path_suggestions;
+
+    let results = path_suggestions("/this/path/does/not/exist/on/this/machine/");
+    assert!(results.is_empty());
+}
+
+/// Tab should replace the buffer with the highlighted suggestion and, when
+/// that suggestion is a directory, immediately populate suggestions for its
+/// contents -- so completion can drill down one level at a time.
+#[test]
+fn text_input_accept_suggestion_drills_into_directories() {
+    use crate::app::{App, Mode};
+
+    let dir = make_suggestion_fixture();
+    let mut app = App::new();
+    app.start_add_input();
+    let Mode::TextInput { buffer, suggestions, selected, .. } = &mut app.mode else {
+        panic!("expected text input mode");
+    };
+    *buffer = format!("{}/", dir.display());
+    *suggestions = crate::app::path_suggestions(buffer);
+    *selected = suggestions.iter().position(|s| s.ends_with("subdir/")).expect("subdir should be offered");
+
+    app.text_input_accept_suggestion();
+
+    let Mode::TextInput { buffer, suggestions, selected, .. } = &app.mode else {
+        panic!("expected text input mode");
+    };
+    assert_eq!(*buffer, format!("{}/subdir/", dir.display()));
+    assert_eq!(*selected, 0, "selection should reset after accepting");
+    assert!(suggestions.is_empty(), "the fixture's subdir is empty");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Up/Down should cycle the highlighted suggestion, wrapping at both ends.
+#[test]
+fn text_input_move_suggestion_wraps() {
+    use crate::app::{App, Mode};
+
+    let dir = make_suggestion_fixture();
+    let mut app = App::new();
+    app.start_add_input();
+    let Mode::TextInput { buffer, suggestions, .. } = &mut app.mode else {
+        panic!("expected text input mode");
+    };
+    *buffer = format!("{}/", dir.display());
+    *suggestions = crate::app::path_suggestions(buffer);
+    let count = suggestions.len();
+    assert!(count >= 2, "fixture should offer several entries");
+
+    app.text_input_move_suggestion(-1);
+    let Mode::TextInput { selected, .. } = &app.mode else { unreachable!() };
+    assert_eq!(*selected, count - 1, "moving back from 0 should wrap to the last entry");
+
+    app.text_input_move_suggestion(1);
+    let Mode::TextInput { selected, .. } = &app.mode else { unreachable!() };
+    assert_eq!(*selected, 0, "moving forward should wrap back to the first entry");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Typing or backspacing should recompute suggestions against the new
+/// buffer and reset the selection, rather than leaving a stale list or a
+/// now out-of-range index around.
+#[test]
+fn text_input_char_and_backspace_refresh_suggestions() {
+    use crate::app::{App, Mode};
+
+    let dir = make_suggestion_fixture();
+    let mut app = App::new();
+    app.start_add_input();
+    let Mode::TextInput { buffer, .. } = &mut app.mode else { panic!("expected text input mode") };
+    *buffer = format!("{}/", dir.display());
+
+    for c in "al".chars() {
+        app.text_input_char(c);
+    }
+    let Mode::TextInput { buffer, suggestions, selected, .. } = &app.mode else {
+        panic!("expected text input mode");
+    };
+    assert_eq!(buffer, &format!("{}/al", dir.display()));
+    assert_eq!(suggestions.len(), 2, "should narrow to the two 'al*' entries: {suggestions:?}");
+    assert_eq!(*selected, 0);
+
+    // One backspace narrows "al" to "a" -- still just the two "al*" entries.
+    app.text_input_backspace();
+    let Mode::TextInput { suggestions, .. } = &app.mode else { panic!("expected text input mode") };
+    assert_eq!(suggestions.len(), 2, "'a' should still match only the two 'al*' entries: {suggestions:?}");
+
+    // A second backspace clears the prefix entirely, widening to everything.
+    app.text_input_backspace();
+    let Mode::TextInput { suggestions, .. } = &app.mode else { panic!("expected text input mode") };
+    assert_eq!(suggestions.len(), 4, "an empty prefix should widen the match to all four entries: {suggestions:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The suggestions popup should actually render under the input line, list
+/// the current matches, and hide once the mode leaves TextInput.
+#[test]
+fn ui_renders_suggestions_popup_and_hides_outside_text_input() {
+    use crate::app::{App, Mode};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let dir = make_suggestion_fixture();
+    let mut app = App::new();
+    app.start_add_input();
+    let Mode::TextInput { buffer, suggestions, selected, .. } = &mut app.mode else {
+        panic!("expected text input mode");
+    };
+    *buffer = format!("{}/a", dir.display());
+    *suggestions = crate::app::path_suggestions(buffer);
+    *selected = 1;
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let mut rows = Vec::new();
+    for y in 0..buf.area.height {
+        let mut row = String::new();
+        for x in 0..buf.area.width {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        rows.push(row);
+    }
+    let screen = rows.join("\n");
+
+    assert!(screen.contains("suggestions"), "expected the popup title:\n{screen}");
+    assert!(screen.contains("alpha.mp4"), "expected the matching entry listed:\n{screen}");
+    assert!(screen.contains("alpha2.txt"), "expected the other matching entry listed:\n{screen}");
+    assert!(!screen.contains("beta.mkv"), "non-matching entry should be filtered out:\n{screen}");
+
+    app.cancel_text_input();
+    let mut terminal2 = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal2.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf2 = terminal2.backend().buffer();
+    let screen2: String = (0..buf2.area.height)
+        .map(|y| (0..buf2.area.width).map(|x| buf2[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!screen2.contains("suggestions"), "popup should disappear once out of text-input mode:\n{screen2}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

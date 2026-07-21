@@ -24,6 +24,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_line(frame, app, root[2]);
     draw_log(frame, app, root[3]);
     draw_picker_popup(frame, app);
+    draw_suggestions_popup(frame, app, root[2]);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect) {
@@ -36,7 +37,7 @@ fn draw_header(frame: &mut Frame, area: Rect) {
 
 fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.mode {
-        Mode::TextInput { target, buffer } => {
+        Mode::TextInput { target, buffer, .. } => {
             let prompt = match target {
                 crate::app::TextTarget::NewInputPath => "add input file path: ",
                 crate::app::TextTarget::OutputPath(_) => "output file path: ",
@@ -512,4 +513,70 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect { x, y, width, height }
+}
+
+/// Live path-completion dropdown shown under the input line while adding an
+/// input file or editing an output's path -- non-modal (typing keeps
+/// working normally), unlike the picker popup. Hidden whenever there are no
+/// matches, so it never sits there empty.
+fn draw_suggestions_popup(frame: &mut Frame, app: &App, status_area: Rect) {
+    let Mode::TextInput { suggestions, selected, .. } = &app.mode else {
+        return;
+    };
+    if suggestions.is_empty() {
+        return;
+    }
+
+    let area = frame.area();
+    let popup_width = area.width.saturating_sub(4).clamp(20, 60);
+    let max_visible = 8u16;
+    let popup_height = (suggestions.len() as u16).min(max_visible) + 2;
+    let available_height = area.height.saturating_sub(status_area.bottom());
+    if available_height < 3 {
+        return;
+    }
+    let popup = Rect {
+        x: status_area.x.min(area.width.saturating_sub(popup_width)),
+        y: status_area.bottom(),
+        width: popup_width,
+        height: popup_height.min(available_height),
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(" suggestions ", Style::default().fg(Color::DarkGray)))
+        .title_bottom(Span::styled(" Tab complete · ↑↓ cycle ", Style::default().fg(Color::DarkGray)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let visible = inner.height as usize;
+    let scroll = if suggestions.len() <= visible {
+        0
+    } else {
+        (*selected).saturating_sub(visible / 2).min(suggestions.len() - visible)
+    };
+
+    let lines: Vec<TextLine> = suggestions
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(i, s)| {
+            let style = if i == *selected {
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            TextLine::styled(format!(" {s}"), style)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }

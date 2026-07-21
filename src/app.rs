@@ -45,7 +45,15 @@ pub struct PickerEntry {
 
 pub enum Mode {
     Normal,
-    TextInput { target: TextTarget, buffer: String },
+    TextInput {
+        target: TextTarget,
+        buffer: String,
+        /// Files/directories in the buffer's current directory whose name
+        /// starts with what's typed after the last '/' -- recomputed on
+        /// every keystroke. See `path_suggestions`.
+        suggestions: Vec<String>,
+        selected: usize,
+    },
     Picker {
         kind: PickerKind,
         title: String,
@@ -191,9 +199,13 @@ impl App {
     }
 
     pub fn start_add_input(&mut self) {
+        let buffer = String::new();
+        let suggestions = path_suggestions(&buffer);
         self.mode = Mode::TextInput {
             target: TextTarget::NewInputPath,
-            buffer: String::new(),
+            buffer,
+            suggestions,
+            selected: 0,
         };
     }
 
@@ -213,9 +225,13 @@ impl App {
             return;
         };
         let Some(output) = self.graph.outputs.get(i) else { return };
+        let buffer = output.path.clone();
+        let suggestions = path_suggestions(&buffer);
         self.mode = Mode::TextInput {
             target: TextTarget::OutputPath(output.id),
-            buffer: output.path.clone(),
+            buffer,
+            suggestions,
+            selected: 0,
         };
     }
 
@@ -224,7 +240,7 @@ impl App {
     }
 
     pub fn confirm_text_input(&mut self) {
-        let Mode::TextInput { target, buffer } =
+        let Mode::TextInput { target, buffer, .. } =
             std::mem::replace(&mut self.mode, Mode::Normal)
         else {
             return;
@@ -259,15 +275,42 @@ impl App {
     }
 
     pub fn text_input_char(&mut self, c: char) {
-        if let Mode::TextInput { buffer, .. } = &mut self.mode {
+        if let Mode::TextInput { buffer, suggestions, selected, .. } = &mut self.mode {
             buffer.push(c);
+            *suggestions = path_suggestions(buffer);
+            *selected = 0;
         }
     }
 
     pub fn text_input_backspace(&mut self) {
-        if let Mode::TextInput { buffer, .. } = &mut self.mode {
+        if let Mode::TextInput { buffer, suggestions, selected, .. } = &mut self.mode {
             buffer.pop();
+            *suggestions = path_suggestions(buffer);
+            *selected = 0;
         }
+    }
+
+    /// Up/Down while typing a path: move the highlighted suggestion.
+    pub fn text_input_move_suggestion(&mut self, delta: isize) {
+        if let Mode::TextInput { suggestions, selected, .. } = &mut self.mode {
+            let len = suggestions.len() as isize;
+            if len == 0 {
+                return;
+            }
+            *selected = (*selected as isize + delta).rem_euclid(len) as usize;
+        }
+    }
+
+    /// Tab: replace the buffer's current path segment with the highlighted
+    /// suggestion (shell-style completion), and refresh suggestions against
+    /// the new, longer buffer so drilling into a directory keeps working.
+    pub fn text_input_accept_suggestion(&mut self) {
+        if let Mode::TextInput { buffer, suggestions, selected, .. } = &mut self.mode
+            && let Some(chosen) = suggestions.get(*selected).cloned() {
+                *buffer = chosen;
+                *suggestions = path_suggestions(buffer);
+                *selected = 0;
+            }
     }
 
     /// 'c': arm the focused input stream, or -- when something is armed
@@ -631,6 +674,13 @@ fn clean_path_input(raw: &str) -> String {
             s = &s[1..s.len() - 1];
         }
     }
+    expand_tilde(s)
+}
+
+/// Expands a leading `~` or `~/...` to `$HOME`. Anything else is returned
+/// unchanged (including a bare relative path, which is left for the OS to
+/// resolve against the process's own working directory).
+fn expand_tilde(s: &str) -> String {
     if let Some(rest) = s.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{home}/{rest}");
@@ -640,6 +690,52 @@ fn clean_path_input(raw: &str) -> String {
             return home;
         }
     s.to_string()
+}
+
+/// Files/directories matching what's typed after the last '/' in `buffer`,
+/// each returned as a full replacement value for the buffer (so accepting
+/// one is just `buffer = suggestion`). Directories get a trailing '/' so
+/// the user can keep completing deeper. Mirrors familiar shell completion:
+/// entries are listed relative to whatever the user already typed (so `~`
+/// notation is preserved in the buffer even though listing itself needs
+/// the expanded path), sorted alphabetically, and dotfiles are hidden
+/// unless the user is already typing a dot-prefix.
+pub fn path_suggestions(buffer: &str) -> Vec<String> {
+    // A bare "~" (no '/' yet) should offer the home directory's contents,
+    // same as "~/" -- normalize once and recurse rather than duplicating
+    // the split/scan logic for that one case.
+    if buffer.starts_with('~') && !buffer.contains('/') {
+        return path_suggestions(&format!("~/{}", &buffer[1..]));
+    }
+
+    let (dir_part, prefix) = match buffer.rfind('/') {
+        Some(idx) => (&buffer[..idx + 1], &buffer[idx + 1..]),
+        None => ("", buffer),
+    };
+
+    let scan_target = if dir_part.is_empty() { ".".to_string() } else { expand_tilde(dir_part) };
+    let Ok(read_dir) = std::fs::read_dir(&scan_target) else {
+        return Vec::new();
+    };
+
+    let show_hidden = prefix.starts_with('.');
+    let mut entries: Vec<(String, bool)> = read_dir
+        .filter_map(|e| e.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(prefix) || (name.starts_with('.') && !show_hidden) {
+                return None;
+            }
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            Some((name, is_dir))
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    entries
+        .into_iter()
+        .map(|(name, is_dir)| format!("{dir_part}{name}{}", if is_dir { "/" } else { "" }))
+        .collect()
 }
 
 /// If ffmpeg actually reported a discovered list, keep only the curated
