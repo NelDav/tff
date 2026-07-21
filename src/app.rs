@@ -18,18 +18,21 @@ const COMMON_CONTAINERS: &[(&str, &str)] = &[
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    Input(usize), // index into graph.inputs
-    Output,
+    Input(usize),  // index into graph.inputs
+    Output(usize), // index into graph.outputs
 }
 
 pub enum TextTarget {
     NewInputPath,
-    OutputPath,
+    OutputPath(NodeId),
 }
 
 pub enum PickerKind {
-    Codec { node: NodeId, stream_idx: usize },
-    Container,
+    /// Index into `Graph::edges`. Safe to hold onto across the picker's
+    /// lifetime because Picker mode captures all key input itself, so
+    /// nothing else can mutate `edges` (and shift indices) while it's open.
+    Codec { edge_idx: usize },
+    Container { output: NodeId },
 }
 
 pub struct PickerEntry {
@@ -75,9 +78,13 @@ pub fn filtered_indices(options: &[PickerEntry], query: &str) -> Vec<usize> {
 pub struct App {
     pub graph: Graph,
     pub focus: Focus,
-    pub port_idx: usize,
+    /// Selected row within the focused node: a stream index when an input
+    /// is focused, or an index into that output's incoming edges (see
+    /// `Graph::edge_indices_for_output`) when an output is focused.
+    pub row_idx: usize,
     pub mode: Mode,
-    /// A stream port the user has armed, waiting to be connected to the output.
+    /// A stream port the user has armed, waiting to be connected to
+    /// whichever output node gets focused next.
     pub armed: Option<(NodeId, usize)>,
     pub log: Vec<String>,
     pub status: String,
@@ -104,8 +111,8 @@ impl App {
         }
         App {
             graph: Graph::new(),
-            focus: Focus::Output,
-            port_idx: 0,
+            focus: Focus::Output(0),
+            row_idx: 0,
             mode: Mode::Normal,
             armed: None,
             log,
@@ -119,23 +126,24 @@ impl App {
     }
 
     fn node_count(&self) -> usize {
-        self.graph.inputs.len() + 1 // + output node
+        self.graph.inputs.len() + self.graph.outputs.len()
     }
 
     fn focus_index(&self) -> usize {
         match self.focus {
             Focus::Input(i) => i,
-            Focus::Output => self.graph.inputs.len(),
+            Focus::Output(i) => self.graph.inputs.len() + i,
         }
     }
 
     fn set_focus_index(&mut self, idx: usize) {
-        self.focus = if idx >= self.graph.inputs.len() {
-            Focus::Output
-        } else {
+        let n_inputs = self.graph.inputs.len();
+        self.focus = if idx < n_inputs {
             Focus::Input(idx)
+        } else {
+            Focus::Output((idx - n_inputs).min(self.graph.outputs.len().saturating_sub(1)))
         };
-        self.port_idx = 0;
+        self.row_idx = 0;
     }
 
     pub fn cycle_focus(&mut self, forward: bool) {
@@ -149,34 +157,36 @@ impl App {
         self.set_focus_index(next);
     }
 
-    pub fn cycle_port(&mut self, forward: bool) {
-        if let Focus::Input(i) = self.focus
-            && let Some(node) = self.graph.inputs.get(i) {
-                let len = node.streams.len();
-                if len == 0 {
-                    return;
-                }
-                self.port_idx = if forward {
-                    (self.port_idx + 1) % len
-                } else {
-                    (self.port_idx + len - 1) % len
-                };
-            }
+    /// Up/Down while a node is focused: cycles the selected stream (input)
+    /// or the selected incoming connection (output).
+    pub fn cycle_row(&mut self, forward: bool) {
+        let len = match self.focus {
+            Focus::Input(i) => self.graph.inputs.get(i).map_or(0, |n| n.streams.len()),
+            Focus::Output(i) => self
+                .graph
+                .outputs
+                .get(i)
+                .map_or(0, |o| self.graph.edge_indices_for_output(o.id).len()),
+        };
+        if len == 0 {
+            return;
+        }
+        self.row_idx = if forward {
+            (self.row_idx + 1) % len
+        } else {
+            (self.row_idx + len - 1) % len
+        };
     }
 
     pub fn move_focused_node(&mut self, dx: f64, dy: f64) {
         let step = 2.0;
-        match self.focus {
-            Focus::Input(i) => {
-                if let Some(node) = self.graph.inputs.get_mut(i) {
-                    node.pos.0 = (node.pos.0 + dx * step).max(0.0);
-                    node.pos.1 = (node.pos.1 + dy * step).max(0.0);
-                }
-            }
-            Focus::Output => {
-                self.graph.output.pos.0 = (self.graph.output.pos.0 + dx * step).max(0.0);
-                self.graph.output.pos.1 = (self.graph.output.pos.1 + dy * step).max(0.0);
-            }
+        let pos = match self.focus {
+            Focus::Input(i) => self.graph.inputs.get_mut(i).map(|n| &mut n.pos),
+            Focus::Output(i) => self.graph.outputs.get_mut(i).map(|n| &mut n.pos),
+        };
+        if let Some(pos) = pos {
+            pos.0 = (pos.0 + dx * step).max(0.0);
+            pos.1 = (pos.1 + dy * step).max(0.0);
         }
     }
 
@@ -187,10 +197,25 @@ impl App {
         };
     }
 
+    /// 'O': add a new output node and focus it.
+    pub fn add_output_node(&mut self) {
+        self.graph.add_output();
+        let idx = self.graph.inputs.len() + self.graph.outputs.len() - 1;
+        self.set_focus_index(idx);
+        self.log.push("added output node".to_string());
+    }
+
+    /// 'o': edit the focused output's path. No-op unless an output is
+    /// focused -- there's nothing to edit on an input node.
     pub fn start_edit_output(&mut self) {
+        let Focus::Output(i) = self.focus else {
+            self.log.push("focus an output node first, then 'o' edits its path".to_string());
+            return;
+        };
+        let Some(output) = self.graph.outputs.get(i) else { return };
         self.mode = Mode::TextInput {
-            target: TextTarget::OutputPath,
-            buffer: self.graph.output.path.clone(),
+            target: TextTarget::OutputPath(output.id),
+            buffer: output.path.clone(),
         };
     }
 
@@ -223,11 +248,12 @@ impl App {
                     }
                 }
             }
-            TextTarget::OutputPath => {
+            TextTarget::OutputPath(output_id) => {
                 let path = clean_path_input(&buffer);
-                if !path.is_empty() {
-                    self.graph.output.path = path;
-                }
+                if !path.is_empty()
+                    && let Some(node) = self.graph.output_mut(output_id) {
+                        node.path = path;
+                    }
             }
         }
     }
@@ -244,70 +270,124 @@ impl App {
         }
     }
 
-    /// 'c': arm the focused stream port, or complete a connection to the output.
+    /// 'c': arm the focused input stream, or -- when something is armed
+    /// and an output node is focused -- connect/disconnect it to that
+    /// specific output. ffmpeg can write several output files in one run,
+    /// so which output a stream feeds is a real choice once more than one
+    /// exists; focusing the destination is how you make that choice.
     pub fn toggle_connect(&mut self) {
         match self.focus {
             Focus::Input(i) => {
-                let Some(node) = self.graph.inputs.get(i) else {
-                    return;
-                };
-                let Some(stream) = node.streams.get(self.port_idx) else {
-                    return;
-                };
-                let key = (node.id, self.port_idx);
+                let Some(node) = self.graph.inputs.get(i) else { return };
+                let Some(stream) = node.streams.get(self.row_idx) else { return };
+                let key = (node.id, self.row_idx);
                 if self.armed == Some(key) {
                     self.armed = None; // disarm
                 } else {
-                    self.log
-                        .push(format!("armed {} from {} — move to output, press 'c'", stream.label(), node.path));
+                    self.log.push(format!(
+                        "armed {} from {} — focus an output, press 'c' to connect",
+                        stream.label(),
+                        node.path
+                    ));
                     self.armed = Some(key);
                 }
             }
-            Focus::Output => {
+            Focus::Output(i) => {
+                let Some(output) = self.graph.outputs.get(i) else { return };
+                let output_id = output.id;
                 if let Some((node_id, stream_idx)) = self.armed.take() {
-                    self.graph.toggle_edge(node_id, stream_idx);
-                    self.log.push("connected to output".to_string());
+                    let was_connected = self.graph.has_edge(node_id, stream_idx, output_id);
+                    self.graph.toggle_edge(node_id, stream_idx, output_id);
+                    self.log.push(if was_connected {
+                        "disconnected".to_string()
+                    } else {
+                        "connected to output".to_string()
+                    });
                 }
             }
         }
     }
 
-    /// 'd': disconnect the edge on the currently focused port, if any.
+    /// 'd': on an input port, disconnect it from every output it feeds; on
+    /// an output node, disconnect just the selected incoming connection.
     pub fn disconnect_focused(&mut self) {
-        if let Focus::Input(i) = self.focus
-            && let Some(node) = self.graph.inputs.get(i)
-                && let Some(stream) = node.streams.get(self.port_idx) {
-                    let (id, idx) = (node.id, self.port_idx);
-                    let label = stream.label();
-                    if self.graph.is_connected(id, idx) {
-                        self.graph.toggle_edge(id, idx);
-                        self.log.push(format!("disconnected {label}"));
-                    }
+        match self.focus {
+            Focus::Input(i) => {
+                let Some(node) = self.graph.inputs.get(i) else { return };
+                let Some(stream) = node.streams.get(self.row_idx) else { return };
+                let (id, idx) = (node.id, self.row_idx);
+                let label = stream.label();
+                let before = self.graph.edges.len();
+                self.graph.edges.retain(|e| !(e.from_node == id && e.from_stream_idx == idx));
+                if self.graph.edges.len() != before {
+                    self.log.push(format!("disconnected {label} from all outputs"));
                 }
+            }
+            Focus::Output(i) => {
+                let Some(output) = self.graph.outputs.get(i) else { return };
+                let output_id = output.id;
+                let edge_idxs = self.graph.edge_indices_for_output(output_id);
+                let Some(&ei) = edge_idxs.get(self.row_idx) else { return };
+                self.graph.remove_edge_at(ei);
+                self.log.push("disconnected".to_string());
+                let new_len = self.graph.edge_indices_for_output(output_id).len();
+                if new_len > 0 && self.row_idx >= new_len {
+                    self.row_idx = new_len - 1;
+                }
+            }
+        }
     }
 
-    /// 'e': open a picker listing codecs available for the focused port's
-    /// connection. No-op on an unconnected port -- codec only matters for
-    /// streams actually being muxed into the output.
+    /// 'e': open a picker listing codecs for a specific connection. On an
+    /// input port with exactly one outgoing connection, that's unambiguous;
+    /// with more than one (fanned out to several outputs) or none, this
+    /// asks the user to be precise via the output side instead. On an
+    /// output node, it targets whichever connection row is selected.
     pub fn open_codec_picker(&mut self) {
-        let Focus::Input(i) = self.focus else { return };
-        let Some(node) = self.graph.inputs.get(i) else { return };
-        let Some(stream) = node.streams.get(self.port_idx) else { return };
-        let (id, idx, kind) = (node.id, self.port_idx, stream.kind);
+        let (edge_idx, kind, label) = match self.focus {
+            Focus::Input(i) => {
+                let Some(node) = self.graph.inputs.get(i) else { return };
+                let Some(stream) = node.streams.get(self.row_idx) else { return };
+                let (id, idx) = (node.id, self.row_idx);
+                let matches: Vec<usize> = self
+                    .graph
+                    .edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.from_node == id && e.from_stream_idx == idx)
+                    .map(|(ei, _)| ei)
+                    .collect();
+                match matches.len() {
+                    0 => {
+                        self.log
+                            .push("connect this stream first ('c'), then 'e' to pick a codec".to_string());
+                        return;
+                    }
+                    1 => (matches[0], stream.kind, stream.label()),
+                    _ => {
+                        self.log.push(
+                            "connected to multiple outputs — focus the specific output row to set its codec"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                }
+            }
+            Focus::Output(i) => {
+                let Some(output) = self.graph.outputs.get(i) else { return };
+                let edge_idxs = self.graph.edge_indices_for_output(output.id);
+                let Some(&ei) = edge_idxs.get(self.row_idx) else {
+                    self.log.push("nothing mapped to this output yet".to_string());
+                    return;
+                };
+                let edge = &self.graph.edges[ei];
+                let Some(input) = self.graph.input(edge.from_node) else { return };
+                let Some(stream) = input.streams.get(edge.from_stream_idx) else { return };
+                (ei, stream.kind, stream.label())
+            }
+        };
 
-        if !self.graph.is_connected(id, idx) {
-            self.log
-                .push("connect this stream first ('c'), then 'e' to pick a codec".to_string());
-            return;
-        }
-
-        let current = self
-            .graph
-            .edges
-            .iter()
-            .find(|e| e.from_node == id && e.from_stream_idx == idx)
-            .map(|e| e.codec.clone())
-            .unwrap_or(Codec::Copy);
+        let current = self.graph.edges[edge_idx].codec.clone();
 
         let mut names: Vec<String> = Codec::curated_fallback(kind)
             .into_iter()
@@ -322,8 +402,8 @@ impl App {
         let selected = selected_index(&options, current.ffmpeg_name());
 
         self.mode = Mode::Picker {
-            kind: PickerKind::Codec { node: id, stream_idx: idx },
-            title: format!("codec for {}", stream.label()),
+            kind: PickerKind::Codec { edge_idx },
+            title: format!("codec for {label}"),
             options,
             selected,
             query: String::new(),
@@ -331,9 +411,16 @@ impl App {
         };
     }
 
-    /// 'f': open a picker listing ffmpeg's available output containers.
+    /// 'f': open a picker listing ffmpeg's available output containers for
+    /// the focused output node.
     pub fn open_container_picker(&mut self) {
-        let current = self.graph.output.container.clone();
+        let Focus::Output(i) = self.focus else {
+            self.log.push("focus an output node first, then 'f' picks its container".to_string());
+            return;
+        };
+        let Some(output) = self.graph.outputs.get(i) else { return };
+        let output_id = output.id;
+        let current = output.container.clone();
 
         let mut names: Vec<String> = COMMON_CONTAINERS.iter().map(|(name, _)| name.to_string()).collect();
         prioritize_and_extend(&mut names, self.available_muxers.iter().map(String::as_str));
@@ -342,7 +429,7 @@ impl App {
         let selected = selected_index(&options, current.as_deref());
 
         self.mode = Mode::Picker {
-            kind: PickerKind::Container,
+            kind: PickerKind::Container { output: output_id },
             title: "output container".to_string(),
             options,
             selected,
@@ -430,7 +517,7 @@ impl App {
         };
 
         match kind {
-            PickerKind::Codec { node, stream_idx } => {
+            PickerKind::Codec { edge_idx } => {
                 let codec = match entry.value {
                     None => Codec::Copy,
                     Some(name) => Codec::Encode(name),
@@ -439,18 +526,18 @@ impl App {
                     Codec::Copy => "codec set to copy (no re-encode)".to_string(),
                     Codec::Encode(_) => format!("codec set to {}", codec.label()),
                 });
-                self.graph.set_edge_codec(node, stream_idx, codec);
+                self.graph.set_edge_codec_at(edge_idx, codec);
             }
-            PickerKind::Container => {
-                self.graph.output.container = entry.value.clone();
+            PickerKind::Container { output } => {
+                let Some(node) = self.graph.output_mut(output) else { return };
+                node.container = entry.value.clone();
                 match &entry.value {
                     Some(name) => {
                         if let Some((_, ext)) = COMMON_CONTAINERS.iter().find(|(n, _)| n == name) {
-                            let stem = std::path::Path::new(&self.graph.output.path).with_extension("");
-                            self.graph.output.path = format!("{}.{ext}", stem.to_string_lossy());
+                            let stem = std::path::Path::new(&node.path).with_extension("");
+                            node.path = format!("{}.{ext}", stem.to_string_lossy());
                         }
-                        self.log
-                            .push(format!("output container set to {name} ({})", self.graph.output.path));
+                        self.log.push(format!("output container set to {name} ({})", node.path));
                     }
                     None => self
                         .log
@@ -460,10 +547,12 @@ impl App {
         }
     }
 
-    /// 'x': remove the whole focused input node.
+    /// 'x': remove the focused node -- an input entirely, or an output as
+    /// long as it isn't the last one (ffmpeg needs somewhere to write to).
     pub fn delete_focused_node(&mut self) {
-        if let Focus::Input(i) = self.focus
-            && let Some(node) = self.graph.inputs.get(i) {
+        match self.focus {
+            Focus::Input(i) => {
+                let Some(node) = self.graph.inputs.get(i) else { return };
                 let id = node.id;
                 let path = node.path.clone();
                 self.graph.remove_input(id);
@@ -472,6 +561,20 @@ impl App {
                 let n = self.graph.inputs.len();
                 self.set_focus_index(i.min(n));
             }
+            Focus::Output(i) => {
+                if self.graph.outputs.len() <= 1 {
+                    self.log.push("can't remove the last output".to_string());
+                    return;
+                }
+                let Some(output) = self.graph.outputs.get(i) else { return };
+                let id = output.id;
+                let path = output.path.clone();
+                self.graph.remove_output(id);
+                self.log.push(format!("removed output: {path}"));
+                let n = self.node_count();
+                self.set_focus_index((self.graph.inputs.len() + i).min(n.saturating_sub(1)));
+            }
+        }
     }
 
     pub fn start_render(&mut self) {
@@ -479,8 +582,10 @@ impl App {
             return;
         }
         if self.graph.edges.is_empty() {
-            self.log
-                .push("nothing mapped yet — arm a stream with 'c', connect it to the output".to_string());
+            self.log.push(
+                "nothing mapped yet — arm a stream with 'c', then focus an output and press 'c' again"
+                    .to_string(),
+            );
             return;
         }
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();

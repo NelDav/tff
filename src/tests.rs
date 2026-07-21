@@ -6,10 +6,11 @@ use crate::graph::{Codec, Graph, StreamInfo, StreamKind};
 
 /// build_ffmpeg_args should keep the blanket `-c copy` default and add a
 /// per-output-stream override only for the edge that isn't Copy, addressed
-/// by its position in the edge list (which is also the -map/output order).
+/// by its position within that output's own edge list.
 #[test]
 fn ffmpeg_args_add_per_stream_codec_override() {
     let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
     let id = graph.add_input(
         "in.mp4".to_string(),
         vec![
@@ -17,9 +18,10 @@ fn ffmpeg_args_add_per_stream_codec_override() {
             StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None },
         ],
     );
-    graph.toggle_edge(id, 0); // video: stays Copy
-    graph.toggle_edge(id, 1); // audio: re-encoded
-    graph.set_edge_codec(id, 1, Codec::Encode("flac".to_string()));
+    graph.toggle_edge(id, 0, out); // video: stays Copy
+    graph.toggle_edge(id, 1, out); // audio: re-encoded
+    let audio_edge = graph.edge_indices_for_output(out)[1];
+    graph.set_edge_codec_at(audio_edge, Codec::Encode("flac".to_string()));
 
     let args = graph.build_ffmpeg_args();
     let joined = args.join(" ");
@@ -27,6 +29,50 @@ fn ffmpeg_args_add_per_stream_codec_override() {
     assert!(joined.contains("-c copy"), "expected a blanket -c copy default: {joined}");
     assert!(joined.contains("-c:1 flac"), "expected -c:1 flac override: {joined}");
     assert!(!joined.contains("-c:0"), "video edge is Copy, should get no override: {joined}");
+}
+
+/// Stream specifiers like -c:0 are scoped to the *current* output section
+/// in ffmpeg's multi-output syntax, so with two outputs each getting one
+/// re-encoded stream, both sections should independently start at -c:0
+/// rather than continuing a global counter across outputs.
+#[test]
+fn ffmpeg_args_use_local_stream_indices_per_output_section() {
+    let mut graph = Graph::new();
+    let out1 = graph.outputs[0].id;
+    let out2 = graph.add_output();
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    graph.toggle_edge(id, 0, out1);
+    graph.toggle_edge(id, 0, out2);
+    graph.set_edge_codec_at(graph.edge_indices_for_output(out1)[0], Codec::Encode("libx264".to_string()));
+    graph.set_edge_codec_at(graph.edge_indices_for_output(out2)[0], Codec::Encode("libx265".to_string()));
+
+    let args = graph.build_ffmpeg_args();
+    let joined = args.join(" ");
+
+    assert!(joined.contains("-c:0 libx264"), "first output section should start at -c:0: {joined}");
+    assert!(joined.contains("-c:0 libx265"), "second output section should also start at -c:0: {joined}");
+    assert!(!joined.contains("-c:1"), "each section has only one stream, no -c:1 expected: {joined}");
+}
+
+/// Outputs with nothing mapped to them should be omitted entirely --
+/// otherwise ffmpeg would try to auto-select streams for that path, which
+/// isn't what an empty output node in the graph means.
+#[test]
+fn ffmpeg_args_skip_outputs_with_no_edges() {
+    let mut graph = Graph::new();
+    graph.add_output(); // second output, left empty
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    graph.toggle_edge(id, 0, graph.outputs[0].id);
+
+    let args = graph.build_ffmpeg_args();
+    assert!(args.contains(&"output.mkv".to_string()));
+    assert!(!args.contains(&"output2.mkv".to_string()), "empty output should not appear: {args:?}");
 }
 
 /// Opening the codec picker for a connected port should list "copy" first,
@@ -37,14 +83,15 @@ fn codec_picker_offers_only_matching_kind_with_current_preselected() {
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
+    let out = app.graph.outputs[0].id;
     let id = app.graph.add_input(
         "in.mp4".to_string(),
         vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
     );
-    app.graph.toggle_edge(id, 0);
-    app.graph.set_edge_codec(id, 0, Codec::Encode("libx265".to_string()));
+    app.graph.toggle_edge(id, 0, out);
+    app.graph.set_edge_codec_at(0, Codec::Encode("libx265".to_string()));
     app.focus = Focus::Input(0);
-    app.port_idx = 0;
+    app.row_idx = 0;
 
     app.open_codec_picker();
 
@@ -66,7 +113,7 @@ fn codec_picker_offers_only_matching_kind_with_current_preselected() {
 }
 
 /// 'e' should refuse to open a picker for an unconnected port -- codec only
-/// matters for streams actually being muxed into the output.
+/// matters for streams actually being muxed into an output.
 #[test]
 fn codec_picker_refuses_on_unconnected_port() {
     use crate::app::{App, Focus, Mode};
@@ -77,12 +124,67 @@ fn codec_picker_refuses_on_unconnected_port() {
         vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
     );
     app.focus = Focus::Input(0);
-    app.port_idx = 0;
+    app.row_idx = 0;
 
     app.open_codec_picker();
 
     assert!(matches!(app.mode, Mode::Normal), "should not open a picker for an unconnected port");
     assert!(app.log.last().unwrap().contains("connect this stream first"));
+}
+
+/// A stream fanned out to more than one output has no single unambiguous
+/// codec from the input side -- 'e' there should decline and point the user
+/// at the output side instead of guessing which connection they meant.
+#[test]
+fn codec_picker_on_fanned_out_input_asks_for_precision() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let out1 = app.graph.outputs[0].id;
+    let out2 = app.graph.add_output();
+    let id = app.graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    app.graph.toggle_edge(id, 0, out1);
+    app.graph.toggle_edge(id, 0, out2);
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+
+    app.open_codec_picker();
+
+    assert!(matches!(app.mode, Mode::Normal), "should not guess which of several connections to edit");
+    assert!(app.log.last().unwrap().contains("multiple outputs"));
+}
+
+/// With the same input stream fanned out to two outputs, opening the codec
+/// picker from a specific output's row should target *that* connection's
+/// edge, independent of the other one.
+#[test]
+fn codec_picker_via_output_row_targets_the_right_edge() {
+    use crate::app::{App, Focus, Mode, PickerKind};
+
+    let mut app = App::new();
+    let out1 = app.graph.outputs[0].id;
+    let out2 = app.graph.add_output();
+    let id = app.graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    app.graph.toggle_edge(id, 0, out1);
+    app.graph.toggle_edge(id, 0, out2);
+    app.graph.set_edge_codec_at(app.graph.edge_indices_for_output(out2)[0], Codec::Encode("libx265".to_string()));
+
+    app.focus = Focus::Output(1); // out2
+    app.row_idx = 0;
+    app.open_codec_picker();
+
+    let Mode::Picker { kind, options, selected, .. } = &app.mode else {
+        panic!("expected picker mode");
+    };
+    let PickerKind::Codec { edge_idx } = kind else { panic!("expected codec picker") };
+    assert_eq!(*edge_idx, app.graph.edge_indices_for_output(out2)[0]);
+    assert_eq!(options[*selected].value.as_deref(), Some("libx265"), "should preselect out2's own codec, not out1's");
 }
 
 /// Confirming a container choice should set an explicit -f override and,
@@ -92,7 +194,14 @@ fn codec_picker_refuses_on_unconnected_port() {
 fn container_picker_confirm_sets_override_and_rewrites_known_extension() {
     use crate::app::{App, Mode};
 
-    let mut app = App::new();
+    let mut app = App::new(); // focus defaults to Focus::Output(0)
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    app.graph.toggle_edge(id, 0, out); // build_ffmpeg_args skips empty outputs -- give it something to carry
+
     app.open_container_picker();
     let idx = match &app.mode {
         Mode::Picker { options, .. } => options
@@ -106,9 +215,28 @@ fn container_picker_confirm_sets_override_and_rewrites_known_extension() {
     }
     app.picker_confirm();
 
-    assert_eq!(app.graph.output.container.as_deref(), Some("webm"));
-    assert_eq!(app.graph.output.path, "output.webm");
+    assert_eq!(app.graph.outputs[0].container.as_deref(), Some("webm"));
+    assert_eq!(app.graph.outputs[0].path, "output.webm");
     assert!(app.graph.build_ffmpeg_args().windows(2).any(|w| w == ["-f", "webm"]));
+}
+
+/// 'f' with an input node focused (nothing to pick a container for) should
+/// decline rather than silently doing nothing unexplained.
+#[test]
+fn container_picker_refuses_without_a_focused_output() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    app.graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    app.focus = Focus::Input(0);
+
+    app.open_container_picker();
+
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.log.last().unwrap().contains("focus an output"));
 }
 
 /// Esc (with no active filter) should discard the picker without applying
@@ -118,13 +246,14 @@ fn picker_escape_with_no_filter_closes_picker_unchanged() {
     use crate::app::{App, Focus, Mode};
 
     let mut app = App::new();
+    let out = app.graph.outputs[0].id;
     let id = app.graph.add_input(
         "in.mp4".to_string(),
         vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
     );
-    app.graph.toggle_edge(id, 0);
+    app.graph.toggle_edge(id, 0, out);
     app.focus = Focus::Input(0);
-    app.port_idx = 0;
+    app.row_idx = 0;
 
     app.open_codec_picker();
     app.picker_move(3);
@@ -161,13 +290,14 @@ fn picker_search_filters_list_and_confirm_keeps_filter_for_navigation() {
     use crate::app::{filtered_indices, App, Focus, Mode};
 
     let mut app = App::new();
+    let out = app.graph.outputs[0].id;
     let id = app.graph.add_input(
         "in.mp4".to_string(),
         vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
     );
-    app.graph.toggle_edge(id, 0);
+    app.graph.toggle_edge(id, 0, out);
     app.focus = Focus::Input(0);
-    app.port_idx = 0;
+    app.row_idx = 0;
     app.open_codec_picker();
 
     app.picker_start_search();
@@ -211,7 +341,7 @@ fn picker_search_filters_list_and_confirm_keeps_filter_for_navigation() {
 fn picker_escape_clears_filter_before_closing() {
     use crate::app::{App, Mode};
 
-    let mut app = App::new();
+    let mut app = App::new(); // focus defaults to Focus::Output(0)
     app.open_container_picker();
 
     app.picker_start_search();
@@ -248,12 +378,13 @@ fn ui_shows_codec_badge_on_wire_and_output_line() {
     use ratatui::Terminal;
 
     let mut app = App::new();
+    let out = app.graph.outputs[0].id;
     let id = app.graph.add_input(
         "video_a.mp4".to_string(),
         vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
     );
-    app.graph.toggle_edge(id, 0);
-    app.graph.set_edge_codec(id, 0, Codec::Encode("libx265".to_string()));
+    app.graph.toggle_edge(id, 0, out);
+    app.graph.set_edge_codec_at(0, Codec::Encode("libx265".to_string()));
 
     let backend = TestBackend::new(140, 40);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -292,6 +423,7 @@ fn edge_line_reaches_output_node_not_canvas_origin() {
     use ratatui::Terminal;
 
     let mut app = App::new();
+    let out = app.graph.outputs[0].id;
     let id = app.graph.add_input(
         "in.mp4".to_string(),
         vec![StreamInfo {
@@ -301,7 +433,7 @@ fn edge_line_reaches_output_node_not_canvas_origin() {
             lang: None,
         }],
     );
-    app.graph.toggle_edge(id, 0);
+    app.graph.toggle_edge(id, 0, out);
 
     let backend = TestBackend::new(140, 40);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -353,6 +485,7 @@ fn wires_are_colored_by_stream_kind() {
     use ratatui::Terminal;
 
     let mut app = App::new();
+    let out = app.graph.outputs[0].id;
     let mk = |kind: StreamKind, codec: &str| {
         vec![StreamInfo {
             index: 0,
@@ -364,9 +497,9 @@ fn wires_are_colored_by_stream_kind() {
     let v = app.graph.add_input("v.mp4".to_string(), mk(StreamKind::Video, "h264"));
     let a = app.graph.add_input("a.m4a".to_string(), mk(StreamKind::Audio, "aac"));
     let s = app.graph.add_input("s.srt".to_string(), mk(StreamKind::Subtitle, "subrip"));
-    app.graph.toggle_edge(v, 0);
-    app.graph.toggle_edge(a, 0);
-    app.graph.toggle_edge(s, 0);
+    app.graph.toggle_edge(v, 0, out);
+    app.graph.toggle_edge(a, 0, out);
+    app.graph.toggle_edge(s, 0, out);
 
     // Tall enough that all three inputs (spaced 12 rows apart) stay within
     // the graph panel instead of being clipped by node_rect's bounds check.
@@ -433,6 +566,7 @@ fn combines_video_audio_and_subtitle_from_three_files() {
     ]));
 
     let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
     let id_v = graph.add_input(
         video_path.to_str().unwrap().to_string(),
         ffmpeg::probe(video_path.to_str().unwrap()).unwrap(),
@@ -446,11 +580,12 @@ fn combines_video_audio_and_subtitle_from_three_files() {
         ffmpeg::probe(sub_path.to_str().unwrap()).unwrap(),
     );
 
-    // Exactly what the TUI does when the user arms a port and connects it.
-    graph.toggle_edge(id_v, 0);
-    graph.toggle_edge(id_a, 0);
-    graph.toggle_edge(id_s, 0);
-    graph.output.path = out_path.to_str().unwrap().to_string();
+    // Exactly what the TUI does when the user arms a port and connects it
+    // to a focused output.
+    graph.toggle_edge(id_v, 0, out);
+    graph.toggle_edge(id_a, 0, out);
+    graph.toggle_edge(id_s, 0, out);
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
 
     let args = graph.build_ffmpeg_args();
     let (tx, rx) = mpsc::channel();
@@ -500,13 +635,14 @@ fn reencodes_a_connected_stream_to_a_different_codec() {
     ]));
 
     let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
     let source_streams = ffmpeg::probe(audio_path.to_str().unwrap()).unwrap();
     assert_eq!(source_streams[0].codec, "aac", "test fixture should start as aac");
     let id = graph.add_input(audio_path.to_str().unwrap().to_string(), source_streams);
 
-    graph.toggle_edge(id, 0);
-    graph.set_edge_codec(id, 0, Codec::Encode("flac".to_string()));
-    graph.output.path = out_path.to_str().unwrap().to_string();
+    graph.toggle_edge(id, 0, out);
+    graph.set_edge_codec_at(0, Codec::Encode("flac".to_string()));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
 
     let args = graph.build_ffmpeg_args();
     let (tx, rx) = mpsc::channel();
@@ -526,6 +662,167 @@ fn reencodes_a_connected_stream_to_a_different_codec() {
     assert_eq!(out_streams[0].codec, "flac", "expected the output to be re-encoded to flac");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// End-to-end check of the multi-output feature itself: one ffmpeg
+/// invocation, two separate output files, each getting a different stream
+/// from the same source -- proving `build_ffmpeg_args`' per-output
+/// sectioning actually reaches ffmpeg correctly rather than just looking
+/// right in the argument list.
+#[test]
+fn two_outputs_produce_two_separate_files_in_one_ffmpeg_run() {
+    let dir = std::env::temp_dir().join(format!("tff-test-multiout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source_path = dir.join("source.mp4");
+    let video_out = dir.join("video_only.mkv");
+    let audio_out = dir.join("audio_only.mkv");
+
+    run_ok(Command::new("ffmpeg").args([
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=1:size=160x120:rate=5",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=1",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-shortest",
+        source_path.to_str().unwrap(),
+    ]));
+
+    let mut graph = Graph::new();
+    let out1 = graph.outputs[0].id; // video destination
+    let out2 = graph.add_output(); // audio destination
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+
+    graph.toggle_edge(id, video_idx, out1);
+    graph.toggle_edge(id, audio_idx, out2);
+    graph.outputs[0].path = video_out.to_str().unwrap().to_string();
+    graph.outputs[1].path = audio_out.to_str().unwrap().to_string();
+
+    let args = graph.build_ffmpeg_args();
+    let (tx, rx) = mpsc::channel();
+    ffmpeg::run_args(args, tx);
+
+    let mut done_code = None;
+    while let Ok(line) = rx.recv() {
+        if let Some(code) = line.strip_prefix("__DONE__") {
+            done_code = Some(code.to_string());
+            break;
+        }
+    }
+    assert_eq!(done_code.as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let video_streams = ffmpeg::probe(video_out.to_str().unwrap()).unwrap();
+    assert_eq!(video_streams.len(), 1);
+    assert_eq!(video_streams[0].kind, StreamKind::Video);
+
+    let audio_streams = ffmpeg::probe(audio_out.to_str().unwrap()).unwrap();
+    assert_eq!(audio_streams.len(), 1);
+    assert_eq!(audio_streams[0].kind, StreamKind::Audio);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The app should always keep at least one output -- ffmpeg needs
+/// somewhere to write to -- so deleting the last one should refuse.
+#[test]
+fn delete_focused_node_refuses_to_remove_last_output() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    assert_eq!(app.graph.outputs.len(), 1);
+    app.focus = Focus::Output(0);
+
+    app.delete_focused_node();
+
+    assert_eq!(app.graph.outputs.len(), 1, "the only output should survive");
+    assert!(app.log.last().unwrap().contains("can't remove the last output"));
+}
+
+/// Deleting one of several outputs should work and drop its edges, while a
+/// second output remains untouched.
+#[test]
+fn delete_focused_output_removes_it_and_its_edges() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out1 = app.graph.outputs[0].id;
+    let out2 = app.graph.add_output();
+    let id = app.graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    app.graph.toggle_edge(id, 0, out1);
+    app.graph.toggle_edge(id, 0, out2);
+    assert_eq!(app.graph.edges.len(), 2);
+
+    app.focus = Focus::Output(1); // out2
+    app.delete_focused_node();
+
+    assert_eq!(app.graph.outputs.len(), 1);
+    assert_eq!(app.graph.outputs[0].id, out1);
+    assert_eq!(app.graph.edges.len(), 1, "out2's edge should be gone");
+    assert!(app.graph.edges[0].to_output == out1);
+}
+
+/// 'O' should add a new output node and focus it.
+#[test]
+fn add_output_node_appends_and_focuses_it() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    assert_eq!(app.graph.outputs.len(), 1);
+
+    app.add_output_node();
+
+    assert_eq!(app.graph.outputs.len(), 2);
+    assert!(matches!(app.focus, Focus::Output(1)));
+}
+
+/// 'd' on an input port disconnects it from *every* output it feeds
+/// (a bulk reset), while 'd' on an output row removes only that one
+/// specific connection, leaving the port's other connections intact.
+#[test]
+fn disconnect_is_bulk_on_input_and_precise_on_output() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out1 = app.graph.outputs[0].id;
+    let out2 = app.graph.add_output();
+    let id = app.graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }],
+    );
+    app.graph.toggle_edge(id, 0, out1);
+    app.graph.toggle_edge(id, 0, out2);
+    assert_eq!(app.graph.edges.len(), 2);
+
+    // Precise: disconnecting via the out2 row only removes that edge.
+    app.focus = Focus::Output(1);
+    app.row_idx = 0;
+    app.disconnect_focused();
+    assert_eq!(app.graph.edges.len(), 1);
+    assert_eq!(app.graph.edges[0].to_output, out1);
+
+    // Reconnect, then verify the bulk path from the input side.
+    app.graph.toggle_edge(id, 0, out2);
+    assert_eq!(app.graph.edges.len(), 2);
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.disconnect_focused();
+    assert!(app.graph.edges.is_empty(), "disconnecting from the input should clear all of its edges");
 }
 
 fn run_ok(cmd: &mut Command) {
@@ -552,4 +849,59 @@ fn discovers_real_encoders_and_muxers_from_ffmpeg() {
     assert!(muxers.iter().any(|m| m == "matroska"), "expected matroska among muxers");
     assert!(muxers.iter().any(|m| m == "mp4"), "expected mp4 among muxers");
     assert!(!muxers.contains(&"=".to_string()), "parser must not pick up legend lines");
+}
+
+/// A stream fanned out to two outputs, with a different codec on each,
+/// should render: the input port summarized as "→ 2 outputs" (since no
+/// single codec applies), each output auto-named distinctly, and the
+/// per-connection codec badge attached to only the output that re-encodes.
+#[test]
+fn ui_renders_fan_out_with_independent_per_output_codecs() {
+    use crate::app::{App, Focus};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let id = app.graph.add_input(
+        "video_a.mp4".to_string(),
+        vec![
+            StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None },
+            StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None },
+        ],
+    );
+    let out1 = app.graph.outputs[0].id;
+    let out2 = app.graph.add_output();
+
+    app.graph.toggle_edge(id, 0, out1);
+    app.graph.toggle_edge(id, 0, out2);
+    app.graph.toggle_edge(id, 1, out1);
+    app.graph.set_edge_codec_at(app.graph.edge_indices_for_output(out2)[0], Codec::Encode("libx265".to_string()));
+    app.focus = Focus::Output(1);
+    app.row_idx = 0;
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let mut rows = Vec::new();
+    for y in 0..buffer.area.height {
+        let mut row = String::new();
+        for x in 0..buffer.area.width {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+        rows.push(row);
+    }
+    let screen = rows.join("\n");
+
+    assert!(screen.contains("→ 2 outputs"), "fanned-out port should summarize by count, not one arbitrary codec:\n{screen}");
+    assert!(screen.contains("OUTPUT 1: output.mkv"), "first output should keep its default name:\n{screen}");
+    assert!(screen.contains("OUTPUT 2: output2.mkv"), "second output should be auto-named distinctly:\n{screen}");
+    // "[x265]" (bracketed) only ever appears as the per-connection codec
+    // tag on a mapped-stream line; the wire badge shows the bare "x265"
+    // without brackets, so this count isolates the tag specifically. Only
+    // out2's connection re-encodes, so it should appear exactly once even
+    // though out1 has two mapped lines from the same source stream.
+    let tag_count = screen.matches("[x265]").count();
+    assert_eq!(tag_count, 1, "exactly one mapped line (out2's) should carry the x265 tag:\n{screen}");
 }

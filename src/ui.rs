@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Focus, Mode};
-use crate::graph::{Codec, Edge, InputNode, StreamKind};
+use crate::graph::{Codec, Edge, InputNode, NodeId, StreamKind};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let root = Layout::default()
@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect) {
     let line = TextLine::from(
-        " tff — node-based ffmpeg  │  Tab focus  ↑↓ port  hjkl move  a add-input  o output-path  c connect  d disconnect  e codec  f container  x delete-node  r render  q quit ",
+        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  a add-input  O add-output  o output-path  c arm/connect  d disconnect  e codec  f container  x delete-node  r render  q quit ",
     )
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_widget(Paragraph::new(line), area);
@@ -39,7 +39,7 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
         Mode::TextInput { target, buffer } => {
             let prompt = match target {
                 crate::app::TextTarget::NewInputPath => "add input file path: ",
-                crate::app::TextTarget::OutputPath => "output file path: ",
+                crate::app::TextTarget::OutputPath(_) => "output file path: ",
             };
             TextLine::from(vec![
                 Span::styled(prompt, Style::default().fg(Color::Yellow)),
@@ -61,7 +61,7 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                         .unwrap_or_default();
                     TextLine::from(Span::styled(
                         format!(
-                            "armed {label} from {} — focus OUTPUT and press 'c' to connect (Esc to cancel)",
+                            "armed {label} from {} — focus an output, press 'c' to connect (Esc to cancel)",
                             node.path
                         ),
                         Style::default().fg(Color::Yellow),
@@ -107,43 +107,57 @@ fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
 
     for (i, input) in app.graph.inputs.iter().enumerate() {
         let focused = matches!(app.focus, Focus::Input(fi) if fi == i);
-        draw_input_node(frame, inner, input, &app.graph.edges, focused, app.port_idx, app.armed);
+        draw_input_node(frame, inner, input, &app.graph.edges, focused, app.row_idx, app.armed);
     }
-    draw_output_node(frame, inner, app);
+    for (i, output) in app.graph.outputs.iter().enumerate() {
+        draw_output_node(frame, inner, app, i, output);
+    }
 }
 
 /// Draws each edge as an orthogonal wire (one or two `─` runs joined by a
 /// `│` and box-drawing corners when source and destination rows differ),
 /// colored by the stream kind it carries. Attaches one cell outside each
 /// node's border so it never overlaps the box the node widgets draw later.
+/// Each edge routes to its own `to_output` node's rect, and its row within
+/// that box is its position among that output's other incoming edges.
 fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
-    let output_rows = node_rows(app.graph.edges.len());
-    let Some(dst_rect) = node_rect(area, app.graph.output.pos, app.graph.output.width, output_rows)
-    else {
-        return;
-    };
+    let output_rects: Vec<(NodeId, Rect)> = app
+        .graph
+        .outputs
+        .iter()
+        .filter_map(|o| {
+            let rows = node_rows(app.graph.edge_indices_for_output(o.id).len());
+            node_rect(area, o.pos, o.width, rows).map(|r| (o.id, r))
+        })
+        .collect();
 
     let buf = frame.buffer_mut();
-    for (i, edge) in app.graph.edges.iter().enumerate() {
-        let Some(input) = app.graph.input(edge.from_node) else {
+    for output in &app.graph.outputs {
+        let Some(&(_, dst_rect)) = output_rects.iter().find(|(id, _)| *id == output.id) else {
             continue;
         };
-        let Some(stream) = input.streams.get(edge.from_stream_idx) else {
-            continue;
-        };
-        let src_rows = node_rows(input.streams.len());
-        let Some(src_rect) = node_rect(area, input.pos, input.width, src_rows) else {
-            continue;
-        };
+        for (row, &ei) in app.graph.edge_indices_for_output(output.id).iter().enumerate() {
+            let edge = &app.graph.edges[ei];
+            let Some(input) = app.graph.input(edge.from_node) else {
+                continue;
+            };
+            let Some(stream) = input.streams.get(edge.from_stream_idx) else {
+                continue;
+            };
+            let src_rows = node_rows(input.streams.len());
+            let Some(src_rect) = node_rect(area, input.pos, input.width, src_rows) else {
+                continue;
+            };
 
-        let src = Position::new(src_rect.right(), src_rect.y + 1 + edge.from_stream_idx as u16);
-        let dst = Position::new(dst_rect.x.saturating_sub(1), dst_rect.y + 1 + i as u16);
-        let badge = match edge.codec {
-            Codec::Copy => None,
-            Codec::Encode(_) => Some(edge.codec.label()),
-        };
+            let src = Position::new(src_rect.right(), src_rect.y + 1 + edge.from_stream_idx as u16);
+            let dst = Position::new(dst_rect.x.saturating_sub(1), dst_rect.y + 1 + row as u16);
+            let badge = match edge.codec {
+                Codec::Copy => None,
+                Codec::Encode(_) => Some(edge.codec.label()),
+            };
 
-        draw_wire(buf, area, src, dst, i as u16, kind_color(stream.kind), badge);
+            draw_wire(buf, area, src, dst, row as u16, kind_color(stream.kind), badge);
+        }
     }
 }
 
@@ -263,7 +277,7 @@ fn draw_input_node(
     node: &InputNode,
     edges: &[Edge],
     focused: bool,
-    port_idx: usize,
+    row_idx: usize,
     armed: Option<(usize, usize)>,
 ) {
     let rows = node_rows(node.streams.len());
@@ -277,7 +291,7 @@ fn draw_input_node(
         lines.push(TextLine::from("(no streams)"));
     }
     for (i, stream) in node.streams.iter().enumerate() {
-        let is_port_focused = focused && i == port_idx;
+        let is_row_focused = focused && i == row_idx;
         let is_armed = armed == Some((node.id, i));
         let marker = if is_armed { "◎" } else { "○" };
         let color = if is_armed {
@@ -286,21 +300,23 @@ fn draw_input_node(
             kind_color(stream.kind)
         };
         let mut style = Style::default().fg(color);
-        if is_port_focused {
+        if is_row_focused {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        let codec_tag = edges
-            .iter()
-            .find(|e| e.from_node == node.id && e.from_stream_idx == i)
-            .and_then(|e| match e.codec {
-                Codec::Copy => None,
-                Codec::Encode(_) => Some(e.codec.label()),
-            });
-        let text = match codec_tag {
-            Some(tag) => format!("{marker} {} → {tag}", stream.label()),
-            None => format!("{marker} {}", stream.label()),
+        // A stream can fan out to more than one output; show its codec only
+        // when that's unambiguous (exactly one connection), and otherwise a
+        // plain count -- the output side is where per-connection detail lives.
+        let matches: Vec<&Edge> =
+            edges.iter().filter(|e| e.from_node == node.id && e.from_stream_idx == i).collect();
+        let suffix = match matches.as_slice() {
+            [] => String::new(),
+            [only] => match only.codec {
+                Codec::Copy => String::new(),
+                Codec::Encode(_) => format!(" → {}", only.codec.label()),
+            },
+            many => format!(" → {} outputs", many.len()),
         };
-        lines.push(TextLine::styled(text, style));
+        lines.push(TextLine::styled(format!("{marker} {}{suffix}", stream.label()), style));
     }
 
     let basename = node.path.rsplit('/').next().unwrap_or(&node.path);
@@ -316,20 +332,27 @@ fn draw_input_node(
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App) {
-    let node = &app.graph.output;
-    let rows = node_rows(app.graph.edges.len());
+fn draw_output_node(
+    frame: &mut Frame,
+    canvas_area: Rect,
+    app: &App,
+    index: usize,
+    node: &crate::graph::OutputNode,
+) {
+    let edge_idxs = app.graph.edge_indices_for_output(node.id);
+    let rows = node_rows(edge_idxs.len());
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
-    let focused = matches!(app.focus, Focus::Output);
+    let focused = matches!(app.focus, Focus::Output(oi) if oi == index);
     let border_color = if focused { Color::Yellow } else { Color::Cyan };
 
     let mut lines = Vec::new();
-    if app.graph.edges.is_empty() {
+    if edge_idxs.is_empty() {
         lines.push(TextLine::from("(nothing mapped — arm a stream with 'c')"));
     }
-    for edge in &app.graph.edges {
+    for (row, &ei) in edge_idxs.iter().enumerate() {
+        let edge = &app.graph.edges[ei];
         let codec_suffix = match edge.codec {
             Codec::Copy => String::new(),
             Codec::Encode(_) => format!(" [{}]", edge.codec.label()),
@@ -347,7 +370,11 @@ fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App) {
                 )
             })
             .unwrap_or_else(|| "● (dangling)".to_string());
-        lines.push(TextLine::from(label));
+        let mut style = Style::default();
+        if focused && row == app.row_idx {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(TextLine::styled(label, style));
     }
 
     let container_tag = match &node.container {
@@ -359,7 +386,7 @@ fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
-            format!(" OUTPUT: {}{container_tag} ", node.path),
+            format!(" OUTPUT {}: {}{container_tag} ", index + 1, node.path),
             Style::default().fg(border_color).add_modifier(Modifier::BOLD),
         ));
 
