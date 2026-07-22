@@ -59,6 +59,7 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                 crate::app::TextTarget::OutputPath(_) => "output file path: ".to_string(),
                 crate::app::TextTarget::ModifierMetadataValue { key, .. } => format!("{key}: "),
                 crate::app::TextTarget::ModifierCustomKey(_) => "custom metadata key: ".to_string(),
+                crate::app::TextTarget::ModifierFilterValue { key, .. } => format!("{key}: "),
             };
             TextLine::from(vec![
                 Span::styled(prompt, Style::default().fg(Color::Yellow)),
@@ -110,6 +111,7 @@ fn modifier_field_rows(kind: &ModifierKind) -> u16 {
         ModifierKind::Convert(_) => 0,
         ModifierKind::Metadata { fields } => fields.len().max(1) as u16 + 1, // + divider
         ModifierKind::Disposition { flags } => flags.len().max(1) as u16 + 1, // + divider
+        ModifierKind::Filter { fields, .. } => fields.len().max(1) as u16 + 1, // + divider
     }
 }
 
@@ -447,6 +449,17 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
             } else {
                 for flag in flags {
                     lines.push(TextLine::from(flag.clone()));
+                }
+            }
+            let divider_width = rect.width.saturating_sub(2) as usize;
+            lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
+        }
+        ModifierKind::Filter { fields, .. } => {
+            if fields.is_empty() {
+                lines.push(TextLine::styled("(no parameters set)", Style::default().fg(Color::DarkGray)));
+            } else {
+                for (key, value) in fields {
+                    lines.push(TextLine::from(format!("{key}: {value}")));
                 }
             }
             let divider_width = rect.width.saturating_sub(2) as usize;

@@ -23,6 +23,19 @@ impl fmt::Display for StreamKind {
     }
 }
 
+impl StreamKind {
+    /// Full word, for user-facing messages where the single-letter `Display`
+    /// form (used in stream labels like "v:0") would read badly.
+    pub fn noun(&self) -> &'static str {
+        match self {
+            StreamKind::Video => "video",
+            StreamKind::Audio => "audio",
+            StreamKind::Subtitle => "subtitle",
+            StreamKind::Other => "other",
+        }
+    }
+}
+
 /// A codec choice: either pass a stream through unchanged ("stream copy",
 /// the fast/lossless default) or re-encode it with a specific ffmpeg
 /// encoder name. The name is an owned `String` because the real option
@@ -137,6 +150,158 @@ pub fn disposition_flags() -> &'static [&'static str] {
     &["default", "forced", "hearing_impaired", "visual_impaired", "original", "dub", "comment", "lyrics", "karaoke"]
 }
 
+/// A filter-based effect: unlike Convert/Metadata/Disposition (which only
+/// ever emit `-c`/`-metadata`/`-disposition` stream-specifier flags), these
+/// need a real `-filter_complex` graph, built in `build_output_section`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterName {
+    /// Delay a track by N seconds to fix an audio/video sync offset.
+    Shift,
+    Volume,
+    Scale,
+    Crop,
+    Fade,
+    /// 90-degree-increment rotation, done in the pixels via `transpose`
+    /// rather than a container-level `rotate` tag -- see `expression`'s doc
+    /// comment for why the tag route was abandoned.
+    Rotate,
+}
+
+impl FilterName {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FilterName::Shift => "shift",
+            FilterName::Volume => "volume",
+            FilterName::Scale => "scale",
+            FilterName::Crop => "crop",
+            FilterName::Fade => "fade",
+            FilterName::Rotate => "rotate",
+        }
+    }
+
+    /// Which stream kinds this filter is meaningful for -- gates the field
+    /// picker the same way Convert's codec choices are gated by the
+    /// connected stream's kind, since e.g. scaling an audio-only stream
+    /// isn't a real ffmpeg operation.
+    pub fn applies_to(&self, kind: StreamKind) -> bool {
+        match self {
+            FilterName::Shift | FilterName::Fade => matches!(kind, StreamKind::Video | StreamKind::Audio),
+            FilterName::Volume => matches!(kind, StreamKind::Audio),
+            FilterName::Scale | FilterName::Crop | FilterName::Rotate => matches!(kind, StreamKind::Video),
+        }
+    }
+
+    /// The fields the picker offers for this filter, edited the same way as
+    /// Metadata's fields (pick a field, type a value) but without a
+    /// "custom key..." escape hatch -- unlike metadata tags, a filter's
+    /// parameter set is fixed, not open-ended.
+    pub fn fields(&self) -> &'static [&'static str] {
+        match self {
+            FilterName::Shift => &["seconds"],
+            FilterName::Volume => &["factor"],
+            FilterName::Scale => &["width", "height"],
+            FilterName::Crop => &["width", "height", "x", "y"],
+            FilterName::Fade => &["type", "start", "duration"],
+            FilterName::Rotate => &["direction"],
+        }
+    }
+
+    /// The fixed set of values a field accepts, if it's one of the
+    /// enum-like ones (as opposed to a number/expression ffmpeg parses
+    /// itself, like `width` or `seconds`) -- lets the picker offer a
+    /// selection instead of free text for a field where anything else
+    /// typed is simply wrong, not just unusual.
+    pub fn value_options(&self, key: &str) -> Option<&'static [&'static str]> {
+        match (self, key) {
+            (FilterName::Rotate, "direction") => Some(&["90cw", "90ccw", "180"]),
+            (FilterName::Fade, "type") => Some(&["in", "out"]),
+            _ => None,
+        }
+    }
+
+    /// Builds this filter's ffmpeg filtergraph expression (e.g.
+    /// `"scale=w=1280:h=720"`) for a stream of the given kind, or `None` if
+    /// nothing usable is set (an unconfigured filter node is a no-op rather
+    /// than an error, same as an empty Metadata/Disposition node).
+    ///
+    /// Uses named parameters throughout (`w=`/`h=`, not positional) so an
+    /// unset field can just be omitted and fall back to the filter's own
+    /// ffmpeg-native default -- verified via `ffmpeg -h filter=<name>` for
+    /// each one: `scale`'s missing dimension defaults to `-1` (preserve
+    /// aspect) here rather than "iw"/"ih", since -1 is more likely to be
+    /// what's wanted when only one side is set; `crop`'s x/y already default
+    /// to centered when omitted.
+    ///
+    /// `Shift` and `Fade` need a different real filter for video vs audio
+    /// (`setpts`/`fade` vs `adelay`/`afade`), picked from `kind`. This is
+    /// also where a real, verified asymmetry lives: `setpts` tolerates a
+    /// negative shift (frames that would land before t=0 are simply
+    /// dropped), but `adelay` rejects a negative delay outright with "Delay
+    /// must be non negative number" -- so audio can only be shifted later,
+    /// never earlier, without trimming. Not worked around here; ffmpeg's own
+    /// error surfaces in the render log same as any other bad argument.
+    ///
+    /// `Rotate` deliberately re-encodes pixels via `transpose` instead of
+    /// setting a container `rotate` tag: this codebase already found (see
+    /// `metadata_keys_for`'s doc comment) that the tag is unreliable --
+    /// preserved on MKV but silently dropped on MP4 once combined with
+    /// re-encoding. A pixel-level transpose has no such container
+    /// dependence. 180 degrees is two 90-degree transposes chained (there's
+    /// no single-step "flip" direction), verified to compose correctly.
+    pub fn expression(&self, kind: StreamKind, fields: &BTreeMap<String, String>) -> Option<String> {
+        let get = |k: &str| fields.get(k).map(String::as_str);
+        match self {
+            FilterName::Shift => {
+                let seconds = get("seconds")?;
+                match kind {
+                    StreamKind::Audio => {
+                        let ms = (seconds.trim().parse::<f64>().ok()? * 1000.0).round() as i64;
+                        Some(format!("adelay=delays={ms}:all=1"))
+                    }
+                    _ => Some(format!("setpts=PTS+({seconds})/TB")),
+                }
+            }
+            FilterName::Volume => Some(format!("volume=volume={}", get("factor")?)),
+            FilterName::Scale => {
+                if get("width").is_none() && get("height").is_none() {
+                    return None;
+                }
+                let w = get("width").unwrap_or("-1");
+                let h = get("height").unwrap_or("-1");
+                Some(format!("scale=w={w}:h={h}"))
+            }
+            FilterName::Crop => {
+                if get("width").is_none() && get("height").is_none() {
+                    return None;
+                }
+                let mut parts = Vec::new();
+                for (key, param) in [("width", "w"), ("height", "h"), ("x", "x"), ("y", "y")] {
+                    if let Some(v) = get(key) {
+                        parts.push(format!("{param}={v}"));
+                    }
+                }
+                Some(format!("crop={}", parts.join(":")))
+            }
+            FilterName::Fade => {
+                let fade_type = get("type")?;
+                if fade_type != "in" && fade_type != "out" {
+                    return None;
+                }
+                let start = get("start").unwrap_or("0");
+                let duration = get("duration").unwrap_or("1");
+                let filter = if kind == StreamKind::Audio { "afade" } else { "fade" };
+                Some(format!("{filter}=t={fade_type}:st={start}:d={duration}"))
+            }
+            FilterName::Rotate => match get("direction")? {
+                "90cw" => Some("transpose=dir=1".to_string()),
+                "90ccw" => Some("transpose=dir=2".to_string()),
+                "180" => Some("transpose=dir=1,transpose=dir=1".to_string()),
+                _ => None,
+            },
+        }
+    }
+}
+
 /// What a modifier node does to whatever stream flows through it.
 #[derive(Clone, Debug)]
 pub enum ModifierKind {
@@ -147,6 +312,9 @@ pub enum ModifierKind {
     /// ffmpeg as a single `+`-joined `-disposition:<i>` value (`0` to
     /// explicitly clear all of them).
     Disposition { flags: BTreeSet<String> },
+    /// A `-filter_complex` effect; `fields` holds whatever `name.fields()`
+    /// asks for, same shape/editing flow as Metadata's fields.
+    Filter { name: FilterName, fields: BTreeMap<String, String> },
 }
 
 impl ModifierKind {
@@ -157,6 +325,7 @@ impl ModifierKind {
             // now, so the title just needs to name the kind.
             ModifierKind::Metadata { .. } => "metadata".to_string(),
             ModifierKind::Disposition { .. } => "disposition".to_string(),
+            ModifierKind::Filter { name, .. } => name.label().to_string(),
         }
     }
 }
@@ -202,18 +371,24 @@ pub struct Wire {
 
 /// The result of walking a chain of wires/modifiers back to its ultimate
 /// source stream: which stream it started from, and the effective codec,
-/// metadata, and disposition accumulated from every modifier along the way.
-/// Metadata fields merge across the whole chain (they're independent named
-/// slots), but codec and disposition are each an all-or-nothing setting for
-/// the stream, so whichever modifier sets one first walking backward --
-/// i.e. closest to the output -- wins outright, matching how a real
-/// pipeline's last stage wins.
+/// metadata, disposition, and filter chain accumulated from every modifier
+/// along the way. Metadata fields merge across the whole chain (they're
+/// independent named slots), and filters accumulate as an ordered list
+/// (each is a distinct pipeline stage, so e.g. two Scale nodes both apply,
+/// in chain order) -- but codec and disposition are each an all-or-nothing
+/// setting for the stream, so whichever modifier sets one first walking
+/// backward -- i.e. closest to the output -- wins outright, matching how a
+/// real pipeline's last stage wins.
 pub struct Resolved {
     pub from_node: NodeId,
     pub from_stream_idx: usize,
     pub codec: Codec,
     pub metadata: BTreeMap<String, String>,
     pub disposition: Option<BTreeSet<String>>,
+    /// In source-to-output order (the order the filters should actually be
+    /// applied), even though this is built up walking backward from the
+    /// output.
+    pub filters: Vec<(FilterName, BTreeMap<String, String>)>,
 }
 
 pub struct Graph {
@@ -363,6 +538,7 @@ impl Graph {
         let mut codec = Codec::Copy;
         let mut metadata = BTreeMap::new();
         let mut disposition: Option<BTreeSet<String>> = None;
+        let mut filters: Vec<(FilterName, BTreeMap<String, String>)> = Vec::new();
         let mut current = from;
         let mut hops = 0usize;
         loop {
@@ -378,6 +554,7 @@ impl Graph {
                         codec,
                         metadata,
                         disposition,
+                        filters,
                     });
                 }
                 Endpoint::ModifierOut(mid) => {
@@ -398,6 +575,9 @@ impl Graph {
                                 disposition = Some(flags.clone());
                             }
                         }
+                        ModifierKind::Filter { name, fields } => {
+                            filters.insert(0, (*name, fields.clone()));
+                        }
                     }
                     let incoming = self.wires.iter().find(|w| w.to == Target::ModifierIn(mid))?;
                     current = incoming.from;
@@ -413,11 +593,21 @@ impl Graph {
     /// just before the path -- both exist so `build_preview_args` can reuse
     /// this for a short, temp-file rendition of one output instead of
     /// duplicating the section-building logic.
+    ///
+    /// A resolved stream with a non-empty filter chain gets its own
+    /// `[in]expr,expr[label]` entry pushed onto `filter_complex` (labels are
+    /// unique per call, keyed off `filter_complex`'s running length -- never
+    /// reused, since a real ffmpeg run rejects `-map`ping the same
+    /// filtergraph output label twice, "already used elsewhere") and is
+    /// `-map`ped by that label instead of by `file:stream`; a stream with no
+    /// filters (or whose filters are all unconfigured no-ops) is mapped
+    /// directly, exactly as before this existed.
     fn build_output_section(
         &self,
         output: &OutputNode,
         path_override: Option<&str>,
         extra_args: &[String],
+        filter_complex: &mut Vec<String>,
     ) -> Option<Vec<String>> {
         let resolved: Vec<Resolved> = self
             .incoming(Target::Output(output.id))
@@ -429,15 +619,37 @@ impl Graph {
         }
 
         let mut args = Vec::new();
+        // Per resolved stream, whether it ended up routed through the
+        // filtergraph -- affects the default codec below, since a filtered
+        // stream can't use stream copy (verified against real ffmpeg:
+        // "Filtering and streamcopy cannot be used together", a hard error,
+        // not a warning).
+        let mut was_filtered = Vec::with_capacity(resolved.len());
         for r in &resolved {
-            if let Some(input) = self.input(r.from_node)
-                && let Some(stream) = input.streams.get(r.from_stream_idx) {
-                    args.push("-map".to_string());
-                    args.push(format!("{}:{}", input.file_index, stream.index));
-                }
+            let Some(input) = self.input(r.from_node) else {
+                was_filtered.push(false);
+                continue;
+            };
+            let Some(stream) = input.streams.get(r.from_stream_idx) else {
+                was_filtered.push(false);
+                continue;
+            };
+            let source = format!("{}:{}", input.file_index, stream.index);
+
+            let expr_parts: Vec<String> =
+                r.filters.iter().filter_map(|(name, fields)| name.expression(stream.kind, fields)).collect();
+
+            args.push("-map".to_string());
+            if expr_parts.is_empty() {
+                args.push(source);
+                was_filtered.push(false);
+            } else {
+                let label = format!("f{}", filter_complex.len());
+                filter_complex.push(format!("[{source}]{}[{label}]", expr_parts.join(",")));
+                args.push(format!("[{label}]"));
+                was_filtered.push(true);
+            }
         }
-        args.push("-c".to_string());
-        args.push("copy".to_string());
         // Stream specifiers like -c:0/-metadata:s:0 are scoped to the
         // *current* output section, so the index here is local to this
         // output's own resolved list, not a position in self.wires.
@@ -451,10 +663,23 @@ impl Graph {
         // program marker, not a type selector, so absolute indices work
         // fine there). The bare numeric form is the one that means
         // "absolute output stream index" for both -c and -disposition.
-        for (local_i, r) in resolved.iter().enumerate() {
-            if let Some(name) = r.codec.ffmpeg_name() {
-                args.push(format!("-c:{local_i}"));
-                args.push(name.to_string());
+        for (local_i, (r, &filtered)) in resolved.iter().zip(&was_filtered).enumerate() {
+            match r.codec.ffmpeg_name() {
+                Some(name) => {
+                    args.push(format!("-c:{local_i}"));
+                    args.push(name.to_string());
+                }
+                // No explicit codec chosen: a plain stream defaults to
+                // copy same as always, but a filtered one can't be copied
+                // (its bytes no longer match the source), so it's left
+                // unset instead -- ffmpeg then picks its own default
+                // encoder for the target container, exactly as if this
+                // stream had no -c:i at all.
+                None if !filtered => {
+                    args.push(format!("-c:{local_i}"));
+                    args.push("copy".to_string());
+                }
+                None => {}
             }
             for (key, value) in &r.metadata {
                 args.push(format!("-metadata:s:{local_i}"));
@@ -491,10 +716,23 @@ impl Graph {
             args.push("-i".to_string());
             args.push(input.path.clone());
         }
+        let mut filter_complex = Vec::new();
+        let mut sections = Vec::new();
         for output in &self.outputs {
-            if let Some(section) = self.build_output_section(output, None, &[]) {
-                args.extend(section);
+            if let Some(section) = self.build_output_section(output, None, &[], &mut filter_complex) {
+                sections.push(section);
             }
+        }
+        // -filter_complex is a single global graph (not one per output), so
+        // it has to land once, before any -map references one of its
+        // labels -- everything upstream of this point is still valid
+        // regardless of which/how many outputs actually use a filter.
+        if !filter_complex.is_empty() {
+            args.push("-filter_complex".to_string());
+            args.push(filter_complex.join(";"));
+        }
+        for section in sections {
+            args.extend(section);
         }
         args
     }
@@ -510,8 +748,14 @@ impl Graph {
             args.push("-i".to_string());
             args.push(input.path.clone());
         }
+        let mut filter_complex = Vec::new();
         let extra = vec!["-t".to_string(), duration_secs.to_string()];
-        args.extend(self.build_output_section(output, Some(preview_path), &extra)?);
+        let section = self.build_output_section(output, Some(preview_path), &extra, &mut filter_complex)?;
+        if !filter_complex.is_empty() {
+            args.push("-filter_complex".to_string());
+            args.push(filter_complex.join(";"));
+        }
+        args.extend(section);
         Some(args)
     }
 }

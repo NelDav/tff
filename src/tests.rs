@@ -3,7 +3,7 @@ use std::process::Command;
 use std::sync::mpsc;
 
 use crate::ffmpeg;
-use crate::graph::{Codec, Endpoint, Graph, ModifierKind, StreamInfo, StreamKind, Target};
+use crate::graph::{Codec, Endpoint, FilterName, Graph, ModifierKind, StreamInfo, StreamKind, Target};
 
 fn video_stream() -> Vec<StreamInfo> {
     vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }]
@@ -22,6 +22,10 @@ fn metadata_fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn disposition_set(flags: &[&str]) -> BTreeSet<String> {
     flags.iter().map(|f| f.to_string()).collect()
+}
+
+fn filter_fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -46,8 +50,8 @@ fn direct_wire_resolves_to_stream_copy() {
     assert!(resolved.metadata.is_empty());
 
     let args = graph.build_ffmpeg_args();
-    assert!(args.contains(&"-c".to_string()) && args.contains(&"copy".to_string()));
-    assert!(!args.iter().any(|a| a.starts_with("-c:")), "no per-stream override expected: {args:?}");
+    let joined = args.join(" ");
+    assert!(joined.contains("-c:0 copy"), "expected an explicit per-stream copy default: {joined}");
 }
 
 /// Routing a stream through a Convert modifier should make that codec show
@@ -90,6 +94,51 @@ fn metadata_modifier_sets_language_and_title_override() {
     let joined = args.join(" ");
     assert!(joined.contains("-metadata:s:0 language=eng"), "{joined}");
     assert!(joined.contains("-metadata:s:0 title=Director's Commentary"), "{joined}");
+}
+
+/// A Filter modifier should route its stream through a `-filter_complex`
+/// label instead of a direct `file:stream` map, and -- unlike every other
+/// modifier kind -- must NOT get a bare `-c:<i> copy` default, since ffmpeg
+/// rejects stream-copying a filtered stream outright. This is a pure
+/// arg-string regression test for a real bug hit while building this: the
+/// old blanket `-c copy` broke every filtered output with "Filtering and
+/// streamcopy cannot be used together" (see the end-to-end filter tests for
+/// proof the fixed version actually runs).
+#[test]
+fn filter_modifier_routes_through_filter_complex_and_skips_copy_default() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let modifier =
+        graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: filter_fields(&[("width", "640")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args();
+    let joined = args.join(" ");
+    assert!(joined.contains("-filter_complex"), "{joined}");
+    assert!(joined.contains("[0:0]scale=w=640:h=-1[f0]"), "{joined}");
+    assert!(joined.contains("-map [f0]"), "{joined}");
+    assert!(!joined.contains("-c:0 copy"), "a filtered stream must not default to copy: {joined}");
+}
+
+/// A Filter node with no fields set yet is a no-op, same as an empty
+/// Metadata/Disposition node -- the stream should map directly with no
+/// -filter_complex at all, not an empty or broken one.
+#[test]
+fn unconfigured_filter_modifier_is_a_no_op() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let modifier = graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args();
+    let joined = args.join(" ");
+    assert!(!joined.contains("-filter_complex"), "{joined}");
+    assert!(joined.contains("-map 0:0"), "{joined}");
+    assert!(joined.contains("-c:0 copy"), "{joined}");
 }
 
 /// Chaining a Convert node into a Metadata node should combine both
@@ -530,6 +579,180 @@ fn disposition_picker_confirm_toggles_flag_and_stays_open() {
     let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
     let ModifierKind::Disposition { flags } = &m.kind else { panic!("wrong kind") };
     assert!(!flags.contains("default"), "flag should be cleared again: {flags:?}");
+}
+
+/// 'e' on an unconnected Filter node should refuse, mirroring how Convert's
+/// codec picker refuses until its input is wired up.
+#[test]
+fn activate_modifier_refuses_filter_field_picker_when_unconnected() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.log.last().unwrap().contains("connect this node's input first"));
+}
+
+/// 'e' on a Filter node connected to a stream kind it doesn't apply to
+/// (Scale on an audio stream) should refuse with a clear reason instead of
+/// opening a picker for parameters that would silently do nothing.
+#[test]
+fn activate_modifier_refuses_filter_field_picker_for_wrong_stream_kind() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::ModifierIn(modifier)); // audio
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.log.last().unwrap().contains("doesn't apply to audio streams"));
+}
+
+/// 'e' on a connected, kind-appropriate Filter node should open a picker
+/// listing exactly that filter's curated fields -- and, unlike Metadata's
+/// picker, no "custom key..." escape hatch.
+#[test]
+fn activate_modifier_on_filter_opens_field_picker_for_its_kind() {
+    use crate::app::{App, Focus, Mode, PickerKind};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Crop,
+        fields: filter_fields(&[("width", "640")]),
+    });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+
+    let Mode::Picker { kind, title, options, .. } = &app.mode else {
+        panic!("expected picker mode");
+    };
+    assert!(matches!(kind, PickerKind::FilterField { .. }));
+    assert_eq!(title, "crop: choose field");
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert!(options.iter().any(|o| o.display == "width: 640"), "{displays:?}");
+    assert!(options.iter().any(|o| o.display == "height: (not set)"), "{displays:?}");
+    assert!(options.iter().any(|o| o.display == "x: (not set)"), "{displays:?}");
+    assert!(options.iter().any(|o| o.display == "y: (not set)"), "{displays:?}");
+    assert!(!options.iter().any(|o| o.display.contains("custom key")), "Filter fields have no custom-key escape hatch");
+}
+
+/// Picking a field from the Filter picker should open a value text input,
+/// and confirming it should store the value on the graph -- the same
+/// round trip as Metadata's field editing.
+#[test]
+fn filter_field_picker_confirm_opens_value_input_and_stores_it() {
+    use crate::app::{App, Focus, Mode, TextTarget};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+    let idx = match &app.mode {
+        Mode::Picker { options, .. } => options.iter().position(|o| o.value.as_deref() == Some("width")).unwrap(),
+        _ => panic!("expected picker mode"),
+    };
+    app.picker_move(idx as isize);
+    app.picker_confirm();
+
+    let Mode::TextInput { target, buffer, .. } = &app.mode else {
+        panic!("expected text input mode");
+    };
+    assert!(matches!(target, TextTarget::ModifierFilterValue { key, .. } if key == "width"));
+    assert_eq!(buffer, "");
+
+    for c in "1280".chars() {
+        app.text_input_char(c);
+    }
+    app.confirm_text_input();
+
+    let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
+    let ModifierKind::Filter { fields, .. } = &m.kind else { panic!("wrong kind") };
+    assert_eq!(fields.get("width"), Some(&"1280".to_string()));
+}
+
+/// A field with a fixed set of valid values (Rotate's "direction") should
+/// offer a selection picker instead of free-text entry -- ffmpeg only
+/// accepts a handful of exact strings there, so anything else typed is
+/// simply wrong, not just unusual.
+#[test]
+fn filter_field_with_fixed_values_opens_a_selection_picker_not_free_text() {
+    use crate::app::{App, Focus, Mode, PickerKind};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Rotate, fields: BTreeMap::new() });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier(); // opens the field picker (just "direction" for Rotate)
+    app.picker_confirm(); // pick "direction"
+
+    let Mode::Picker { kind, title, options, .. } = &app.mode else {
+        panic!("expected a second picker for the value, not text input");
+    };
+    assert!(matches!(kind, PickerKind::FilterFieldValue { .. }));
+    assert_eq!(title, "rotate: direction");
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert_eq!(displays, vec!["(not set)", "90cw", "90ccw", "180"]);
+
+    let idx = options.iter().position(|o| o.value.as_deref() == Some("90cw")).unwrap();
+    app.picker_move(idx as isize);
+    app.picker_confirm();
+
+    assert!(matches!(app.mode, Mode::Normal), "picking a value should close back to normal, not stay open");
+    let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
+    let ModifierKind::Filter { fields, .. } = &m.kind else { panic!("wrong kind") };
+    assert_eq!(fields.get("direction"), Some(&"90cw".to_string()));
+}
+
+/// The value-selection picker's "(not set)" entry should clear the field,
+/// mirroring how the Codec/Container pickers' reset entry works.
+#[test]
+fn filter_field_value_picker_reset_entry_clears_the_field() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Rotate,
+        fields: filter_fields(&[("direction", "180")]),
+    });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+    app.picker_confirm(); // pick "direction"
+
+    let Mode::Picker { options, selected, .. } = &app.mode else { panic!("expected picker mode") };
+    assert_eq!(options[*selected].display, "180", "should preselect the current value");
+    let reset_idx = options.iter().position(|o| o.value.is_none()).unwrap();
+    app.picker_move(reset_idx as isize - *selected as isize);
+
+    app.picker_confirm();
+
+    let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
+    let ModifierKind::Filter { fields, .. } = &m.kind else { panic!("wrong kind") };
+    assert!(!fields.contains_key("direction"), "direction should be cleared: {fields:?}");
 }
 
 /// Selecting a curated key from the metadata picker should open a value
@@ -1077,6 +1300,19 @@ fn run_graph_and_wait(graph: &Graph) -> Option<String> {
     done_code
 }
 
+/// A real video+audio file for the filter end-to-end tests below, built
+/// fresh per test into its own temp dir.
+fn make_test_source(dir: &std::path::Path, duration_secs: u32, width: u32, height: u32) -> std::path::PathBuf {
+    let path = dir.join("source.mp4");
+    run_ok(Command::new("ffmpeg").args([
+        "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", &format!("testsrc=duration={duration_secs}:size={width}x{height}:rate=10"),
+        "-f", "lavfi", "-i", &format!("sine=frequency=440:duration={duration_secs}"),
+        "-c:v", "libx264", "-c:a", "aac", "-shortest", path.to_str().unwrap(),
+    ]));
+    path
+}
+
 /// End-to-end check of the core feature: pull one track each from three
 /// different input files and mux them into a single output file via plain
 /// direct wires (no modifiers needed for a straight copy-through).
@@ -1264,6 +1500,313 @@ fn disposition_modifier_sets_flags_on_the_right_stream_end_to_end() {
         text.contains("index=1|disposition:forced=1"),
         "audio stream should have 'forced' set:\n{text}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------
+// Filter-based modifiers: real -filter_complex end-to-end checks
+// ---------------------------------------------------------------------
+
+/// setpts-based video shift: a positive shift should push every frame's
+/// timestamp later, extending the output's total duration by roughly the
+/// same amount (the classic "fix the sync" use case).
+#[test]
+fn filter_shift_video_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-shift-video-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 2, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let modifier =
+        graph.add_modifier(ModifierKind::Filter { name: FilterName::Shift, fields: filter_fields(&[("seconds", "1")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let duration: f64 =
+        String::from_utf8_lossy(&probe.stdout).trim().strip_prefix("duration=").unwrap().parse().unwrap();
+    assert!(duration > 2.7, "expected the 1s shift to extend the ~2s source's duration, got {duration}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// adelay-based audio shift: same idea as the video case, but also the
+/// place a real, verified asymmetry lives -- adelay only accepts
+/// non-negative delays, unlike setpts. Only the positive direction is
+/// exercised here since that's all the filter supports.
+#[test]
+fn filter_shift_audio_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-shift-audio-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 2, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let modifier =
+        graph.add_modifier(ModifierKind::Filter { name: FilterName::Shift, fields: filter_fields(&[("seconds", "1")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: audio_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let duration: f64 =
+        String::from_utf8_lossy(&probe.stdout).trim().strip_prefix("duration=").unwrap().parse().unwrap();
+    assert!(duration > 2.7, "expected the 1s shift to extend the ~2s source's duration, got {duration}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Volume: verified via `volumedetect`'s mean_volume, not just "did ffmpeg
+/// exit 0" -- a factor of 0.1 should read roughly 20dB quieter
+/// (20*log10(0.1) = -20dB) than the unfiltered source.
+#[test]
+fn filter_volume_reduces_loudness_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-volume-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 2, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let modifier =
+        graph.add_modifier(ModifierKind::Filter { name: FilterName::Volume, fields: filter_fields(&[("factor", "0.1")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: audio_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let mean_volume_db = |path: &str| -> f64 {
+        let output = Command::new("ffmpeg")
+            .args(["-i", path, "-af", "volumedetect", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let line = stderr.lines().find(|l| l.contains("mean_volume:")).expect("mean_volume line");
+        line.split("mean_volume:").nth(1).unwrap().trim().trim_end_matches(" dB").parse().unwrap()
+    };
+    let before = mean_volume_db(source_path.to_str().unwrap());
+    let after = mean_volume_db(out_path.to_str().unwrap());
+    assert!(
+        before - after > 15.0,
+        "expected roughly 20dB quieter with volume=0.1, source={before}dB output={after}dB"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scale: only setting width, height left as the picker's "-1" default
+/// (preserve aspect) -- checks both that the filter runs and that the
+/// unset-field default actually behaves as documented.
+#[test]
+fn filter_scale_resizes_video_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-scale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let modifier =
+        graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: filter_fields(&[("width", "80")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=width,height", "-of", "compact", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&probe.stdout);
+    // source is 160x120 (4:3); scaled to width=80 with height left as -1
+    // (preserve aspect) should land on 80x60.
+    assert!(text.contains("width=80|height=60"), "expected 80x60, aspect-preserved from 160x120:\n{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Crop: only width/height set, x/y left to ffmpeg's own centered default.
+#[test]
+fn filter_crop_crops_video_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-crop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let modifier = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Crop,
+        fields: filter_fields(&[("width", "50"), ("height", "40")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=width,height", "-of", "compact", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&probe.stdout);
+    assert!(text.contains("width=50|height=40"), "expected the crop dims regardless of source size:\n{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fade: verified by checking the first frame is actually near-black
+/// (0.0 avg luma with fade-in) versus the source's un-faded first frame
+/// (a colorful `testsrc` pattern, ~127 avg luma) -- not just "ffmpeg exited
+/// 0", which would pass even if the filter silently did nothing.
+#[test]
+fn filter_fade_starts_black_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-fade-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 2, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let modifier = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Fade,
+        fields: filter_fields(&[("type", "in"), ("start", "0"), ("duration", "1")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let avg_luma_of_first_frame = |path: &str| -> f64 {
+        let output = Command::new("ffmpeg")
+            .args(["-i", path, "-vframes", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+            .output()
+            .unwrap();
+        let data = output.stdout;
+        data.iter().map(|&b| b as f64).sum::<f64>() / data.len() as f64
+    };
+    let faded = avg_luma_of_first_frame(out_path.to_str().unwrap());
+    assert!(faded < 5.0, "expected the fade-in's first frame to be near-black, got avg luma {faded}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Rotate: 90-degree directions should swap width/height; 180 (two chained
+/// 90s) should preserve the original dimensions.
+#[test]
+fn filter_rotate_swaps_dimensions_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-rotate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+
+    let dims = |direction: &str| -> (String, String) {
+        let out_path = dir.join(format!("out-{direction}.mkv"));
+        let mut graph = Graph::new();
+        let out = graph.outputs[0].id;
+        let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+        let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+        let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+        let modifier = graph.add_modifier(ModifierKind::Filter {
+            name: FilterName::Rotate,
+            fields: filter_fields(&[("direction", direction)]),
+        });
+        graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
+        graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+        graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+        assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", out_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let mut parts = text.trim().split(',');
+        (parts.next().unwrap().to_string(), parts.next().unwrap().to_string())
+    };
+
+    assert_eq!(dims("90cw"), ("120".to_string(), "160".to_string()), "90cw should swap 160x120 -> 120x160");
+    assert_eq!(dims("180"), ("160".to_string(), "120".to_string()), "180 should preserve 160x120");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two Filter modifiers chained on one wire (Scale then Crop) should both
+/// apply, in order -- exercised through the real Graph/resolve()/
+/// build_output_section() path, not just by hand-assembling ffmpeg args,
+/// since that's the actual integration point for multi-filter chains.
+#[test]
+fn filter_chain_of_two_modifiers_applies_both_in_order_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-filter-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+
+    let scale = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Scale,
+        fields: filter_fields(&[("width", "100"), ("height", "100")]),
+    });
+    let crop = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Crop,
+        fields: filter_fields(&[("width", "50"), ("height", "50")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(scale));
+    graph.connect(Endpoint::ModifierOut(scale), Target::ModifierIn(crop));
+    graph.connect(Endpoint::ModifierOut(crop), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=width,height", "-of", "compact", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&probe.stdout);
+    // If only scale had applied: 100x100. If only crop had applied (crop's
+    // own "iw"/"ih" default on the unscaled 160x120 source): still wrong.
+    // 50x50 is reachable only if both stages actually ran in order.
+    assert!(text.contains("width=50|height=50"), "expected both scale and crop to apply in order:\n{text}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1659,6 +2202,42 @@ fn ui_renders_disposition_picker_and_node_flag_list() {
     assert!(screen.contains("[ ] hearing_impaired"), "expected an unchecked curated flag:\n{screen}");
     assert!(screen.contains("default"), "expected 'default' listed in the node's upper section:\n{screen}");
     assert!(screen.contains("forced"), "expected 'forced' listed in the node's upper section:\n{screen}");
+}
+
+/// A Filter node's field picker should render its curated fields, and the
+/// node itself should list its set parameters in the same two-part upper-
+/// section layout as Metadata/Disposition.
+#[test]
+fn ui_renders_filter_field_picker_and_node_parameter_list() {
+    use crate::app::{App, Focus};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Scale,
+        fields: filter_fields(&[("width", "1280")]),
+    });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(idx);
+    app.activate_modifier();
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(screen.contains("[scale]"), "expected the node's title tag:\n{screen}");
+    assert!(screen.contains("scale: choose field"), "expected the picker title:\n{screen}");
+    assert!(screen.contains("width: 1280"), "expected the current value in the picker:\n{screen}");
+    assert!(screen.contains("height: (not set)"), "expected an unset curated field in the picker:\n{screen}");
+    assert!(screen.contains("width: 1280"), "expected the field listed in the node's upper section:\n{screen}");
 }
 
 /// Regression test for the row-offset math that places wire endpoints on a

@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::ffmpeg;
-use crate::graph::{Codec, Endpoint, Graph, ModifierKind, NodeId, StreamKind, Target};
+use crate::graph::{Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, StreamKind, Target};
 
 /// Common containers offered first in the picker, ahead of the rest of
 /// ffmpeg's discovered muxer list. Paired with the file extension to switch
@@ -41,6 +41,11 @@ pub enum TextTarget {
     /// Step one of "custom key...": typing the key name itself, before the
     /// value prompt for it opens.
     ModifierCustomKey(NodeId),
+    /// Typing the value for a specific parameter of a Filter node.
+    ModifierFilterValue {
+        modifier: NodeId,
+        key: String,
+    },
 }
 
 pub enum PickerKind {
@@ -62,6 +67,18 @@ pub enum PickerKind {
     /// and leaves the picker open instead of closing it.
     DispositionFlags {
         modifier: NodeId,
+    },
+    /// Choosing which parameter to edit on a Filter node.
+    FilterField {
+        modifier: NodeId,
+    },
+    /// Choosing a value for a Filter parameter that only accepts a fixed
+    /// set of values (see `FilterName::value_options`), e.g. Rotate's
+    /// "direction" -- a selection instead of `ModifierFilterValue`'s free
+    /// text, since anything else typed there is simply invalid.
+    FilterFieldValue {
+        modifier: NodeId,
+        key: String,
     },
 }
 
@@ -280,6 +297,30 @@ impl App {
                 display: "disposition (default / forced / ...)".to_string(),
                 value: Some("disposition".to_string()),
             },
+            PickerEntry {
+                display: "shift (audio/video sync delay)".to_string(),
+                value: Some("shift".to_string()),
+            },
+            PickerEntry {
+                display: "volume".to_string(),
+                value: Some("volume".to_string()),
+            },
+            PickerEntry {
+                display: "scale (resize)".to_string(),
+                value: Some("scale".to_string()),
+            },
+            PickerEntry {
+                display: "crop".to_string(),
+                value: Some("crop".to_string()),
+            },
+            PickerEntry {
+                display: "fade in/out".to_string(),
+                value: Some("fade".to_string()),
+            },
+            PickerEntry {
+                display: "rotate (90/180 degrees)".to_string(),
+                value: Some("rotate".to_string()),
+            },
         ];
         self.mode = Mode::Picker {
             kind: PickerKind::NewModifier,
@@ -383,33 +424,7 @@ impl App {
                 // finished, unlike a codec choice.
                 let kind = self.modifier_input_kind(mid).unwrap_or(StreamKind::Other);
                 let keys = crate::graph::metadata_keys_for(kind);
-                let mut options: Vec<PickerEntry> = keys
-                    .iter()
-                    .map(|k| {
-                        let display = match fields.get(*k) {
-                            Some(v) => format!("{k}: {v}"),
-                            None => format!("{k}: (not set)"),
-                        };
-                        PickerEntry {
-                            display,
-                            value: Some((*k).to_string()),
-                        }
-                    })
-                    .collect();
-                // Any already-set keys outside the curated list (set via a
-                // previous "custom key...") should still be visible/editable.
-                for (k, v) in fields {
-                    if !keys.contains(&k.as_str()) {
-                        options.push(PickerEntry {
-                            display: format!("{k}: {v}"),
-                            value: Some(k.clone()),
-                        });
-                    }
-                }
-                options.push(PickerEntry {
-                    display: "custom key…".to_string(),
-                    value: None,
-                });
+                let options = field_picker_options(fields, keys, true);
 
                 self.mode = Mode::Picker {
                     kind: PickerKind::MetadataKey { modifier: mid },
@@ -425,6 +440,29 @@ impl App {
                     kind: PickerKind::DispositionFlags { modifier: mid },
                     title: "disposition: toggle flags".to_string(),
                     options: disposition_picker_options(flags),
+                    selected: 0,
+                    query: String::new(),
+                    searching: false,
+                };
+            }
+            ModifierKind::Filter { name, fields } => {
+                let Some(kind) = self.modifier_input_kind(mid) else {
+                    self.log.push(format!(
+                        "connect this node's input first ('c'), then 'e' to configure {}",
+                        name.label()
+                    ));
+                    return;
+                };
+                if !name.applies_to(kind) {
+                    self.log.push(format!("{} doesn't apply to {} streams", name.label(), kind.noun()));
+                    return;
+                }
+                let options = field_picker_options(fields, name.fields(), false);
+
+                self.mode = Mode::Picker {
+                    kind: PickerKind::FilterField { modifier: mid },
+                    title: format!("{}: choose field", name.label()),
+                    options,
                     selected: 0,
                     query: String::new(),
                     searching: false,
@@ -494,7 +532,9 @@ impl App {
                     .modifier(modifier)
                     .and_then(|m| match &m.kind {
                         ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
-                        ModifierKind::Convert(_) | ModifierKind::Disposition { .. } => None,
+                        ModifierKind::Convert(_)
+                        | ModifierKind::Disposition { .. }
+                        | ModifierKind::Filter { .. } => None,
                     })
                     .unwrap_or_default();
                 self.mode = Mode::TextInput {
@@ -503,6 +543,20 @@ impl App {
                     suggestions: Vec::new(),
                     selected: 0,
                 };
+            }
+            TextTarget::ModifierFilterValue { modifier, key } => {
+                let value = buffer.trim().to_string();
+                if let Some(m) = self.graph.modifier_mut(modifier)
+                    && let ModifierKind::Filter { fields, .. } = &mut m.kind
+                {
+                    if value.is_empty() {
+                        fields.remove(&key);
+                        self.log.push(format!("{key} cleared"));
+                    } else {
+                        fields.insert(key.clone(), value.clone());
+                        self.log.push(format!("{key} set to {value}"));
+                    }
+                }
             }
         }
     }
@@ -923,6 +977,12 @@ impl App {
                         },
                         "disposition",
                     ),
+                    Some("shift") => (filter_modifier(FilterName::Shift), "shift"),
+                    Some("volume") => (filter_modifier(FilterName::Volume), "volume"),
+                    Some("scale") => (filter_modifier(FilterName::Scale), "scale"),
+                    Some("crop") => (filter_modifier(FilterName::Crop), "crop"),
+                    Some("fade") => (filter_modifier(FilterName::Fade), "fade"),
+                    Some("rotate") => (filter_modifier(FilterName::Rotate), "rotate"),
                     _ => (ModifierKind::Convert(Codec::Copy), "convert"),
                 };
                 self.graph.add_modifier(kind);
@@ -936,7 +996,9 @@ impl App {
                         .modifier(modifier)
                         .and_then(|m| match &m.kind {
                             ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
-                            ModifierKind::Convert(_) | ModifierKind::Disposition { .. } => None,
+                            ModifierKind::Convert(_)
+                            | ModifierKind::Disposition { .. }
+                            | ModifierKind::Filter { .. } => None,
                         })
                         .unwrap_or_default();
                     self.mode = Mode::TextInput {
@@ -958,6 +1020,59 @@ impl App {
             },
             PickerKind::DispositionFlags { .. } => {
                 unreachable!("handled above before `entry` is computed")
+            }
+            PickerKind::FilterField { modifier } => {
+                // No "custom key..." entry for Filter fields (see
+                // field_picker_options), so entry.value is always Some.
+                let Some(key) = entry.value else { return };
+                let Some(ModifierKind::Filter { name, fields }) =
+                    self.graph.modifier(modifier).map(|m| &m.kind)
+                else {
+                    return;
+                };
+                let current = fields.get(&key).cloned();
+
+                // A field with a fixed set of valid values (e.g. Rotate's
+                // "direction") gets a selection instead of free text --
+                // anything else typed there is simply invalid, not just an
+                // unusual choice.
+                if let Some(values) = name.value_options(&key) {
+                    let options =
+                        picker_options("(not set)", values.iter().map(|v| v.to_string()).collect());
+                    let selected = selected_index(&options, current.as_deref());
+                    self.mode = Mode::Picker {
+                        kind: PickerKind::FilterFieldValue { modifier, key: key.clone() },
+                        title: format!("{}: {key}", name.label()),
+                        options,
+                        selected,
+                        query: String::new(),
+                        searching: false,
+                    };
+                    return;
+                }
+
+                self.mode = Mode::TextInput {
+                    target: TextTarget::ModifierFilterValue { modifier, key },
+                    buffer: current.unwrap_or_default(),
+                    suggestions: Vec::new(),
+                    selected: 0,
+                };
+            }
+            PickerKind::FilterFieldValue { modifier, key } => {
+                if let Some(m) = self.graph.modifier_mut(modifier)
+                    && let ModifierKind::Filter { fields, .. } = &mut m.kind
+                {
+                    match entry.value {
+                        Some(value) => {
+                            fields.insert(key.clone(), value.clone());
+                            self.log.push(format!("{key} set to {value}"));
+                        }
+                        None => {
+                            fields.remove(&key);
+                            self.log.push(format!("{key} cleared"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1241,6 +1356,37 @@ fn selected_index(options: &[PickerEntry], current: Option<&str>) -> usize {
             .position(|o| o.value.as_deref() == Some(name))
             .unwrap_or(0),
     }
+}
+
+/// Shared by Metadata and Filter nodes: one entry per curated key, showing
+/// its current value or "(not set)". `allow_custom` additionally lists any
+/// already-set key outside the curated list (reachable only via Metadata's
+/// "custom key..." escape hatch) plus that escape hatch itself -- a Filter
+/// node's parameter set is fixed, so it never needs one.
+fn filter_modifier(name: FilterName) -> ModifierKind {
+    ModifierKind::Filter { name, fields: BTreeMap::new() }
+}
+
+fn field_picker_options(fields: &BTreeMap<String, String>, keys: &[&str], allow_custom: bool) -> Vec<PickerEntry> {
+    let mut options: Vec<PickerEntry> = keys
+        .iter()
+        .map(|k| {
+            let display = match fields.get(*k) {
+                Some(v) => format!("{k}: {v}"),
+                None => format!("{k}: (not set)"),
+            };
+            PickerEntry { display, value: Some((*k).to_string()) }
+        })
+        .collect();
+    if allow_custom {
+        for (k, v) in fields {
+            if !keys.contains(&k.as_str()) {
+                options.push(PickerEntry { display: format!("{k}: {v}"), value: Some(k.clone()) });
+            }
+        }
+        options.push(PickerEntry { display: "custom key…".to_string(), value: None });
+    }
+    options
 }
 
 /// The disposition picker's option list: one entry per curated flag, with a
