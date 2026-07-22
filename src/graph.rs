@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub type NodeId = usize;
@@ -127,21 +127,36 @@ pub fn metadata_keys_for(_kind: StreamKind) -> &'static [&'static str] {
     &["language", "title", "handler_name"]
 }
 
+/// The disposition flags offered by the picker. `ffmpeg -dispositions`
+/// reports 19 in total, most of which are niche container-level bookkeeping
+/// (`attached_pic`, `still_image`, `multilayer`, `timed_thumbnails`, ...).
+/// This is the practically useful subset for marking a track's role: which
+/// one plays by default, which subtitle track is "forced", and the common
+/// accessibility/dub-language markers.
+pub fn disposition_flags() -> &'static [&'static str] {
+    &["default", "forced", "hearing_impaired", "visual_impaired", "original", "dub", "comment", "lyrics", "karaoke"]
+}
+
 /// What a modifier node does to whatever stream flows through it.
 #[derive(Clone, Debug)]
 pub enum ModifierKind {
     Convert(Codec),
     /// Arbitrary `-metadata:s:<i> key=value` pairs, keyed by field name.
     Metadata { fields: BTreeMap<String, String> },
+    /// Which of `disposition_flags()` are set on this stream, passed to
+    /// ffmpeg as a single `+`-joined `-disposition:<i>` value (`0` to
+    /// explicitly clear all of them).
+    Disposition { flags: BTreeSet<String> },
 }
 
 impl ModifierKind {
     pub fn short_label(&self) -> String {
         match self {
             ModifierKind::Convert(codec) => format!("convert: {}", codec.label()),
-            // The fields themselves are listed in the node's body now, so
-            // the title just needs to name the kind.
+            // The fields/flags themselves are listed in the node's body
+            // now, so the title just needs to name the kind.
             ModifierKind::Metadata { .. } => "metadata".to_string(),
+            ModifierKind::Disposition { .. } => "disposition".to_string(),
         }
     }
 }
@@ -186,15 +201,19 @@ pub struct Wire {
 }
 
 /// The result of walking a chain of wires/modifiers back to its ultimate
-/// source stream: which stream it started from, and the effective codec
-/// and metadata accumulated from every modifier along the way (the
-/// modifier closest to the output wins for any field more than one
-/// modifier sets, matching how a real pipeline's last stage wins).
+/// source stream: which stream it started from, and the effective codec,
+/// metadata, and disposition accumulated from every modifier along the way.
+/// Metadata fields merge across the whole chain (they're independent named
+/// slots), but codec and disposition are each an all-or-nothing setting for
+/// the stream, so whichever modifier sets one first walking backward --
+/// i.e. closest to the output -- wins outright, matching how a real
+/// pipeline's last stage wins.
 pub struct Resolved {
     pub from_node: NodeId,
     pub from_stream_idx: usize,
     pub codec: Codec,
     pub metadata: BTreeMap<String, String>,
+    pub disposition: Option<BTreeSet<String>>,
 }
 
 pub struct Graph {
@@ -343,6 +362,7 @@ impl Graph {
     pub fn resolve(&self, from: Endpoint) -> Option<Resolved> {
         let mut codec = Codec::Copy;
         let mut metadata = BTreeMap::new();
+        let mut disposition: Option<BTreeSet<String>> = None;
         let mut current = from;
         let mut hops = 0usize;
         loop {
@@ -352,7 +372,13 @@ impl Graph {
             }
             match current {
                 Endpoint::Stream { node, stream_idx } => {
-                    return Some(Resolved { from_node: node, from_stream_idx: stream_idx, codec, metadata });
+                    return Some(Resolved {
+                        from_node: node,
+                        from_stream_idx: stream_idx,
+                        codec,
+                        metadata,
+                        disposition,
+                    });
                 }
                 Endpoint::ModifierOut(mid) => {
                     let m = self.modifier(mid)?;
@@ -365,6 +391,11 @@ impl Graph {
                         ModifierKind::Metadata { fields } => {
                             for (k, v) in fields {
                                 metadata.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        ModifierKind::Disposition { flags } => {
+                            if disposition.is_none() {
+                                disposition = Some(flags.clone());
                             }
                         }
                     }
@@ -410,6 +441,16 @@ impl Graph {
         // Stream specifiers like -c:0/-metadata:s:0 are scoped to the
         // *current* output section, so the index here is local to this
         // output's own resolved list, not a position in self.wires.
+        //
+        // -disposition deliberately uses the bare bare `:0` form (no `s:`
+        // prefix) like -c does, *not* -metadata's `:s:0` form: verified
+        // against a real ffmpeg build that `-disposition:s:N` silently
+        // no-ops (there, "s" is the stream-*type* letter for subtitle, so
+        // "s:0" means "the first subtitle stream" -- for -metadata, by
+        // contrast, "s:" is metadata's own fixed stream-vs-chapter-vs-
+        // program marker, not a type selector, so absolute indices work
+        // fine there). The bare numeric form is the one that means
+        // "absolute output stream index" for both -c and -disposition.
         for (local_i, r) in resolved.iter().enumerate() {
             if let Some(name) = r.codec.ffmpeg_name() {
                 args.push(format!("-c:{local_i}"));
@@ -418,6 +459,14 @@ impl Graph {
             for (key, value) in &r.metadata {
                 args.push(format!("-metadata:s:{local_i}"));
                 args.push(format!("{key}={value}"));
+            }
+            if let Some(flags) = &r.disposition {
+                args.push(format!("-disposition:{local_i}"));
+                args.push(if flags.is_empty() {
+                    "0".to_string()
+                } else {
+                    flags.iter().cloned().collect::<Vec<_>>().join("+")
+                });
             }
         }
         if let Some(container) = &output.container {

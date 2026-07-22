@@ -109,6 +109,7 @@ fn modifier_field_rows(kind: &ModifierKind) -> u16 {
     match kind {
         ModifierKind::Convert(_) => 0,
         ModifierKind::Metadata { fields } => fields.len().max(1) as u16 + 1, // + divider
+        ModifierKind::Disposition { flags } => flags.len().max(1) as u16 + 1, // + divider
     }
 }
 
@@ -412,9 +413,9 @@ fn draw_input_node(
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-/// A Metadata modifier's box has an upper section listing every field it
-/// sets (with the value that will be written) above a divider; every
-/// modifier then has a connections section below -- first its single
+/// A Metadata or Disposition modifier's box has an upper section listing
+/// everything it sets (field values, or active flags) above a divider;
+/// every modifier then has a connections section below -- first its single
 /// incoming connection (or lack of one), then its outgoing connections one
 /// per row, the same way an output node lists its incoming ones.
 fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &ModifierNode) {
@@ -428,16 +429,30 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
 
     let mut lines = Vec::new();
 
-    if let ModifierKind::Metadata { fields } = &node.kind {
-        if fields.is_empty() {
-            lines.push(TextLine::styled("(no metadata set)", Style::default().fg(Color::DarkGray)));
-        } else {
-            for (key, value) in fields {
-                lines.push(TextLine::from(format!("{key}: {value}")));
+    match &node.kind {
+        ModifierKind::Metadata { fields } => {
+            if fields.is_empty() {
+                lines.push(TextLine::styled("(no metadata set)", Style::default().fg(Color::DarkGray)));
+            } else {
+                for (key, value) in fields {
+                    lines.push(TextLine::from(format!("{key}: {value}")));
+                }
             }
+            let divider_width = rect.width.saturating_sub(2) as usize;
+            lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
         }
-        let divider_width = rect.width.saturating_sub(2) as usize;
-        lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
+        ModifierKind::Disposition { flags } => {
+            if flags.is_empty() {
+                lines.push(TextLine::styled("(no dispositions set)", Style::default().fg(Color::DarkGray)));
+            } else {
+                for flag in flags {
+                    lines.push(TextLine::from(flag.clone()));
+                }
+            }
+            let divider_width = rect.width.saturating_sub(2) as usize;
+            lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
+        }
+        ModifierKind::Convert(_) => {}
     }
 
     let incoming_wire = app.graph.wires.iter().find(|w| w.to == Target::ModifierIn(node.id));

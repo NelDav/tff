@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::sync::mpsc;
 
@@ -18,6 +18,10 @@ fn video_audio_streams() -> Vec<StreamInfo> {
 
 fn metadata_fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+fn disposition_set(flags: &[&str]) -> BTreeSet<String> {
+    flags.iter().map(|f| f.to_string()).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -469,6 +473,63 @@ fn activate_modifier_on_metadata_opens_key_picker_with_current_values() {
     assert!(options.iter().any(|o| o.display == "handler_name: (not set)"));
     assert_eq!(options.last().unwrap().display, "custom key…", "custom-key escape hatch should be last");
     assert!(options.last().unwrap().value.is_none());
+}
+
+/// 'e' on a Disposition node should open a picker listing every curated
+/// flag with a checkbox reflecting whether it's currently set.
+#[test]
+fn activate_modifier_on_disposition_opens_flag_picker_with_checkboxes() {
+    use crate::app::{App, Focus, Mode, PickerKind};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::Disposition { flags: disposition_set(&["forced"]) });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+
+    let Mode::Picker { kind, options, .. } = &app.mode else {
+        panic!("expected picker mode");
+    };
+    assert!(matches!(kind, PickerKind::DispositionFlags { .. }));
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert!(options.iter().any(|o| o.display == "[x] forced"), "{displays:?}");
+    assert!(options.iter().any(|o| o.display == "[ ] default"), "{displays:?}");
+}
+
+/// Confirming a disposition flag should toggle it in the graph and keep the
+/// picker open with the checkbox flipped -- unlike every other picker kind,
+/// this one is a multi-select, so Enter shouldn't close it. Toggling the
+/// same flag again should turn it back off.
+#[test]
+fn disposition_picker_confirm_toggles_flag_and_stays_open() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::Disposition { flags: BTreeSet::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+    app.activate_modifier();
+
+    let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let default_row = options.iter().position(|o| o.display == "[ ] default").unwrap();
+    // Move onto "default"'s row (picker opens with row 0 selected).
+    app.picker_move(default_row as isize);
+
+    app.picker_confirm();
+
+    assert!(matches!(app.mode, Mode::Picker { .. }), "picker should stay open after toggling");
+    let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
+    let ModifierKind::Disposition { flags } = &m.kind else { panic!("wrong kind") };
+    assert!(flags.contains("default"), "flag should now be set: {flags:?}");
+    let Mode::Picker { options, .. } = &app.mode else { unreachable!() };
+    assert!(options.iter().any(|o| o.display == "[x] default"), "checkbox should reflect the toggle");
+
+    app.picker_confirm(); // toggle it back off
+
+    let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
+    let ModifierKind::Disposition { flags } = &m.kind else { panic!("wrong kind") };
+    assert!(!flags.contains("default"), "flag should be cleared again: {flags:?}");
 }
 
 /// Selecting a curated key from the metadata picker should open a value
@@ -1145,6 +1206,68 @@ fn metadata_modifier_applies_language_and_title_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// End-to-end check that a Disposition modifier's flags land on the right
+/// stream. Written specifically to catch a real gotcha found while building
+/// this: `-disposition:s:<i>` (mirroring how `-metadata:s:<i>` is built)
+/// silently no-ops, because for `-disposition` the `s` is the generic
+/// stream-specifier's *type* letter (subtitle) rather than a fixed
+/// "this targets a stream" marker the way it is for `-metadata`. The
+/// bare-index form (`-disposition:<i>`, like `-c:<i>`) is the one that
+/// actually addresses "the i-th mapped output stream".
+#[test]
+fn disposition_modifier_sets_flags_on_the_right_stream_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-disposition-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source_path = dir.join("source.mp4");
+    let out_path = dir.join("out.mkv");
+
+    run_ok(Command::new("ffmpeg").args([
+        "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=5",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+        "-c:v", "libx264", "-c:a", "aac", "-shortest", source_path.to_str().unwrap(),
+    ]));
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+
+    // Video mapped first (stream 0 in the output) with no Disposition
+    // modifier, audio mapped second (stream 1) with "forced" set on it --
+    // so the test also catches a wrong-index regression, not just a
+    // wrong-specifier one.
+    let modifier = graph.add_modifier(ModifierKind::Disposition { flags: disposition_set(&["forced"]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::Output(out));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: audio_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-show_entries", "stream=index:stream_disposition=forced",
+            "-of", "compact", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        text.contains("index=0|disposition:forced=0"),
+        "video stream shouldn't have 'forced' set:\n{text}"
+    );
+    assert!(
+        text.contains("index=1|disposition:forced=1"),
+        "audio stream should have 'forced' set:\n{text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// End-to-end check that a chain (Convert then Metadata) applies *both*
 /// effects to the real output file in one ffmpeg run.
 #[test]
@@ -1505,6 +1628,39 @@ fn ui_renders_metadata_picker_and_node_summary() {
     assert!(screen.contains("handler_name: (not set)"), "expected the third curated field:\n{screen}");
     assert!(screen.contains("custom key"), "expected the custom-key escape hatch:\n{screen}");
 }
+
+/// The disposition flag picker should render its checkboxes, and the
+/// modifier node itself should list its active flags in the upper section.
+#[test]
+fn ui_renders_disposition_picker_and_node_flag_list() {
+    use crate::app::{App, Focus};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let modifier =
+        app.graph.add_modifier(ModifierKind::Disposition { flags: disposition_set(&["forced", "default"]) });
+    let idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(idx);
+    app.activate_modifier();
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(screen.contains("[disposition]"), "expected the node's title tag:\n{screen}");
+    assert!(screen.contains("disposition: toggle flags"), "expected the picker title:\n{screen}");
+    assert!(screen.contains("[x] forced"), "expected the picker's checked box for forced:\n{screen}");
+    assert!(screen.contains("[ ] hearing_impaired"), "expected an unchecked curated flag:\n{screen}");
+    assert!(screen.contains("default"), "expected 'default' listed in the node's upper section:\n{screen}");
+    assert!(screen.contains("forced"), "expected 'forced' listed in the node's upper section:\n{screen}");
+}
+
 /// Regression test for the row-offset math that places wire endpoints on a
 /// Metadata node: its field section grows with however many fields are set,
 /// which pushes the incoming/outgoing connection rows (and thus where wires

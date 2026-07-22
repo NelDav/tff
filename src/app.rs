@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -34,7 +34,10 @@ pub enum TextTarget {
     OutputPath(NodeId),
     /// Typing the value for a specific metadata key (curated or custom) on
     /// a Metadata node.
-    ModifierMetadataValue { modifier: NodeId, key: String },
+    ModifierMetadataValue {
+        modifier: NodeId,
+        key: String,
+    },
     /// Step one of "custom key...": typing the key name itself, before the
     /// value prompt for it opens.
     ModifierCustomKey(NodeId),
@@ -42,12 +45,24 @@ pub enum TextTarget {
 
 pub enum PickerKind {
     /// The modifier whose Convert codec is being chosen.
-    Codec { modifier: NodeId },
-    Container { output: NodeId },
+    Codec {
+        modifier: NodeId,
+    },
+    Container {
+        output: NodeId,
+    },
     /// Choosing which kind of modifier node 'm' should create.
     NewModifier,
     /// Choosing which metadata field to edit on a Metadata node.
-    MetadataKey { modifier: NodeId },
+    MetadataKey {
+        modifier: NodeId,
+    },
+    /// Toggling disposition flags on a Disposition node. Unlike every other
+    /// picker kind, this is a multi-select: confirming an entry toggles it
+    /// and leaves the picker open instead of closing it.
+    DispositionFlags {
+        modifier: NodeId,
+    },
 }
 
 pub struct PickerEntry {
@@ -176,7 +191,9 @@ impl App {
         } else if idx < n_inputs + n_modifiers {
             Focus::Modifier(idx - n_inputs)
         } else {
-            Focus::Output((idx - n_inputs - n_modifiers).min(self.graph.outputs.len().saturating_sub(1)))
+            Focus::Output(
+                (idx - n_inputs - n_modifiers).min(self.graph.outputs.len().saturating_sub(1)),
+            )
         };
         self.row_idx = 0;
     }
@@ -198,11 +215,9 @@ impl App {
     pub fn cycle_row(&mut self, forward: bool) {
         let len = match self.focus {
             Focus::Input(i) => self.graph.inputs.get(i).map_or(0, |n| n.streams.len()),
-            Focus::Modifier(i) => self
-                .graph
-                .modifiers
-                .get(i)
-                .map_or(0, |m| self.graph.outgoing(Endpoint::ModifierOut(m.id)).len()),
+            Focus::Modifier(i) => self.graph.modifiers.get(i).map_or(0, |m| {
+                self.graph.outgoing(Endpoint::ModifierOut(m.id)).len()
+            }),
             Focus::Output(i) => self
                 .graph
                 .outputs
@@ -253,8 +268,18 @@ impl App {
     /// 'm': open a picker to choose which kind of modifier node to add.
     pub fn open_add_modifier_picker(&mut self) {
         let options = vec![
-            PickerEntry { display: "convert (codec)".to_string(), value: Some("convert".to_string()) },
-            PickerEntry { display: "metadata (language / title)".to_string(), value: Some("metadata".to_string()) },
+            PickerEntry {
+                display: "convert (codec)".to_string(),
+                value: Some("convert".to_string()),
+            },
+            PickerEntry {
+                display: "metadata (language / title)".to_string(),
+                value: Some("metadata".to_string()),
+            },
+            PickerEntry {
+                display: "disposition (default / forced / ...)".to_string(),
+                value: Some("disposition".to_string()),
+            },
         ];
         self.mode = Mode::Picker {
             kind: PickerKind::NewModifier,
@@ -270,10 +295,13 @@ impl App {
     /// focused -- there's nothing to edit on an input or modifier node.
     pub fn start_edit_output(&mut self) {
         let Focus::Output(i) = self.focus else {
-            self.log.push("focus an output node first, then 'o' edits its path".to_string());
+            self.log
+                .push("focus an output node first, then 'o' edits its path".to_string());
             return;
         };
-        let Some(output) = self.graph.outputs.get(i) else { return };
+        let Some(output) = self.graph.outputs.get(i) else {
+            return;
+        };
         let buffer = output.path.clone();
         let suggestions = path_suggestions(&buffer);
         self.mode = Mode::TextInput {
@@ -287,7 +315,11 @@ impl App {
     /// The stream kind flowing into a modifier, if it's connected --
     /// traced back through however many other modifiers sit upstream.
     fn modifier_input_kind(&self, modifier_id: NodeId) -> Option<StreamKind> {
-        let incoming = self.graph.wires.iter().find(|w| w.to == Target::ModifierIn(modifier_id))?;
+        let incoming = self
+            .graph
+            .wires
+            .iter()
+            .find(|w| w.to == Target::ModifierIn(modifier_id))?;
         let resolved = self.graph.resolve(incoming.from)?;
         let input = self.graph.input(resolved.from_node)?;
         input.streams.get(resolved.from_stream_idx).map(|s| s.kind)
@@ -299,16 +331,21 @@ impl App {
     /// for a Metadata node.
     pub fn activate_modifier(&mut self) {
         let Focus::Modifier(i) = self.focus else {
-            self.log.push("focus a convert or metadata node, then 'e' edits its setting".to_string());
+            self.log
+                .push("focus a convert or metadata node, then 'e' edits its setting".to_string());
             return;
         };
-        let Some(m) = self.graph.modifiers.get(i) else { return };
+        let Some(m) = self.graph.modifiers.get(i) else {
+            return;
+        };
         let mid = m.id;
         match &m.kind {
             ModifierKind::Convert(current) => {
                 let Some(kind) = self.modifier_input_kind(mid) else {
-                    self.log
-                        .push("connect this node's input first ('c'), then 'e' to pick a codec".to_string());
+                    self.log.push(
+                        "connect this node's input first ('c'), then 'e' to pick a codec"
+                            .to_string(),
+                    );
                     return;
                 };
                 let current = current.clone();
@@ -319,7 +356,10 @@ impl App {
                     .collect();
                 prioritize_and_extend(
                     &mut names,
-                    self.available_encoders.iter().filter(|(_, k)| *k == kind).map(|(n, _)| n.as_str()),
+                    self.available_encoders
+                        .iter()
+                        .filter(|(_, k)| *k == kind)
+                        .map(|(n, _)| n.as_str()),
                 );
                 let options = picker_options("copy (no re-encode)", names);
                 let selected = selected_index(&options, current.ffmpeg_name());
@@ -350,22 +390,41 @@ impl App {
                             Some(v) => format!("{k}: {v}"),
                             None => format!("{k}: (not set)"),
                         };
-                        PickerEntry { display, value: Some((*k).to_string()) }
+                        PickerEntry {
+                            display,
+                            value: Some((*k).to_string()),
+                        }
                     })
                     .collect();
                 // Any already-set keys outside the curated list (set via a
                 // previous "custom key...") should still be visible/editable.
                 for (k, v) in fields {
                     if !keys.contains(&k.as_str()) {
-                        options.push(PickerEntry { display: format!("{k}: {v}"), value: Some(k.clone()) });
+                        options.push(PickerEntry {
+                            display: format!("{k}: {v}"),
+                            value: Some(k.clone()),
+                        });
                     }
                 }
-                options.push(PickerEntry { display: "custom key…".to_string(), value: None });
+                options.push(PickerEntry {
+                    display: "custom key…".to_string(),
+                    value: None,
+                });
 
                 self.mode = Mode::Picker {
                     kind: PickerKind::MetadataKey { modifier: mid },
                     title: "metadata: choose field".to_string(),
                     options,
+                    selected: 0,
+                    query: String::new(),
+                    searching: false,
+                };
+            }
+            ModifierKind::Disposition { flags } => {
+                self.mode = Mode::Picker {
+                    kind: PickerKind::DispositionFlags { modifier: mid },
+                    title: "disposition: toggle flags".to_string(),
+                    options: disposition_picker_options(flags),
                     selected: 0,
                     query: String::new(),
                     searching: false,
@@ -406,22 +465,24 @@ impl App {
             TextTarget::OutputPath(output_id) => {
                 let path = clean_path_input(&buffer);
                 if !path.is_empty()
-                    && let Some(node) = self.graph.output_mut(output_id) {
-                        node.path = path;
-                    }
+                    && let Some(node) = self.graph.output_mut(output_id)
+                {
+                    node.path = path;
+                }
             }
             TextTarget::ModifierMetadataValue { modifier, key } => {
                 let value = buffer.trim().to_string();
                 if let Some(m) = self.graph.modifier_mut(modifier)
-                    && let ModifierKind::Metadata { fields } = &mut m.kind {
-                        if value.is_empty() {
-                            fields.remove(&key);
-                            self.log.push(format!("{key} cleared"));
-                        } else {
-                            fields.insert(key.clone(), value.clone());
-                            self.log.push(format!("{key} set to {value}"));
-                        }
+                    && let ModifierKind::Metadata { fields } = &mut m.kind
+                {
+                    if value.is_empty() {
+                        fields.remove(&key);
+                        self.log.push(format!("{key} cleared"));
+                    } else {
+                        fields.insert(key.clone(), value.clone());
+                        self.log.push(format!("{key} set to {value}"));
                     }
+                }
             }
             TextTarget::ModifierCustomKey(modifier) => {
                 let key = buffer.trim().to_string();
@@ -433,7 +494,7 @@ impl App {
                     .modifier(modifier)
                     .and_then(|m| match &m.kind {
                         ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
-                        ModifierKind::Convert(_) => None,
+                        ModifierKind::Convert(_) | ModifierKind::Disposition { .. } => None,
                     })
                     .unwrap_or_default();
                 self.mode = Mode::TextInput {
@@ -447,7 +508,13 @@ impl App {
     }
 
     pub fn text_input_char(&mut self, c: char) {
-        if let Mode::TextInput { target, buffer, suggestions, selected } = &mut self.mode {
+        if let Mode::TextInput {
+            target,
+            buffer,
+            suggestions,
+            selected,
+        } = &mut self.mode
+        {
             buffer.push(c);
             if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
                 *suggestions = path_suggestions(buffer);
@@ -457,7 +524,13 @@ impl App {
     }
 
     pub fn text_input_backspace(&mut self) {
-        if let Mode::TextInput { target, buffer, suggestions, selected } = &mut self.mode {
+        if let Mode::TextInput {
+            target,
+            buffer,
+            suggestions,
+            selected,
+        } = &mut self.mode
+        {
             buffer.pop();
             if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
                 *suggestions = path_suggestions(buffer);
@@ -468,7 +541,12 @@ impl App {
 
     /// Up/Down while typing a path: move the highlighted suggestion.
     pub fn text_input_move_suggestion(&mut self, delta: isize) {
-        if let Mode::TextInput { suggestions, selected, .. } = &mut self.mode {
+        if let Mode::TextInput {
+            suggestions,
+            selected,
+            ..
+        } = &mut self.mode
+        {
             let len = suggestions.len() as isize;
             if len == 0 {
                 return;
@@ -481,12 +559,18 @@ impl App {
     /// suggestion (shell-style completion), and refresh suggestions against
     /// the new, longer buffer so drilling into a directory keeps working.
     pub fn text_input_accept_suggestion(&mut self) {
-        if let Mode::TextInput { buffer, suggestions, selected, .. } = &mut self.mode
-            && let Some(chosen) = suggestions.get(*selected).cloned() {
-                *buffer = chosen;
-                *suggestions = path_suggestions(buffer);
-                *selected = 0;
-            }
+        if let Mode::TextInput {
+            buffer,
+            suggestions,
+            selected,
+            ..
+        } = &mut self.mode
+            && let Some(chosen) = suggestions.get(*selected).cloned()
+        {
+            *buffer = chosen;
+            *suggestions = path_suggestions(buffer);
+            *selected = 0;
+        }
     }
 
     /// 'c': arm the focused input stream or modifier output, or -- when
@@ -496,9 +580,16 @@ impl App {
     pub fn toggle_connect(&mut self) {
         match self.focus {
             Focus::Input(i) => {
-                let Some(node) = self.graph.inputs.get(i) else { return };
-                let Some(stream) = node.streams.get(self.row_idx) else { return };
-                let ep = Endpoint::Stream { node: node.id, stream_idx: self.row_idx };
+                let Some(node) = self.graph.inputs.get(i) else {
+                    return;
+                };
+                let Some(stream) = node.streams.get(self.row_idx) else {
+                    return;
+                };
+                let ep = Endpoint::Stream {
+                    node: node.id,
+                    stream_idx: self.row_idx,
+                };
                 if self.armed == Some(ep) {
                     self.armed = None; // disarm
                 } else {
@@ -511,7 +602,9 @@ impl App {
                 }
             }
             Focus::Modifier(i) => {
-                let Some(m) = self.graph.modifiers.get(i) else { return };
+                let Some(m) = self.graph.modifiers.get(i) else {
+                    return;
+                };
                 let this_output = Endpoint::ModifierOut(m.id);
                 match self.armed {
                     Some(source) if source == this_output => {
@@ -524,20 +617,27 @@ impl App {
                     }
                     None => {
                         self.armed = Some(this_output);
-                        self.log
-                            .push("armed this node's output — focus the next node, press 'c' to connect".to_string());
+                        self.log.push(
+                            "armed this node's output — focus the next node, press 'c' to connect"
+                                .to_string(),
+                        );
                     }
                 }
             }
             Focus::Output(i) => {
-                let Some(output) = self.graph.outputs.get(i) else { return };
+                let Some(output) = self.graph.outputs.get(i) else {
+                    return;
+                };
                 match self.armed.take() {
                     Some(source) => {
                         self.graph.connect(source, Target::Output(output.id));
                         self.log.push("connected to output".to_string());
                     }
                     None => {
-                        self.log.push("nothing armed -- arm a stream or modifier output first ('c')".to_string());
+                        self.log.push(
+                            "nothing armed -- arm a stream or modifier output first ('c')"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -550,21 +650,33 @@ impl App {
     pub fn disconnect_focused(&mut self) {
         match self.focus {
             Focus::Input(i) => {
-                let Some(node) = self.graph.inputs.get(i) else { return };
-                let Some(stream) = node.streams.get(self.row_idx) else { return };
-                let ep = Endpoint::Stream { node: node.id, stream_idx: self.row_idx };
+                let Some(node) = self.graph.inputs.get(i) else {
+                    return;
+                };
+                let Some(stream) = node.streams.get(self.row_idx) else {
+                    return;
+                };
+                let ep = Endpoint::Stream {
+                    node: node.id,
+                    stream_idx: self.row_idx,
+                };
                 let label = stream.label();
                 let before = self.graph.wires.len();
                 self.graph.wires.retain(|w| w.from != ep);
                 if self.graph.wires.len() != before {
-                    self.log.push(format!("disconnected {label} from everything downstream"));
+                    self.log
+                        .push(format!("disconnected {label} from everything downstream"));
                 }
             }
             Focus::Modifier(i) => {
-                let Some(m) = self.graph.modifiers.get(i) else { return };
+                let Some(m) = self.graph.modifiers.get(i) else {
+                    return;
+                };
                 let ep = Endpoint::ModifierOut(m.id);
                 let outgoing = self.graph.outgoing(ep);
-                let Some(&wi) = outgoing.get(self.row_idx) else { return };
+                let Some(&wi) = outgoing.get(self.row_idx) else {
+                    return;
+                };
                 self.graph.remove_wire_at(wi);
                 self.log.push("disconnected".to_string());
                 let new_len = self.graph.outgoing(ep).len();
@@ -573,10 +685,14 @@ impl App {
                 }
             }
             Focus::Output(i) => {
-                let Some(output) = self.graph.outputs.get(i) else { return };
+                let Some(output) = self.graph.outputs.get(i) else {
+                    return;
+                };
                 let target = Target::Output(output.id);
                 let incoming = self.graph.incoming(target);
-                let Some(&wi) = incoming.get(self.row_idx) else { return };
+                let Some(&wi) = incoming.get(self.row_idx) else {
+                    return;
+                };
                 self.graph.remove_wire_at(wi);
                 self.log.push("disconnected".to_string());
                 let new_len = self.graph.incoming(target).len();
@@ -591,14 +707,20 @@ impl App {
     /// the focused output node.
     pub fn open_container_picker(&mut self) {
         let Focus::Output(i) = self.focus else {
-            self.log.push("focus an output node first, then 'f' picks its container".to_string());
+            self.log
+                .push("focus an output node first, then 'f' picks its container".to_string());
             return;
         };
-        let Some(output) = self.graph.outputs.get(i) else { return };
+        let Some(output) = self.graph.outputs.get(i) else {
+            return;
+        };
         let output_id = output.id;
         let current = output.container.clone();
 
-        let mut names: Vec<String> = COMMON_CONTAINERS.iter().map(|(name, _)| name.to_string()).collect();
+        let mut names: Vec<String> = COMMON_CONTAINERS
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
         prioritize_and_extend(&mut names, self.available_muxers.iter().map(String::as_str));
 
         let options = picker_options("auto (infer from file extension)", names);
@@ -617,7 +739,13 @@ impl App {
     /// Up/Down (or j/k) while a picker is open. Moves within the filtered
     /// view, so it only ever lands on something currently visible.
     pub fn picker_move(&mut self, delta: isize) {
-        if let Mode::Picker { options, selected, query, .. } = &mut self.mode {
+        if let Mode::Picker {
+            options,
+            selected,
+            query,
+            ..
+        } = &mut self.mode
+        {
             let len = filtered_indices(options, query).len() as isize;
             if len == 0 {
                 return;
@@ -628,7 +756,13 @@ impl App {
 
     /// '/': start typing a query to filter the picker's options.
     pub fn picker_start_search(&mut self) {
-        if let Mode::Picker { query, searching, selected, .. } = &mut self.mode {
+        if let Mode::Picker {
+            query,
+            searching,
+            selected,
+            ..
+        } = &mut self.mode
+        {
             query.clear();
             *searching = true;
             *selected = 0;
@@ -636,14 +770,20 @@ impl App {
     }
 
     pub fn picker_search_char(&mut self, c: char) {
-        if let Mode::Picker { query, selected, .. } = &mut self.mode {
+        if let Mode::Picker {
+            query, selected, ..
+        } = &mut self.mode
+        {
             query.push(c);
             *selected = 0;
         }
     }
 
     pub fn picker_search_backspace(&mut self) {
-        if let Mode::Picker { query, selected, .. } = &mut self.mode {
+        if let Mode::Picker {
+            query, selected, ..
+        } = &mut self.mode
+        {
             query.pop();
             *selected = 0;
         }
@@ -661,8 +801,14 @@ impl App {
     /// already-applied filter first (mirrors vim's "clear search" on a bare
     /// Esc); only close the picker once there's no filter left to clear.
     pub fn picker_escape(&mut self) {
-        let Mode::Picker { kind, title, options, mut query, searching, .. } =
-            std::mem::replace(&mut self.mode, Mode::Normal)
+        let Mode::Picker {
+            kind,
+            title,
+            options,
+            mut query,
+            searching,
+            ..
+        } = std::mem::replace(&mut self.mode, Mode::Normal)
         else {
             return;
         };
@@ -682,12 +828,50 @@ impl App {
     }
 
     pub fn picker_confirm(&mut self) {
-        let Mode::Picker { kind, options, selected, query, .. } =
-            std::mem::replace(&mut self.mode, Mode::Normal)
+        let Mode::Picker {
+            kind,
+            title,
+            options,
+            selected,
+            query,
+            searching,
+        } = std::mem::replace(&mut self.mode, Mode::Normal)
         else {
             return;
         };
         let real_idx = filtered_indices(&options, &query).get(selected).copied();
+
+        // Unlike every other picker kind, toggling a disposition flag
+        // doesn't close the picker -- it's a multi-select, so Enter here
+        // just flips the flag and redraws the same list with its checkbox
+        // updated, leaving the user in the picker to toggle more.
+        if let PickerKind::DispositionFlags { modifier } = kind {
+            if let Some(flag) = real_idx
+                .and_then(|i| options.get(i))
+                .and_then(|e| e.value.clone())
+                && let Some(m) = self.graph.modifier_mut(modifier)
+                && let ModifierKind::Disposition { flags } = &mut m.kind
+            {
+                if !flags.remove(&flag) {
+                    flags.insert(flag.clone());
+                }
+                self.log.push(format!("{flag} toggled"));
+            }
+            let options = match self.graph.modifier(modifier).map(|m| &m.kind) {
+                Some(ModifierKind::Disposition { flags }) => disposition_picker_options(flags),
+                _ => Vec::new(),
+            };
+            self.mode = Mode::Picker {
+                kind: PickerKind::DispositionFlags { modifier },
+                title,
+                options,
+                selected,
+                query,
+                searching,
+            };
+            return;
+        }
+
         let Some(entry) = real_idx.and_then(|i| options.into_iter().nth(i)) else {
             return;
         };
@@ -707,7 +891,9 @@ impl App {
                 }
             }
             PickerKind::Container { output } => {
-                let Some(node) = self.graph.output_mut(output) else { return };
+                let Some(node) = self.graph.output_mut(output) else {
+                    return;
+                };
                 node.container = entry.value.clone();
                 match &entry.value {
                     Some(name) => {
@@ -715,16 +901,28 @@ impl App {
                             let stem = std::path::Path::new(&node.path).with_extension("");
                             node.path = format!("{}.{ext}", stem.to_string_lossy());
                         }
-                        self.log.push(format!("output container set to {name} ({})", node.path));
+                        self.log
+                            .push(format!("output container set to {name} ({})", node.path));
                     }
-                    None => self
-                        .log
-                        .push("output container set to auto (inferred from file extension)".to_string()),
+                    None => self.log.push(
+                        "output container set to auto (inferred from file extension)".to_string(),
+                    ),
                 }
             }
             PickerKind::NewModifier => {
                 let (kind, name) = match entry.value.as_deref() {
-                    Some("metadata") => (ModifierKind::Metadata { fields: BTreeMap::new() }, "metadata"),
+                    Some("metadata") => (
+                        ModifierKind::Metadata {
+                            fields: BTreeMap::new(),
+                        },
+                        "metadata",
+                    ),
+                    Some("disposition") => (
+                        ModifierKind::Disposition {
+                            flags: BTreeSet::new(),
+                        },
+                        "disposition",
+                    ),
                     _ => (ModifierKind::Convert(Codec::Copy), "convert"),
                 };
                 self.graph.add_modifier(kind);
@@ -738,7 +936,7 @@ impl App {
                         .modifier(modifier)
                         .and_then(|m| match &m.kind {
                             ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
-                            ModifierKind::Convert(_) => None,
+                            ModifierKind::Convert(_) | ModifierKind::Disposition { .. } => None,
                         })
                         .unwrap_or_default();
                     self.mode = Mode::TextInput {
@@ -758,6 +956,9 @@ impl App {
                     };
                 }
             },
+            PickerKind::DispositionFlags { .. } => {
+                unreachable!("handled above before `entry` is computed")
+            }
         }
     }
 
@@ -767,17 +968,23 @@ impl App {
     pub fn delete_focused_node(&mut self) {
         match self.focus {
             Focus::Input(i) => {
-                let Some(node) = self.graph.inputs.get(i) else { return };
+                let Some(node) = self.graph.inputs.get(i) else {
+                    return;
+                };
                 let id = node.id;
                 let path = node.path.clone();
                 self.graph.remove_input(id);
-                self.armed = self.armed.filter(|e| !matches!(e, Endpoint::Stream { node, .. } if *node == id));
+                self.armed = self
+                    .armed
+                    .filter(|e| !matches!(e, Endpoint::Stream { node, .. } if *node == id));
                 self.log.push(format!("removed input: {path}"));
                 let n = self.graph.inputs.len();
                 self.set_focus_index(i.min(n));
             }
             Focus::Modifier(i) => {
-                let Some(m) = self.graph.modifiers.get(i) else { return };
+                let Some(m) = self.graph.modifiers.get(i) else {
+                    return;
+                };
                 let id = m.id;
                 self.graph.remove_modifier(id);
                 self.armed = self.armed.filter(|e| *e != Endpoint::ModifierOut(id));
@@ -790,13 +997,18 @@ impl App {
                     self.log.push("can't remove the last output".to_string());
                     return;
                 }
-                let Some(output) = self.graph.outputs.get(i) else { return };
+                let Some(output) = self.graph.outputs.get(i) else {
+                    return;
+                };
                 let id = output.id;
                 let path = output.path.clone();
                 self.graph.remove_output(id);
                 self.log.push(format!("removed output: {path}"));
                 let n = self.node_count();
-                self.set_focus_index((self.graph.inputs.len() + self.graph.modifiers.len() + i).min(n.saturating_sub(1)));
+                self.set_focus_index(
+                    (self.graph.inputs.len() + self.graph.modifiers.len() + i)
+                        .min(n.saturating_sub(1)),
+                );
             }
         }
     }
@@ -829,20 +1041,33 @@ impl App {
     /// turn out without waiting for (or overwriting) the real output.
     pub fn start_preview(&mut self) {
         if self.running {
-            self.log.push("already running ffmpeg — wait for it to finish before previewing".to_string());
+            self.log.push(
+                "already running ffmpeg — wait for it to finish before previewing".to_string(),
+            );
             return;
         }
         let Focus::Output(i) = self.focus else {
-            self.log.push("focus an output node first, then 'p' previews it".to_string());
+            self.log
+                .push("focus an output node first, then 'p' previews it".to_string());
             return;
         };
-        let Some(output) = self.graph.outputs.get(i) else { return };
+        let Some(output) = self.graph.outputs.get(i) else {
+            return;
+        };
         let output_id = output.id;
-        let ext = std::path::Path::new(&output.path).extension().and_then(|e| e.to_str()).unwrap_or("mkv");
-        let preview_path =
-            std::env::temp_dir().join(format!("tff-preview-{output_id}.{ext}")).to_string_lossy().into_owned();
+        let ext = std::path::Path::new(&output.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mkv");
+        let preview_path = std::env::temp_dir()
+            .join(format!("tff-preview-{output_id}.{ext}"))
+            .to_string_lossy()
+            .into_owned();
 
-        let Some(args) = self.graph.build_preview_args(output_id, &preview_path, PREVIEW_SECONDS) else {
+        let Some(args) = self
+            .graph
+            .build_preview_args(output_id, &preview_path, PREVIEW_SECONDS)
+        else {
             self.log.push(
                 "nothing mapped to this output yet — arm a stream with 'c', then focus it and press 'c' again"
                     .to_string(),
@@ -919,9 +1144,10 @@ fn expand_tilde(s: &str) -> String {
             return format!("{home}/{rest}");
         }
     } else if s == "~"
-        && let Ok(home) = std::env::var("HOME") {
-            return home;
-        }
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return home;
+    }
     s.to_string()
 }
 
@@ -946,7 +1172,11 @@ pub fn path_suggestions(buffer: &str) -> Vec<String> {
         None => ("", buffer),
     };
 
-    let scan_target = if dir_part.is_empty() { ".".to_string() } else { expand_tilde(dir_part) };
+    let scan_target = if dir_part.is_empty() {
+        ".".to_string()
+    } else {
+        expand_tilde(dir_part)
+    };
     let Ok(read_dir) = std::fs::read_dir(&scan_target) else {
         return Vec::new();
     };
@@ -996,17 +1226,35 @@ fn picker_options(reset_label: &str, names: Vec<String>) -> Vec<PickerEntry> {
         display: reset_label.to_string(),
         value: None,
     }];
-    options.extend(
-        names
-            .into_iter()
-            .map(|n| PickerEntry { display: n.clone(), value: Some(n) }),
-    );
+    options.extend(names.into_iter().map(|n| PickerEntry {
+        display: n.clone(),
+        value: Some(n),
+    }));
     options
 }
 
 fn selected_index(options: &[PickerEntry], current: Option<&str>) -> usize {
     match current {
         None => 0,
-        Some(name) => options.iter().position(|o| o.value.as_deref() == Some(name)).unwrap_or(0),
+        Some(name) => options
+            .iter()
+            .position(|o| o.value.as_deref() == Some(name))
+            .unwrap_or(0),
     }
+}
+
+/// The disposition picker's option list: one entry per curated flag, with a
+/// checkbox reflecting whether it's currently set on this node -- rebuilt
+/// after every toggle so the display stays in sync.
+fn disposition_picker_options(flags: &BTreeSet<String>) -> Vec<PickerEntry> {
+    crate::graph::disposition_flags()
+        .iter()
+        .map(|f| {
+            let mark = if flags.contains(*f) { "x" } else { " " };
+            PickerEntry {
+                display: format!("[{mark}] {f}"),
+                value: Some((*f).to_string()),
+            }
+        })
+        .collect()
 }

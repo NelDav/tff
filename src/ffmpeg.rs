@@ -153,6 +153,21 @@ pub fn list_muxers() -> Result<Vec<String>> {
     Ok(muxers)
 }
 
+/// Launch ffplay on a rendered preview file, in its own window. Runs
+/// detached: unlike `run_args`, nothing here waits for or streams output
+/// from the player process, since it's the user who decides when they're
+/// done looking and closes the window themselves.
+pub fn play(path: &str) -> Result<()> {
+    Command::new("ffplay")
+        .args(["-hide_banner", "-autoexit", "-window_title", "tff preview", path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn ffplay (is it installed and on PATH?)")?;
+    Ok(())
+}
+
 /// Spawn ffmpeg with the given arguments, streaming stdout+stderr lines
 /// through `tx` as they arrive, and a final "__DONE__<code>" sentinel line.
 /// Intended to run on its own thread; owns everything it needs ('static).
