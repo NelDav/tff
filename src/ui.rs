@@ -6,7 +6,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Focus, Mode};
-use crate::graph::{Codec, Edge, InputNode, NodeId, StreamKind};
+use crate::graph::{
+    Codec, Endpoint, Graph, InputNode, ModifierKind, ModifierNode, NodeId, OutputNode, StreamKind, Target,
+};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let root = Layout::default()
@@ -29,18 +31,34 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect) {
     let line = TextLine::from(
-        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  a add-input  O add-output  o output-path  c arm/connect  d disconnect  e codec  f container  x delete-node  r render  q quit ",
+        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  a add-input  O add-output  m add-modifier  o output-path  c arm/connect  d disconnect  e edit  f container  x delete-node  r render  q quit ",
     )
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn describe_endpoint(graph: &Graph, ep: Endpoint) -> Option<String> {
+    match ep {
+        Endpoint::Stream { node, stream_idx } => {
+            let input = graph.input(node)?;
+            let stream = input.streams.get(stream_idx)?;
+            Some(format!("{} from {}", stream.label(), input.path))
+        }
+        Endpoint::ModifierOut(id) => {
+            let m = graph.modifier(id)?;
+            Some(format!("output of [{}]", m.kind.short_label()))
+        }
+    }
 }
 
 fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.mode {
         Mode::TextInput { target, buffer, .. } => {
             let prompt = match target {
-                crate::app::TextTarget::NewInputPath => "add input file path: ",
-                crate::app::TextTarget::OutputPath(_) => "output file path: ",
+                crate::app::TextTarget::NewInputPath => "add input file path: ".to_string(),
+                crate::app::TextTarget::OutputPath(_) => "output file path: ".to_string(),
+                crate::app::TextTarget::ModifierMetadataValue { key, .. } => format!("{key}: "),
+                crate::app::TextTarget::ModifierCustomKey(_) => "custom metadata key: ".to_string(),
             };
             TextLine::from(vec![
                 Span::styled(prompt, Style::default().fg(Color::Yellow)),
@@ -53,22 +71,13 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         )),
         Mode::Normal => {
-            if let Some((node_id, stream_idx)) = app.armed {
-                if let Some(node) = app.graph.input(node_id) {
-                    let label = node
-                        .streams
-                        .get(stream_idx)
-                        .map(|s| s.label())
-                        .unwrap_or_default();
-                    TextLine::from(Span::styled(
-                        format!(
-                            "armed {label} from {} — focus an output, press 'c' to connect (Esc to cancel)",
-                            node.path
-                        ),
+            if let Some(ep) = app.armed {
+                match describe_endpoint(&app.graph, ep) {
+                    Some(desc) => TextLine::from(Span::styled(
+                        format!("armed {desc} — focus a modifier or output, press 'c' to connect (Esc to cancel)"),
                         Style::default().fg(Color::Yellow),
-                    ))
-                } else {
-                    TextLine::from("")
+                    )),
+                    None => TextLine::from(""),
                 }
             } else if app.running {
                 TextLine::from(Span::styled(
@@ -92,9 +101,36 @@ fn node_rows(n_streams: usize) -> u16 {
     (2 + n_streams.max(1)) as u16
 }
 
-/// Renders the node graph: a bordered panel with edge wires drawn straight
-/// into the buffer as box-drawing characters (so they read as thin, crisp
-/// lines rather than a braille-dot blob), then node boxes layered on top.
+/// A Metadata modifier's box has an upper section (one row per field it
+/// sets, or a placeholder row) plus a divider, on top of the connections
+/// section every modifier has; a Convert modifier has just the connections
+/// section, since its one "field" already fits in the title bar.
+fn modifier_field_rows(kind: &ModifierKind) -> u16 {
+    match kind {
+        ModifierKind::Convert(_) => 0,
+        ModifierKind::Metadata { fields } => fields.len().max(1) as u16 + 1, // + divider
+    }
+}
+
+/// Row (0-based from the box's top border) where the incoming-connection
+/// line sits -- right after the field section, if any.
+fn modifier_incoming_row(kind: &ModifierKind) -> u16 {
+    1 + modifier_field_rows(kind)
+}
+
+/// Row where the outgoing-connection list starts.
+fn modifier_outgoing_start_row(kind: &ModifierKind) -> u16 {
+    modifier_incoming_row(kind) + 1
+}
+
+fn modifier_rows(kind: &ModifierKind, outgoing_count: usize) -> u16 {
+    modifier_outgoing_start_row(kind) + outgoing_count.max(1) as u16 + 1 // + bottom border
+}
+
+/// Renders the node graph: a bordered panel with connection wires drawn
+/// straight into the buffer as box-drawing characters (so they read as
+/// thin, crisp lines rather than a braille-dot blob), then node boxes
+/// layered on top.
 fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
     let panel = Block::default().borders(Borders::ALL).title(" graph ");
     let inner = panel.inner(area);
@@ -108,64 +144,114 @@ fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
 
     for (i, input) in app.graph.inputs.iter().enumerate() {
         let focused = matches!(app.focus, Focus::Input(fi) if fi == i);
-        draw_input_node(frame, inner, input, &app.graph.edges, focused, app.row_idx, app.armed);
+        draw_input_node(frame, inner, &app.graph, input, focused, app.row_idx, app.armed);
+    }
+    for (i, modifier) in app.graph.modifiers.iter().enumerate() {
+        draw_modifier_node(frame, inner, app, i, modifier);
     }
     for (i, output) in app.graph.outputs.iter().enumerate() {
         draw_output_node(frame, inner, app, i, output);
     }
 }
 
-/// Draws each edge as an orthogonal wire (one or two `─` runs joined by a
-/// `│` and box-drawing corners when source and destination rows differ),
-/// colored by the stream kind it carries. Attaches one cell outside each
-/// node's border so it never overlaps the box the node widgets draw later.
-/// Each edge routes to its own `to_output` node's rect, and its row within
-/// that box is its position among that output's other incoming edges.
-fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
-    let output_rects: Vec<(NodeId, Rect)> = app
-        .graph
-        .outputs
-        .iter()
-        .filter_map(|o| {
-            let rows = node_rows(app.graph.edge_indices_for_output(o.id).len());
-            node_rect(area, o.pos, o.width, rows).map(|r| (o.id, r))
-        })
-        .collect();
-
-    let buf = frame.buffer_mut();
-    for output in &app.graph.outputs {
-        let Some(&(_, dst_rect)) = output_rects.iter().find(|(id, _)| *id == output.id) else {
-            continue;
-        };
-        for (row, &ei) in app.graph.edge_indices_for_output(output.id).iter().enumerate() {
-            let edge = &app.graph.edges[ei];
-            let Some(input) = app.graph.input(edge.from_node) else {
-                continue;
-            };
-            let Some(stream) = input.streams.get(edge.from_stream_idx) else {
-                continue;
-            };
-            let src_rows = node_rows(input.streams.len());
-            let Some(src_rect) = node_rect(area, input.pos, input.width, src_rows) else {
-                continue;
-            };
-
-            let src = Position::new(src_rect.right(), src_rect.y + 1 + edge.from_stream_idx as u16);
-            let dst = Position::new(dst_rect.x.saturating_sub(1), dst_rect.y + 1 + row as u16);
-            let badge = match edge.codec {
-                Codec::Copy => None,
-                Codec::Encode(_) => Some(edge.codec.label()),
-            };
-
-            draw_wire(buf, area, src, dst, row as u16, kind_color(stream.kind), badge);
+/// Every node's screen Rect, keyed by id, computed once per frame so edge
+/// drawing and node drawing agree on where everything is.
+fn compute_rects(app: &App, area: Rect) -> Vec<(NodeId, Rect)> {
+    let mut rects = Vec::new();
+    for input in &app.graph.inputs {
+        let rows = node_rows(input.streams.len());
+        if let Some(r) = node_rect(area, input.pos, input.width, rows) {
+            rects.push((input.id, r));
         }
+    }
+    for m in &app.graph.modifiers {
+        let rows = modifier_rows(&m.kind, app.graph.outgoing(Endpoint::ModifierOut(m.id)).len());
+        if let Some(r) = node_rect(area, m.pos, m.width, rows) {
+            rects.push((m.id, r));
+        }
+    }
+    for output in &app.graph.outputs {
+        let rows = node_rows(app.graph.incoming(Target::Output(output.id)).len());
+        if let Some(r) = node_rect(area, output.pos, output.width, rows) {
+            rects.push((output.id, r));
+        }
+    }
+    rects
+}
+
+fn rect_for(rects: &[(NodeId, Rect)], id: NodeId) -> Option<Rect> {
+    rects.iter().find(|(rid, _)| *rid == id).map(|(_, r)| *r)
+}
+
+fn wire_color(graph: &Graph, from: Endpoint) -> Color {
+    graph
+        .resolve(from)
+        .and_then(|r| graph.input(r.from_node).and_then(|inp| inp.streams.get(r.from_stream_idx)).map(|s| s.kind))
+        .map(kind_color)
+        .unwrap_or(Color::DarkGray)
+}
+
+/// Draws each connection as an orthogonal wire (one or two `─` runs joined
+/// by a `│` and box-drawing corners when source and destination rows
+/// differ), colored by the stream kind resolved at its ultimate source.
+/// Attaches one cell outside each node's border so it never overlaps the
+/// box the node widgets draw later. A wire leaving a non-Copy Convert
+/// node's output is tagged with that node's codec right where it happens.
+fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
+    let rects = compute_rects(app, area);
+    let buf = frame.buffer_mut();
+
+    for (wire_idx, wire) in app.graph.wires.iter().enumerate() {
+        let src_id = match wire.from {
+            Endpoint::Stream { node, .. } => node,
+            Endpoint::ModifierOut(id) => id,
+        };
+        let Some(src_rect) = rect_for(&rects, src_id) else { continue };
+        let (src_row_offset, src_row) = match wire.from {
+            Endpoint::Stream { stream_idx, .. } => (1u16, stream_idx),
+            Endpoint::ModifierOut(mid) => {
+                let row = app.graph.outgoing(wire.from).iter().position(|&wi| wi == wire_idx).unwrap_or(0);
+                let offset = app.graph.modifier(mid).map(|m| modifier_outgoing_start_row(&m.kind)).unwrap_or(2);
+                (offset, row) // outgoing rows sit below the field/incoming sections
+            }
+        };
+        let src = Position::new(src_rect.right(), src_rect.y + src_row_offset + src_row as u16);
+
+        let dst_id = match wire.to {
+            Target::ModifierIn(id) => id,
+            Target::Output(id) => id,
+        };
+        let Some(dst_rect) = rect_for(&rects, dst_id) else { continue };
+        let (dst_row_offset, dst_row) = match wire.to {
+            Target::ModifierIn(mid) => {
+                let offset = app.graph.modifier(mid).map(|m| modifier_incoming_row(&m.kind)).unwrap_or(1);
+                (offset, 0u16) // a modifier only ever has one incoming row
+            }
+            Target::Output(_) => {
+                let row = app.graph.incoming(wire.to).iter().position(|&wi| wi == wire_idx).unwrap_or(0);
+                (1u16, row as u16)
+            }
+        };
+        let dst = Position::new(dst_rect.x.saturating_sub(1), dst_rect.y + dst_row_offset + dst_row);
+
+        let badge = match wire.from {
+            Endpoint::ModifierOut(mid) => match app.graph.modifier(mid).map(|m| &m.kind) {
+                Some(ModifierKind::Convert(codec)) if !matches!(codec, Codec::Copy) => {
+                    Some(codec.label().to_string())
+                }
+                _ => None,
+            },
+            Endpoint::Stream { .. } => None,
+        };
+
+        draw_wire(buf, area, src, dst, wire_idx as u16, wire_color(&app.graph, wire.from), badge.as_deref());
     }
 }
 
-/// Draws one wire, then -- if `badge` is set (the connection re-encodes
-/// rather than copies) -- overlays a small colored label on the segment
-/// leading into the destination, acting as a "converter" sitting on the
-/// wire itself. Skipped if the segment isn't long enough to hold it.
+/// Draws one wire, then -- if `badge` is set -- overlays a small colored
+/// label on the segment leading into the destination, acting as a
+/// "converter" sitting on the wire itself. Skipped if the segment isn't
+/// long enough to hold it.
 fn draw_wire(
     buf: &mut Buffer,
     bounds: Rect,
@@ -193,7 +279,7 @@ fn draw_wire(
         }
         (sy, from, to)
     } else {
-        // Route the vertical leg through a lane offset by edge index, so
+        // Route the vertical leg through a lane offset by wire index, so
         // multiple wires leaving the same box don't all stack on one column.
         let (lo, hi) = if sx <= dx { (sx, dx) } else { (dx, sx) };
         let mid = if hi.saturating_sub(lo) >= 2 {
@@ -275,11 +361,11 @@ fn node_rect(canvas_area: Rect, pos: (f64, f64), width: u16, rows: u16) -> Optio
 fn draw_input_node(
     frame: &mut Frame,
     canvas_area: Rect,
+    graph: &Graph,
     node: &InputNode,
-    edges: &[Edge],
     focused: bool,
     row_idx: usize,
-    armed: Option<(usize, usize)>,
+    armed: Option<Endpoint>,
 ) {
     let rows = node_rows(node.streams.len());
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
@@ -293,7 +379,8 @@ fn draw_input_node(
     }
     for (i, stream) in node.streams.iter().enumerate() {
         let is_row_focused = focused && i == row_idx;
-        let is_armed = armed == Some((node.id, i));
+        let ep = Endpoint::Stream { node: node.id, stream_idx: i };
+        let is_armed = armed == Some(ep);
         let marker = if is_armed { "◎" } else { "○" };
         let color = if is_armed {
             Color::Yellow
@@ -304,19 +391,11 @@ fn draw_input_node(
         if is_row_focused {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        // A stream can fan out to more than one output; show its codec only
-        // when that's unambiguous (exactly one connection), and otherwise a
-        // plain count -- the output side is where per-connection detail lives.
-        let matches: Vec<&Edge> =
-            edges.iter().filter(|e| e.from_node == node.id && e.from_stream_idx == i).collect();
-        let suffix = match matches.as_slice() {
-            [] => String::new(),
-            [only] => match only.codec {
-                Codec::Copy => String::new(),
-                Codec::Encode(_) => format!(" → {}", only.codec.label()),
-            },
-            many => format!(" → {} outputs", many.len()),
-        };
+        // A stream can fan out to more than one downstream node; the wire
+        // itself shows where a single connection goes, so only call out
+        // the count when there's more than one to disambiguate.
+        let count = graph.outgoing(ep).len();
+        let suffix = if count > 1 { format!(" → {count} connections") } else { String::new() };
         lines.push(TextLine::styled(format!("{marker} {}{suffix}", stream.label()), style));
     }
 
@@ -333,15 +412,90 @@ fn draw_input_node(
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-fn draw_output_node(
-    frame: &mut Frame,
-    canvas_area: Rect,
-    app: &App,
-    index: usize,
-    node: &crate::graph::OutputNode,
-) {
-    let edge_idxs = app.graph.edge_indices_for_output(node.id);
-    let rows = node_rows(edge_idxs.len());
+/// A Metadata modifier's box has an upper section listing every field it
+/// sets (with the value that will be written) above a divider; every
+/// modifier then has a connections section below -- first its single
+/// incoming connection (or lack of one), then its outgoing connections one
+/// per row, the same way an output node lists its incoming ones.
+fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &ModifierNode) {
+    let outgoing = app.graph.outgoing(Endpoint::ModifierOut(node.id));
+    let rows = modifier_rows(&node.kind, outgoing.len());
+    let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
+        return;
+    };
+    let focused = matches!(app.focus, Focus::Modifier(mi) if mi == index);
+    let border_color = if focused { Color::Yellow } else { Color::Magenta };
+
+    let mut lines = Vec::new();
+
+    if let ModifierKind::Metadata { fields } = &node.kind {
+        if fields.is_empty() {
+            lines.push(TextLine::styled("(no metadata set)", Style::default().fg(Color::DarkGray)));
+        } else {
+            for (key, value) in fields {
+                lines.push(TextLine::from(format!("{key}: {value}")));
+            }
+        }
+        let divider_width = rect.width.saturating_sub(2) as usize;
+        lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
+    }
+
+    let incoming_wire = app.graph.wires.iter().find(|w| w.to == Target::ModifierIn(node.id));
+    let incoming_text = match incoming_wire {
+        Some(w) => match app.graph.resolve(w.from) {
+            Some(r) => app
+                .graph
+                .input(r.from_node)
+                .and_then(|inp| inp.streams.get(r.from_stream_idx))
+                .map(|s| format!("← {}", s.label()))
+                .unwrap_or_else(|| "← (unknown)".to_string()),
+            None => "← (broken chain)".to_string(),
+        },
+        None => "← (unconnected)".to_string(),
+    };
+    lines.push(TextLine::styled(incoming_text, Style::default().fg(Color::DarkGray)));
+
+    if outgoing.is_empty() {
+        lines.push(TextLine::styled(
+            "(nothing downstream)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    for (row, &wi) in outgoing.iter().enumerate() {
+        let wire = &app.graph.wires[wi];
+        let target_label = match wire.to {
+            Target::ModifierIn(id) => app
+                .graph
+                .modifier(id)
+                .map(|m| format!("→ [{}]", m.kind.short_label()))
+                .unwrap_or_else(|| "→ (?)".to_string()),
+            Target::Output(id) => match app.graph.outputs.iter().position(|o| o.id == id) {
+                Some(oi) => format!("→ OUTPUT {}: {}", oi + 1, app.graph.outputs[oi].path),
+                None => "→ (?)".to_string(),
+            },
+        };
+        let mut style = Style::default();
+        if focused && row == app.row_idx {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(TextLine::styled(target_label, style));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            format!(" [{}] ", node.kind.short_label()),
+            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+        ));
+
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &OutputNode) {
+    let incoming = app.graph.incoming(Target::Output(node.id));
+    let rows = node_rows(incoming.len());
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
@@ -349,28 +503,39 @@ fn draw_output_node(
     let border_color = if focused { Color::Yellow } else { Color::Cyan };
 
     let mut lines = Vec::new();
-    if edge_idxs.is_empty() {
+    if incoming.is_empty() {
         lines.push(TextLine::from("(nothing mapped — arm a stream with 'c')"));
     }
-    for (row, &ei) in edge_idxs.iter().enumerate() {
-        let edge = &app.graph.edges[ei];
-        let codec_suffix = match edge.codec {
-            Codec::Copy => String::new(),
-            Codec::Encode(_) => format!(" [{}]", edge.codec.label()),
+    for (row, &wi) in incoming.iter().enumerate() {
+        let wire = &app.graph.wires[wi];
+        let label = match app.graph.resolve(wire.from) {
+            Some(r) => {
+                let mut tags = Vec::new();
+                if r.codec.ffmpeg_name().is_some() {
+                    tags.push(r.codec.label().to_string());
+                }
+                for (key, value) in &r.metadata {
+                    tags.push(format!("{key}:{value}"));
+                }
+                // The tag goes right after the stream label -- before the
+                // "<- source file" part -- so it survives the box's width
+                // truncation instead of being the first thing clipped off.
+                let tag = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
+                app.graph
+                    .input(r.from_node)
+                    .and_then(|n| n.streams.get(r.from_stream_idx).map(|s| (n, s)))
+                    .map(|(n, s)| {
+                        format!(
+                            "{}{tag} <- [{}] {}",
+                            s.label(),
+                            n.file_index,
+                            n.path.rsplit('/').next().unwrap_or(&n.path)
+                        )
+                    })
+                    .unwrap_or_else(|| format!("(dangling){tag}"))
+            }
+            None => "● (broken chain)".to_string(),
         };
-        let label = app
-            .graph
-            .input(edge.from_node)
-            .and_then(|n| n.streams.get(edge.from_stream_idx).map(|s| (n, s)))
-            .map(|(n, s)| {
-                format!(
-                    "● {}{codec_suffix} <- [{}] {}",
-                    s.label(),
-                    n.file_index,
-                    n.path.rsplit('/').next().unwrap_or(&n.path)
-                )
-            })
-            .unwrap_or_else(|| "● (dangling)".to_string());
         let mut style = Style::default();
         if focused && row == app.row_idx {
             style = style.add_modifier(Modifier::REVERSED);
@@ -411,9 +576,10 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Floating, centered, scrollable option list -- the dropdown for codec and
-/// container selection. Drawn last so it sits on top of everything else.
-/// Supports a vim-like `/` search that filters the list live as you type.
+/// Floating, centered, scrollable option list -- the dropdown for codec,
+/// container, and new-modifier selection. Drawn last so it sits on top of
+/// everything else. Supports a vim-like `/` search that filters the list
+/// live as you type.
 fn draw_picker_popup(frame: &mut Frame, app: &App) {
     let Mode::Picker { title, options, selected, query, searching, .. } = &app.mode else {
         return;
@@ -518,7 +684,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// Live path-completion dropdown shown under the input line while adding an
 /// input file or editing an output's path -- non-modal (typing keeps
 /// working normally), unlike the picker popup. Hidden whenever there are no
-/// matches, so it never sits there empty.
+/// matches (including for free-text fields like metadata, which never
+/// populate suggestions), so it never sits there empty.
 fn draw_suggestions_popup(frame: &mut Frame, app: &App, status_area: Rect) {
     let Mode::TextInput { suggestions, selected, .. } = &app.mode else {
         return;

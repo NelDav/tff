@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub type NodeId = usize;
@@ -22,10 +23,10 @@ impl fmt::Display for StreamKind {
     }
 }
 
-/// A codec choice for one mapped stream: either pass it through unchanged
-/// ("stream copy", the fast/lossless default) or re-encode it with a
-/// specific ffmpeg encoder name. The name is an owned `String` because the
-/// real option list is discovered at runtime from `ffmpeg -encoders`
+/// A codec choice: either pass a stream through unchanged ("stream copy",
+/// the fast/lossless default) or re-encode it with a specific ffmpeg
+/// encoder name. The name is an owned `String` because the real option
+/// list is discovered at runtime from `ffmpeg -encoders`
 /// (see `ffmpeg::list_encoders`), not fixed at compile time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -109,24 +110,98 @@ pub struct OutputNode {
     pub width: u16,
 }
 
-/// A mapping from one input stream to one output file. ffmpeg supports
-/// several output files in a single invocation, and the same source stream
-/// can be mapped into more than one of them (e.g. a full-quality copy and a
-/// re-encoded preview) -- so `to_output` identifies which output this edge
-/// feeds, and a given (from_node, from_stream_idx) pair may appear in more
-/// than one edge.
+/// The stream-metadata keys offered by the metadata picker for a given
+/// stream kind, passed to ffmpeg as `-metadata:s:<i> key=value`.
+///
+/// Kept deliberately small and kind-independent: `language`, `title`, and
+/// `handler_name` were verified (round-tripped through real ffmpeg/ffprobe
+/// runs against both MKV and MP4) to reliably survive as stream tags for
+/// every stream kind. A commonly-cited "video-specific" key, `rotate`, was
+/// tested the same way and turned out unreliable -- it showed up as a
+/// plain tag on MKV but vanished entirely on MP4 once combined with
+/// re-encoding, with no side_data trace either. Rather than present a
+/// feature that silently doesn't work on a common container, it's left out
+/// of the curated list; the picker's "custom key..." option still lets
+/// anyone set it (or anything else ffmpeg accepts) explicitly.
+pub fn metadata_keys_for(_kind: StreamKind) -> &'static [&'static str] {
+    &["language", "title", "handler_name"]
+}
+
+/// What a modifier node does to whatever stream flows through it.
 #[derive(Clone, Debug)]
-pub struct Edge {
+pub enum ModifierKind {
+    Convert(Codec),
+    /// Arbitrary `-metadata:s:<i> key=value` pairs, keyed by field name.
+    Metadata { fields: BTreeMap<String, String> },
+}
+
+impl ModifierKind {
+    pub fn short_label(&self) -> String {
+        match self {
+            ModifierKind::Convert(codec) => format!("convert: {}", codec.label()),
+            // The fields themselves are listed in the node's body now, so
+            // the title just needs to name the kind.
+            ModifierKind::Metadata { .. } => "metadata".to_string(),
+        }
+    }
+}
+
+/// A node that transforms one stream in transit from an input to an
+/// output: either re-encoding it (`Convert`) or attaching stream metadata
+/// like language/title (`Metadata`). Sits in a chain between an input
+/// stream and an output, with exactly one incoming connection (it only
+/// ever transforms a single stream at a time) but any number of outgoing
+/// ones, so the same converted/tagged result can feed several outputs.
+pub struct ModifierNode {
+    pub id: NodeId,
+    pub kind: ModifierKind,
+    pub pos: (f64, f64),
+    pub width: u16,
+}
+
+/// The source side of a connection: either a specific stream on an input
+/// file, or the (single, always-transformed) output of a modifier node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    Stream { node: NodeId, stream_idx: usize },
+    ModifierOut(NodeId),
+}
+
+/// The destination side of a connection: a modifier's single input slot,
+/// or an output file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    ModifierIn(NodeId),
+    Output(NodeId),
+}
+
+/// A connection in the graph. Deliberately carries no settings of its own
+/// -- all transformation happens in the modifier nodes along the chain a
+/// wire is part of, resolved by walking backward from an output (see
+/// `Graph::resolve`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wire {
+    pub from: Endpoint,
+    pub to: Target,
+}
+
+/// The result of walking a chain of wires/modifiers back to its ultimate
+/// source stream: which stream it started from, and the effective codec
+/// and metadata accumulated from every modifier along the way (the
+/// modifier closest to the output wins for any field more than one
+/// modifier sets, matching how a real pipeline's last stage wins).
+pub struct Resolved {
     pub from_node: NodeId,
-    pub from_stream_idx: usize, // index into InputNode::streams
-    pub to_output: NodeId,
+    pub from_stream_idx: usize,
     pub codec: Codec,
+    pub metadata: BTreeMap<String, String>,
 }
 
 pub struct Graph {
     pub inputs: Vec<InputNode>,
+    pub modifiers: Vec<ModifierNode>,
     pub outputs: Vec<OutputNode>,
-    pub edges: Vec<Edge>,
+    pub wires: Vec<Wire>,
     next_id: NodeId,
 }
 
@@ -134,8 +209,9 @@ impl Graph {
     pub fn new() -> Self {
         let mut graph = Graph {
             inputs: Vec::new(),
+            modifiers: Vec::new(),
             outputs: Vec::new(),
-            edges: Vec::new(),
+            wires: Vec::new(),
             next_id: 1,
         };
         graph.add_output(); // start with one, like a typical single-file mux
@@ -168,7 +244,21 @@ impl Graph {
             id,
             path,
             container: None,
-            pos: (48.0, y),
+            pos: (74.0, y),
+            width: 30,
+        });
+        id
+    }
+
+    pub fn add_modifier(&mut self, kind: ModifierKind) -> NodeId {
+        let id = self.next_id;
+        self.next_id += 1;
+        let idx = self.modifiers.len();
+        let y = 2.0 + (idx as f64) * 8.0;
+        self.modifiers.push(ModifierNode {
+            id,
+            kind,
+            pos: (40.0, y),
             width: 30,
         });
         id
@@ -176,7 +266,7 @@ impl Graph {
 
     pub fn remove_input(&mut self, id: NodeId) {
         self.inputs.retain(|n| n.id != id);
-        self.edges.retain(|e| e.from_node != id);
+        self.wires.retain(|w| !matches!(w.from, Endpoint::Stream { node, .. } if node == id));
         // Re-derive file_index so ffmpeg -i ordering stays contiguous.
         for (idx, node) in self.inputs.iter_mut().enumerate() {
             node.file_index = idx;
@@ -185,7 +275,13 @@ impl Graph {
 
     pub fn remove_output(&mut self, id: NodeId) {
         self.outputs.retain(|n| n.id != id);
-        self.edges.retain(|e| e.to_output != id);
+        self.wires.retain(|w| w.to != Target::Output(id));
+    }
+
+    pub fn remove_modifier(&mut self, id: NodeId) {
+        self.modifiers.retain(|n| n.id != id);
+        self.wires
+            .retain(|w| w.from != Endpoint::ModifierOut(id) && w.to != Target::ModifierIn(id));
     }
 
     pub fn input(&self, id: NodeId) -> Option<&InputNode> {
@@ -196,63 +292,98 @@ impl Graph {
         self.outputs.iter_mut().find(|n| n.id == id)
     }
 
-    /// Whether the given stream is mapped to this *specific* output.
-    pub fn has_edge(&self, node: NodeId, stream_idx: usize, to_output: NodeId) -> bool {
-        self.edges
-            .iter()
-            .any(|e| e.from_node == node && e.from_stream_idx == stream_idx && e.to_output == to_output)
+    pub fn modifier(&self, id: NodeId) -> Option<&ModifierNode> {
+        self.modifiers.iter().find(|n| n.id == id)
     }
 
-    /// Indices into `self.edges` for edges feeding a specific output, in
-    /// stable order. This is what output-side row navigation/selection
-    /// indexes into (a given output's Nth listed connection = edge_idxs[N]).
-    pub fn edge_indices_for_output(&self, output_id: NodeId) -> Vec<usize> {
-        self.edges
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.to_output == output_id)
-            .map(|(i, _)| i)
-            .collect()
+    pub fn modifier_mut(&mut self, id: NodeId) -> Option<&mut ModifierNode> {
+        self.modifiers.iter_mut().find(|n| n.id == id)
     }
 
-    pub fn toggle_edge(&mut self, node: NodeId, stream_idx: usize, to_output: NodeId) {
-        let existing = self
-            .edges
-            .iter()
-            .position(|e| e.from_node == node && e.from_stream_idx == stream_idx && e.to_output == to_output);
-        match existing {
-            Some(i) => {
-                self.edges.remove(i);
+    /// Wires leaving a given source, in stable order -- what a modifier's
+    /// (or, conceptually, a stream port's) outgoing row list indexes into.
+    pub fn outgoing(&self, from: Endpoint) -> Vec<usize> {
+        self.wires.iter().enumerate().filter(|(_, w)| w.from == from).map(|(i, _)| i).collect()
+    }
+
+    /// Wires arriving at a given target, in stable order -- what an
+    /// output's (or a modifier's, though that's always at most one)
+    /// incoming row list indexes into.
+    pub fn incoming(&self, to: Target) -> Vec<usize> {
+        self.wires.iter().enumerate().filter(|(_, w)| w.to == to).map(|(i, _)| i).collect()
+    }
+
+    /// Connect (or, if it already exists, disconnect) `from` -> `to`. A
+    /// modifier's input accepts only one connection at a time, so wiring a
+    /// new source into an already-fed `ModifierIn` replaces the old one; an
+    /// output accepts any number, matching multi-output fan-in.
+    pub fn connect(&mut self, from: Endpoint, to: Target) {
+        if let Some(i) = self.wires.iter().position(|w| w.from == from && w.to == to) {
+            self.wires.remove(i);
+            return;
+        }
+        if let Target::ModifierIn(_) = to {
+            self.wires.retain(|w| w.to != to);
+        }
+        self.wires.push(Wire { from, to });
+    }
+
+    pub fn remove_wire_at(&mut self, wire_idx: usize) {
+        if wire_idx < self.wires.len() {
+            self.wires.remove(wire_idx);
+        }
+    }
+
+    /// Walk backward from `from` to its ultimate source stream, threading
+    /// through however many modifiers sit in between and accumulating the
+    /// codec/metadata each one sets (first one encountered walking
+    /// backward -- i.e. closest to the output -- wins per field). Returns
+    /// `None` if the chain is broken (a modifier with nothing feeding it)
+    /// or forms a cycle (guarded by a bounded number of hops).
+    pub fn resolve(&self, from: Endpoint) -> Option<Resolved> {
+        let mut codec = Codec::Copy;
+        let mut metadata = BTreeMap::new();
+        let mut current = from;
+        let mut hops = 0usize;
+        loop {
+            hops += 1;
+            if hops > self.modifiers.len() + 1 {
+                return None; // cycle guard
             }
-            None => self.edges.push(Edge {
-                from_node: node,
-                from_stream_idx: stream_idx,
-                to_output,
-                codec: Codec::Copy,
-            }),
-        }
-    }
-
-    pub fn remove_edge_at(&mut self, edge_idx: usize) {
-        if edge_idx < self.edges.len() {
-            self.edges.remove(edge_idx);
-        }
-    }
-
-    pub fn set_edge_codec_at(&mut self, edge_idx: usize, codec: Codec) {
-        if let Some(edge) = self.edges.get_mut(edge_idx) {
-            edge.codec = codec;
+            match current {
+                Endpoint::Stream { node, stream_idx } => {
+                    return Some(Resolved { from_node: node, from_stream_idx: stream_idx, codec, metadata });
+                }
+                Endpoint::ModifierOut(mid) => {
+                    let m = self.modifier(mid)?;
+                    match &m.kind {
+                        ModifierKind::Convert(c) => {
+                            if matches!(codec, Codec::Copy) {
+                                codec = c.clone();
+                            }
+                        }
+                        ModifierKind::Metadata { fields } => {
+                            for (k, v) in fields {
+                                metadata.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                    }
+                    let incoming = self.wires.iter().find(|w| w.to == Target::ModifierIn(mid))?;
+                    current = incoming.from;
+                }
+            }
         }
     }
 
     /// Build the `ffmpeg` argument list for the current graph: all inputs
     /// up front, then one output "section" per output node that has at
-    /// least one mapped stream (`-map`s, `-c copy` plus any per-stream
-    /// overrides, `-f` if an explicit container was chosen, then the output
-    /// path) -- mirroring ffmpeg's own multi-output command syntax. Outputs
-    /// with no edges are skipped entirely: handing ffmpeg an output path
-    /// with no `-map` would trigger its default stream auto-selection,
-    /// which isn't what an empty output node means here.
+    /// least one resolvable connection (`-map`s, `-c copy` plus any
+    /// per-stream codec/metadata overrides picked up from modifier chains,
+    /// `-f` if an explicit container was chosen, then the output path) --
+    /// mirroring ffmpeg's own multi-output command syntax. Outputs with
+    /// nothing resolvable are skipped entirely: handing ffmpeg an output
+    /// path with no `-map` would trigger its default stream
+    /// auto-selection, which isn't what an empty output node means here.
     pub fn build_ffmpeg_args(&self) -> Vec<String> {
         let mut args = vec!["-y".to_string()];
         for input in &self.inputs {
@@ -260,27 +391,35 @@ impl Graph {
             args.push(input.path.clone());
         }
         for output in &self.outputs {
-            let edge_idxs = self.edge_indices_for_output(output.id);
-            if edge_idxs.is_empty() {
+            let resolved: Vec<Resolved> = self
+                .incoming(Target::Output(output.id))
+                .into_iter()
+                .filter_map(|wi| self.resolve(self.wires[wi].from))
+                .collect();
+            if resolved.is_empty() {
                 continue;
             }
-            for &ei in &edge_idxs {
-                let edge = &self.edges[ei];
-                if let Some(input) = self.input(edge.from_node)
-                    && let Some(stream) = input.streams.get(edge.from_stream_idx) {
+
+            for r in &resolved {
+                if let Some(input) = self.input(r.from_node)
+                    && let Some(stream) = input.streams.get(r.from_stream_idx) {
                         args.push("-map".to_string());
                         args.push(format!("{}:{}", input.file_index, stream.index));
                     }
             }
             args.push("-c".to_string());
             args.push("copy".to_string());
-            // Stream specifiers like -c:0 are scoped to the *current*
-            // output section, so the index here is local to this output's
-            // own edge list, not a position in the global self.edges.
-            for (local_i, &ei) in edge_idxs.iter().enumerate() {
-                if let Some(name) = self.edges[ei].codec.ffmpeg_name() {
+            // Stream specifiers like -c:0/-metadata:s:0 are scoped to the
+            // *current* output section, so the index here is local to this
+            // output's own resolved list, not a position in self.wires.
+            for (local_i, r) in resolved.iter().enumerate() {
+                if let Some(name) = r.codec.ffmpeg_name() {
                     args.push(format!("-c:{local_i}"));
                     args.push(name.to_string());
+                }
+                for (key, value) in &r.metadata {
+                    args.push(format!("-metadata:s:{local_i}"));
+                    args.push(format!("{key}={value}"));
                 }
             }
             if let Some(container) = &output.container {

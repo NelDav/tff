@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::ffmpeg;
-use crate::graph::{Codec, Graph, NodeId, StreamKind};
+use crate::graph::{Codec, Endpoint, Graph, ModifierKind, NodeId, StreamKind, Target};
 
 /// Common containers offered first in the picker, ahead of the rest of
 /// ffmpeg's discovered muxer list. Paired with the file extension to switch
@@ -18,28 +19,37 @@ const COMMON_CONTAINERS: &[(&str, &str)] = &[
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    Input(usize),  // index into graph.inputs
-    Output(usize), // index into graph.outputs
+    Input(usize),    // index into graph.inputs
+    Modifier(usize), // index into graph.modifiers
+    Output(usize),   // index into graph.outputs
 }
 
 pub enum TextTarget {
     NewInputPath,
     OutputPath(NodeId),
+    /// Typing the value for a specific metadata key (curated or custom) on
+    /// a Metadata node.
+    ModifierMetadataValue { modifier: NodeId, key: String },
+    /// Step one of "custom key...": typing the key name itself, before the
+    /// value prompt for it opens.
+    ModifierCustomKey(NodeId),
 }
 
 pub enum PickerKind {
-    /// Index into `Graph::edges`. Safe to hold onto across the picker's
-    /// lifetime because Picker mode captures all key input itself, so
-    /// nothing else can mutate `edges` (and shift indices) while it's open.
-    Codec { edge_idx: usize },
+    /// The modifier whose Convert codec is being chosen.
+    Codec { modifier: NodeId },
     Container { output: NodeId },
+    /// Choosing which kind of modifier node 'm' should create.
+    NewModifier,
+    /// Choosing which metadata field to edit on a Metadata node.
+    MetadataKey { modifier: NodeId },
 }
 
 pub struct PickerEntry {
     pub display: String,
     /// `None` is the "reset" choice: Copy for a codec picker, "infer from
     /// extension" for the container picker. `Some(name)` is an explicit
-    /// ffmpeg encoder/muxer name.
+    /// ffmpeg encoder/muxer name, or (for `NewModifier`) a kind tag.
     pub value: Option<String>,
 }
 
@@ -50,7 +60,9 @@ pub enum Mode {
         buffer: String,
         /// Files/directories in the buffer's current directory whose name
         /// starts with what's typed after the last '/' -- recomputed on
-        /// every keystroke. See `path_suggestions`.
+        /// every keystroke. See `path_suggestions`. Left empty for
+        /// free-text fields (e.g. metadata) where path completion doesn't
+        /// apply.
         suggestions: Vec<String>,
         selected: usize,
     },
@@ -87,13 +99,14 @@ pub struct App {
     pub graph: Graph,
     pub focus: Focus,
     /// Selected row within the focused node: a stream index when an input
-    /// is focused, or an index into that output's incoming edges (see
-    /// `Graph::edge_indices_for_output`) when an output is focused.
+    /// is focused, an index into that modifier's outgoing connections when
+    /// a modifier is focused, or an index into that output's incoming
+    /// connections when an output is focused.
     pub row_idx: usize,
     pub mode: Mode,
-    /// A stream port the user has armed, waiting to be connected to
-    /// whichever output node gets focused next.
-    pub armed: Option<(NodeId, usize)>,
+    /// A source endpoint the user has armed, waiting to be wired into
+    /// whichever modifier or output node gets focused next.
+    pub armed: Option<Endpoint>,
     pub log: Vec<String>,
     pub status: String,
     pub running: bool,
@@ -134,22 +147,26 @@ impl App {
     }
 
     fn node_count(&self) -> usize {
-        self.graph.inputs.len() + self.graph.outputs.len()
+        self.graph.inputs.len() + self.graph.modifiers.len() + self.graph.outputs.len()
     }
 
     fn focus_index(&self) -> usize {
         match self.focus {
             Focus::Input(i) => i,
-            Focus::Output(i) => self.graph.inputs.len() + i,
+            Focus::Modifier(i) => self.graph.inputs.len() + i,
+            Focus::Output(i) => self.graph.inputs.len() + self.graph.modifiers.len() + i,
         }
     }
 
     fn set_focus_index(&mut self, idx: usize) {
         let n_inputs = self.graph.inputs.len();
+        let n_modifiers = self.graph.modifiers.len();
         self.focus = if idx < n_inputs {
             Focus::Input(idx)
+        } else if idx < n_inputs + n_modifiers {
+            Focus::Modifier(idx - n_inputs)
         } else {
-            Focus::Output((idx - n_inputs).min(self.graph.outputs.len().saturating_sub(1)))
+            Focus::Output((idx - n_inputs - n_modifiers).min(self.graph.outputs.len().saturating_sub(1)))
         };
         self.row_idx = 0;
     }
@@ -165,16 +182,22 @@ impl App {
         self.set_focus_index(next);
     }
 
-    /// Up/Down while a node is focused: cycles the selected stream (input)
-    /// or the selected incoming connection (output).
+    /// Up/Down while a node is focused: cycles the selected stream (input),
+    /// selected outgoing connection (modifier), or selected incoming
+    /// connection (output).
     pub fn cycle_row(&mut self, forward: bool) {
         let len = match self.focus {
             Focus::Input(i) => self.graph.inputs.get(i).map_or(0, |n| n.streams.len()),
+            Focus::Modifier(i) => self
+                .graph
+                .modifiers
+                .get(i)
+                .map_or(0, |m| self.graph.outgoing(Endpoint::ModifierOut(m.id)).len()),
             Focus::Output(i) => self
                 .graph
                 .outputs
                 .get(i)
-                .map_or(0, |o| self.graph.edge_indices_for_output(o.id).len()),
+                .map_or(0, |o| self.graph.incoming(Target::Output(o.id)).len()),
         };
         if len == 0 {
             return;
@@ -190,6 +213,7 @@ impl App {
         let step = 2.0;
         let pos = match self.focus {
             Focus::Input(i) => self.graph.inputs.get_mut(i).map(|n| &mut n.pos),
+            Focus::Modifier(i) => self.graph.modifiers.get_mut(i).map(|n| &mut n.pos),
             Focus::Output(i) => self.graph.outputs.get_mut(i).map(|n| &mut n.pos),
         };
         if let Some(pos) = pos {
@@ -212,13 +236,28 @@ impl App {
     /// 'O': add a new output node and focus it.
     pub fn add_output_node(&mut self) {
         self.graph.add_output();
-        let idx = self.graph.inputs.len() + self.graph.outputs.len() - 1;
-        self.set_focus_index(idx);
+        self.set_focus_index(self.node_count() - 1);
         self.log.push("added output node".to_string());
     }
 
+    /// 'm': open a picker to choose which kind of modifier node to add.
+    pub fn open_add_modifier_picker(&mut self) {
+        let options = vec![
+            PickerEntry { display: "convert (codec)".to_string(), value: Some("convert".to_string()) },
+            PickerEntry { display: "metadata (language / title)".to_string(), value: Some("metadata".to_string()) },
+        ];
+        self.mode = Mode::Picker {
+            kind: PickerKind::NewModifier,
+            title: "add modifier node".to_string(),
+            options,
+            selected: 0,
+            query: String::new(),
+            searching: false,
+        };
+    }
+
     /// 'o': edit the focused output's path. No-op unless an output is
-    /// focused -- there's nothing to edit on an input node.
+    /// focused -- there's nothing to edit on an input or modifier node.
     pub fn start_edit_output(&mut self) {
         let Focus::Output(i) = self.focus else {
             self.log.push("focus an output node first, then 'o' edits its path".to_string());
@@ -233,6 +272,96 @@ impl App {
             suggestions,
             selected: 0,
         };
+    }
+
+    /// The stream kind flowing into a modifier, if it's connected --
+    /// traced back through however many other modifiers sit upstream.
+    fn modifier_input_kind(&self, modifier_id: NodeId) -> Option<StreamKind> {
+        let incoming = self.graph.wires.iter().find(|w| w.to == Target::ModifierIn(modifier_id))?;
+        let resolved = self.graph.resolve(incoming.from)?;
+        let input = self.graph.input(resolved.from_node)?;
+        input.streams.get(resolved.from_stream_idx).map(|s| s.kind)
+    }
+
+    /// 'e': edit the focused modifier's primary setting -- opens the codec
+    /// picker for a Convert node, or opens a picker of metadata fields
+    /// (curated for the connected stream's kind, plus a custom-key option)
+    /// for a Metadata node.
+    pub fn activate_modifier(&mut self) {
+        let Focus::Modifier(i) = self.focus else {
+            self.log.push("focus a convert or metadata node, then 'e' edits its setting".to_string());
+            return;
+        };
+        let Some(m) = self.graph.modifiers.get(i) else { return };
+        let mid = m.id;
+        match &m.kind {
+            ModifierKind::Convert(current) => {
+                let Some(kind) = self.modifier_input_kind(mid) else {
+                    self.log
+                        .push("connect this node's input first ('c'), then 'e' to pick a codec".to_string());
+                    return;
+                };
+                let current = current.clone();
+
+                let mut names: Vec<String> = Codec::curated_fallback(kind)
+                    .into_iter()
+                    .filter_map(|c| c.ffmpeg_name().map(str::to_string))
+                    .collect();
+                prioritize_and_extend(
+                    &mut names,
+                    self.available_encoders.iter().filter(|(_, k)| *k == kind).map(|(n, _)| n.as_str()),
+                );
+                let options = picker_options("copy (no re-encode)", names);
+                let selected = selected_index(&options, current.ffmpeg_name());
+
+                self.mode = Mode::Picker {
+                    kind: PickerKind::Codec { modifier: mid },
+                    title: "convert: codec".to_string(),
+                    options,
+                    selected,
+                    query: String::new(),
+                    searching: false,
+                };
+            }
+            ModifierKind::Metadata { fields } => {
+                // The curated list is the same regardless of kind right
+                // now (see metadata_keys_for's doc comment for why), but
+                // stays kind-aware for when a genuinely kind-specific,
+                // reliable key is found later. Unconnected nodes fall back
+                // to StreamKind::Other's list rather than refusing outright
+                // -- metadata is meaningful to set even before wiring is
+                // finished, unlike a codec choice.
+                let kind = self.modifier_input_kind(mid).unwrap_or(StreamKind::Other);
+                let keys = crate::graph::metadata_keys_for(kind);
+                let mut options: Vec<PickerEntry> = keys
+                    .iter()
+                    .map(|k| {
+                        let display = match fields.get(*k) {
+                            Some(v) => format!("{k}: {v}"),
+                            None => format!("{k}: (not set)"),
+                        };
+                        PickerEntry { display, value: Some((*k).to_string()) }
+                    })
+                    .collect();
+                // Any already-set keys outside the curated list (set via a
+                // previous "custom key...") should still be visible/editable.
+                for (k, v) in fields {
+                    if !keys.contains(&k.as_str()) {
+                        options.push(PickerEntry { display: format!("{k}: {v}"), value: Some(k.clone()) });
+                    }
+                }
+                options.push(PickerEntry { display: "custom key…".to_string(), value: None });
+
+                self.mode = Mode::Picker {
+                    kind: PickerKind::MetadataKey { modifier: mid },
+                    title: "metadata: choose field".to_string(),
+                    options,
+                    selected: 0,
+                    query: String::new(),
+                    searching: false,
+                };
+            }
+        }
     }
 
     pub fn cancel_text_input(&mut self) {
@@ -271,22 +400,59 @@ impl App {
                         node.path = path;
                     }
             }
+            TextTarget::ModifierMetadataValue { modifier, key } => {
+                let value = buffer.trim().to_string();
+                if let Some(m) = self.graph.modifier_mut(modifier)
+                    && let ModifierKind::Metadata { fields } = &mut m.kind {
+                        if value.is_empty() {
+                            fields.remove(&key);
+                            self.log.push(format!("{key} cleared"));
+                        } else {
+                            fields.insert(key.clone(), value.clone());
+                            self.log.push(format!("{key} set to {value}"));
+                        }
+                    }
+            }
+            TextTarget::ModifierCustomKey(modifier) => {
+                let key = buffer.trim().to_string();
+                if key.is_empty() {
+                    return;
+                }
+                let current = self
+                    .graph
+                    .modifier(modifier)
+                    .and_then(|m| match &m.kind {
+                        ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
+                        ModifierKind::Convert(_) => None,
+                    })
+                    .unwrap_or_default();
+                self.mode = Mode::TextInput {
+                    target: TextTarget::ModifierMetadataValue { modifier, key },
+                    buffer: current,
+                    suggestions: Vec::new(),
+                    selected: 0,
+                };
+            }
         }
     }
 
     pub fn text_input_char(&mut self, c: char) {
-        if let Mode::TextInput { buffer, suggestions, selected, .. } = &mut self.mode {
+        if let Mode::TextInput { target, buffer, suggestions, selected } = &mut self.mode {
             buffer.push(c);
-            *suggestions = path_suggestions(buffer);
-            *selected = 0;
+            if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
+                *suggestions = path_suggestions(buffer);
+                *selected = 0;
+            }
         }
     }
 
     pub fn text_input_backspace(&mut self) {
-        if let Mode::TextInput { buffer, suggestions, selected, .. } = &mut self.mode {
+        if let Mode::TextInput { target, buffer, suggestions, selected } = &mut self.mode {
             buffer.pop();
-            *suggestions = path_suggestions(buffer);
-            *selected = 0;
+            if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
+                *suggestions = path_suggestions(buffer);
+                *selected = 0;
+            }
         }
     }
 
@@ -313,145 +479,102 @@ impl App {
             }
     }
 
-    /// 'c': arm the focused input stream, or -- when something is armed
-    /// and an output node is focused -- connect/disconnect it to that
-    /// specific output. ffmpeg can write several output files in one run,
-    /// so which output a stream feeds is a real choice once more than one
-    /// exists; focusing the destination is how you make that choice.
+    /// 'c': arm the focused input stream or modifier output, or -- when
+    /// something is armed and a modifier/output node is focused --
+    /// wire it in. Pressing 'c' again on the exact thing that's currently
+    /// armed disarms it.
     pub fn toggle_connect(&mut self) {
         match self.focus {
             Focus::Input(i) => {
                 let Some(node) = self.graph.inputs.get(i) else { return };
                 let Some(stream) = node.streams.get(self.row_idx) else { return };
-                let key = (node.id, self.row_idx);
-                if self.armed == Some(key) {
+                let ep = Endpoint::Stream { node: node.id, stream_idx: self.row_idx };
+                if self.armed == Some(ep) {
                     self.armed = None; // disarm
                 } else {
                     self.log.push(format!(
-                        "armed {} from {} — focus an output, press 'c' to connect",
+                        "armed {} from {} — focus a modifier or output, press 'c' to connect",
                         stream.label(),
                         node.path
                     ));
-                    self.armed = Some(key);
+                    self.armed = Some(ep);
+                }
+            }
+            Focus::Modifier(i) => {
+                let Some(m) = self.graph.modifiers.get(i) else { return };
+                let this_output = Endpoint::ModifierOut(m.id);
+                match self.armed {
+                    Some(source) if source == this_output => {
+                        self.armed = None; // disarm
+                    }
+                    Some(source) => {
+                        self.graph.connect(source, Target::ModifierIn(m.id));
+                        self.armed = None;
+                        self.log.push("connected".to_string());
+                    }
+                    None => {
+                        self.armed = Some(this_output);
+                        self.log
+                            .push("armed this node's output — focus the next node, press 'c' to connect".to_string());
+                    }
                 }
             }
             Focus::Output(i) => {
                 let Some(output) = self.graph.outputs.get(i) else { return };
-                let output_id = output.id;
-                if let Some((node_id, stream_idx)) = self.armed.take() {
-                    let was_connected = self.graph.has_edge(node_id, stream_idx, output_id);
-                    self.graph.toggle_edge(node_id, stream_idx, output_id);
-                    self.log.push(if was_connected {
-                        "disconnected".to_string()
-                    } else {
-                        "connected to output".to_string()
-                    });
+                match self.armed.take() {
+                    Some(source) => {
+                        self.graph.connect(source, Target::Output(output.id));
+                        self.log.push("connected to output".to_string());
+                    }
+                    None => {
+                        self.log.push("nothing armed -- arm a stream or modifier output first ('c')".to_string());
+                    }
                 }
             }
         }
     }
 
-    /// 'd': on an input port, disconnect it from every output it feeds; on
-    /// an output node, disconnect just the selected incoming connection.
+    /// 'd': on an input port, disconnect it from everything downstream; on
+    /// a modifier, disconnect just the selected outgoing connection; on an
+    /// output, disconnect just the selected incoming connection.
     pub fn disconnect_focused(&mut self) {
         match self.focus {
             Focus::Input(i) => {
                 let Some(node) = self.graph.inputs.get(i) else { return };
                 let Some(stream) = node.streams.get(self.row_idx) else { return };
-                let (id, idx) = (node.id, self.row_idx);
+                let ep = Endpoint::Stream { node: node.id, stream_idx: self.row_idx };
                 let label = stream.label();
-                let before = self.graph.edges.len();
-                self.graph.edges.retain(|e| !(e.from_node == id && e.from_stream_idx == idx));
-                if self.graph.edges.len() != before {
-                    self.log.push(format!("disconnected {label} from all outputs"));
+                let before = self.graph.wires.len();
+                self.graph.wires.retain(|w| w.from != ep);
+                if self.graph.wires.len() != before {
+                    self.log.push(format!("disconnected {label} from everything downstream"));
+                }
+            }
+            Focus::Modifier(i) => {
+                let Some(m) = self.graph.modifiers.get(i) else { return };
+                let ep = Endpoint::ModifierOut(m.id);
+                let outgoing = self.graph.outgoing(ep);
+                let Some(&wi) = outgoing.get(self.row_idx) else { return };
+                self.graph.remove_wire_at(wi);
+                self.log.push("disconnected".to_string());
+                let new_len = self.graph.outgoing(ep).len();
+                if new_len > 0 && self.row_idx >= new_len {
+                    self.row_idx = new_len - 1;
                 }
             }
             Focus::Output(i) => {
                 let Some(output) = self.graph.outputs.get(i) else { return };
-                let output_id = output.id;
-                let edge_idxs = self.graph.edge_indices_for_output(output_id);
-                let Some(&ei) = edge_idxs.get(self.row_idx) else { return };
-                self.graph.remove_edge_at(ei);
+                let target = Target::Output(output.id);
+                let incoming = self.graph.incoming(target);
+                let Some(&wi) = incoming.get(self.row_idx) else { return };
+                self.graph.remove_wire_at(wi);
                 self.log.push("disconnected".to_string());
-                let new_len = self.graph.edge_indices_for_output(output_id).len();
+                let new_len = self.graph.incoming(target).len();
                 if new_len > 0 && self.row_idx >= new_len {
                     self.row_idx = new_len - 1;
                 }
             }
         }
-    }
-
-    /// 'e': open a picker listing codecs for a specific connection. On an
-    /// input port with exactly one outgoing connection, that's unambiguous;
-    /// with more than one (fanned out to several outputs) or none, this
-    /// asks the user to be precise via the output side instead. On an
-    /// output node, it targets whichever connection row is selected.
-    pub fn open_codec_picker(&mut self) {
-        let (edge_idx, kind, label) = match self.focus {
-            Focus::Input(i) => {
-                let Some(node) = self.graph.inputs.get(i) else { return };
-                let Some(stream) = node.streams.get(self.row_idx) else { return };
-                let (id, idx) = (node.id, self.row_idx);
-                let matches: Vec<usize> = self
-                    .graph
-                    .edges
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.from_node == id && e.from_stream_idx == idx)
-                    .map(|(ei, _)| ei)
-                    .collect();
-                match matches.len() {
-                    0 => {
-                        self.log
-                            .push("connect this stream first ('c'), then 'e' to pick a codec".to_string());
-                        return;
-                    }
-                    1 => (matches[0], stream.kind, stream.label()),
-                    _ => {
-                        self.log.push(
-                            "connected to multiple outputs — focus the specific output row to set its codec"
-                                .to_string(),
-                        );
-                        return;
-                    }
-                }
-            }
-            Focus::Output(i) => {
-                let Some(output) = self.graph.outputs.get(i) else { return };
-                let edge_idxs = self.graph.edge_indices_for_output(output.id);
-                let Some(&ei) = edge_idxs.get(self.row_idx) else {
-                    self.log.push("nothing mapped to this output yet".to_string());
-                    return;
-                };
-                let edge = &self.graph.edges[ei];
-                let Some(input) = self.graph.input(edge.from_node) else { return };
-                let Some(stream) = input.streams.get(edge.from_stream_idx) else { return };
-                (ei, stream.kind, stream.label())
-            }
-        };
-
-        let current = self.graph.edges[edge_idx].codec.clone();
-
-        let mut names: Vec<String> = Codec::curated_fallback(kind)
-            .into_iter()
-            .filter_map(|c| c.ffmpeg_name().map(str::to_string))
-            .collect();
-        prioritize_and_extend(
-            &mut names,
-            self.available_encoders.iter().filter(|(_, k)| *k == kind).map(|(n, _)| n.as_str()),
-        );
-
-        let options = picker_options("copy (no re-encode)", names);
-        let selected = selected_index(&options, current.ffmpeg_name());
-
-        self.mode = Mode::Picker {
-            kind: PickerKind::Codec { edge_idx },
-            title: format!("codec for {label}"),
-            options,
-            selected,
-            query: String::new(),
-            searching: false,
-        };
     }
 
     /// 'f': open a picker listing ffmpeg's available output containers for
@@ -560,7 +683,7 @@ impl App {
         };
 
         match kind {
-            PickerKind::Codec { edge_idx } => {
+            PickerKind::Codec { modifier } => {
                 let codec = match entry.value {
                     None => Codec::Copy,
                     Some(name) => Codec::Encode(name),
@@ -569,7 +692,9 @@ impl App {
                     Codec::Copy => "codec set to copy (no re-encode)".to_string(),
                     Codec::Encode(_) => format!("codec set to {}", codec.label()),
                 });
-                self.graph.set_edge_codec_at(edge_idx, codec);
+                if let Some(m) = self.graph.modifier_mut(modifier) {
+                    m.kind = ModifierKind::Convert(codec);
+                }
             }
             PickerKind::Container { output } => {
                 let Some(node) = self.graph.output_mut(output) else { return };
@@ -587,11 +712,48 @@ impl App {
                         .push("output container set to auto (inferred from file extension)".to_string()),
                 }
             }
+            PickerKind::NewModifier => {
+                let (kind, name) = match entry.value.as_deref() {
+                    Some("metadata") => (ModifierKind::Metadata { fields: BTreeMap::new() }, "metadata"),
+                    _ => (ModifierKind::Convert(Codec::Copy), "convert"),
+                };
+                self.graph.add_modifier(kind);
+                self.set_focus_index(self.node_count() - self.graph.outputs.len() - 1);
+                self.log.push(format!("added {name} node"));
+            }
+            PickerKind::MetadataKey { modifier } => match entry.value {
+                Some(key) => {
+                    let current = self
+                        .graph
+                        .modifier(modifier)
+                        .and_then(|m| match &m.kind {
+                            ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
+                            ModifierKind::Convert(_) => None,
+                        })
+                        .unwrap_or_default();
+                    self.mode = Mode::TextInput {
+                        target: TextTarget::ModifierMetadataValue { modifier, key },
+                        buffer: current,
+                        suggestions: Vec::new(),
+                        selected: 0,
+                    };
+                }
+                None => {
+                    // "custom key..." -- first ask for the key name itself.
+                    self.mode = Mode::TextInput {
+                        target: TextTarget::ModifierCustomKey(modifier),
+                        buffer: String::new(),
+                        suggestions: Vec::new(),
+                        selected: 0,
+                    };
+                }
+            },
         }
     }
 
-    /// 'x': remove the focused node -- an input entirely, or an output as
-    /// long as it isn't the last one (ffmpeg needs somewhere to write to).
+    /// 'x': remove the focused node. An input or modifier can always be
+    /// removed; an output can be too, as long as it isn't the last one
+    /// (ffmpeg needs somewhere to write to).
     pub fn delete_focused_node(&mut self) {
         match self.focus {
             Focus::Input(i) => {
@@ -599,10 +761,19 @@ impl App {
                 let id = node.id;
                 let path = node.path.clone();
                 self.graph.remove_input(id);
-                self.armed = self.armed.filter(|(n, _)| *n != id);
+                self.armed = self.armed.filter(|e| !matches!(e, Endpoint::Stream { node, .. } if *node == id));
                 self.log.push(format!("removed input: {path}"));
                 let n = self.graph.inputs.len();
                 self.set_focus_index(i.min(n));
+            }
+            Focus::Modifier(i) => {
+                let Some(m) = self.graph.modifiers.get(i) else { return };
+                let id = m.id;
+                self.graph.remove_modifier(id);
+                self.armed = self.armed.filter(|e| *e != Endpoint::ModifierOut(id));
+                self.log.push("removed modifier node".to_string());
+                let n = self.node_count();
+                self.set_focus_index((self.graph.inputs.len() + i).min(n.saturating_sub(1)));
             }
             Focus::Output(i) => {
                 if self.graph.outputs.len() <= 1 {
@@ -615,7 +786,7 @@ impl App {
                 self.graph.remove_output(id);
                 self.log.push(format!("removed output: {path}"));
                 let n = self.node_count();
-                self.set_focus_index((self.graph.inputs.len() + i).min(n.saturating_sub(1)));
+                self.set_focus_index((self.graph.inputs.len() + self.graph.modifiers.len() + i).min(n.saturating_sub(1)));
             }
         }
     }
@@ -624,9 +795,9 @@ impl App {
         if self.running {
             return;
         }
-        if self.graph.edges.is_empty() {
+        if self.graph.wires.is_empty() {
             self.log.push(
-                "nothing mapped yet — arm a stream with 'c', then focus an output and press 'c' again"
+                "nothing mapped yet — arm a stream with 'c', then focus a modifier or output and press 'c' again"
                     .to_string(),
             );
             return;
