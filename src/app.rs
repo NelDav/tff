@@ -17,6 +17,11 @@ const COMMON_CONTAINERS: &[(&str, &str)] = &[
     ("avi", "avi"),
 ];
 
+/// How much of the focused output's timeline 'p' renders before handing it
+/// to ffplay -- long enough to judge codec/metadata choices, short enough
+/// to stay fast even with a slow re-encode.
+const PREVIEW_SECONDS: u32 = 20;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Input(usize),    // index into graph.inputs
@@ -111,6 +116,10 @@ pub struct App {
     pub status: String,
     pub running: bool,
     rx: Option<Receiver<String>>,
+    /// Set while the in-flight ffmpeg job (tracked via `rx`/`running`) is a
+    /// preview render rather than a real one -- the temp file path to hand
+    /// to `ffplay` once it finishes successfully.
+    preview_target: Option<String>,
     pub should_quit: bool,
     /// The real encoders/muxers this machine's ffmpeg build supports,
     /// queried once at startup. Empty if the query failed, in which case
@@ -140,6 +149,7 @@ impl App {
             status: String::new(),
             running: false,
             rx: None,
+            preview_target: None,
             should_quit: false,
             available_encoders,
             available_muxers,
@@ -813,6 +823,44 @@ impl App {
         });
     }
 
+    /// 'p': render the first `PREVIEW_SECONDS` of the focused output's
+    /// current mapping to a temp file, then hand it to ffplay once that
+    /// finishes -- lets the user see how codec/metadata choices actually
+    /// turn out without waiting for (or overwriting) the real output.
+    pub fn start_preview(&mut self) {
+        if self.running {
+            self.log.push("already running ffmpeg — wait for it to finish before previewing".to_string());
+            return;
+        }
+        let Focus::Output(i) = self.focus else {
+            self.log.push("focus an output node first, then 'p' previews it".to_string());
+            return;
+        };
+        let Some(output) = self.graph.outputs.get(i) else { return };
+        let output_id = output.id;
+        let ext = std::path::Path::new(&output.path).extension().and_then(|e| e.to_str()).unwrap_or("mkv");
+        let preview_path =
+            std::env::temp_dir().join(format!("tff-preview-{output_id}.{ext}")).to_string_lossy().into_owned();
+
+        let Some(args) = self.graph.build_preview_args(output_id, &preview_path, PREVIEW_SECONDS) else {
+            self.log.push(
+                "nothing mapped to this output yet — arm a stream with 'c', then focus it and press 'c' again"
+                    .to_string(),
+            );
+            return;
+        };
+
+        let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
+        self.rx = Some(rx);
+        self.running = true;
+        self.status = format!("rendering {PREVIEW_SECONDS}s preview...");
+        self.preview_target = Some(preview_path);
+        self.log.push(format!("$ ffmpeg {}", args.join(" ")));
+        thread::spawn(move || {
+            ffmpeg::run_args(args, tx);
+        });
+    }
+
     pub fn poll_ffmpeg(&mut self) {
         let Some(rx) = &self.rx else { return };
         let mut done = None;
@@ -825,9 +873,23 @@ impl App {
         }
         if let Some(code) = done {
             self.running = false;
-            self.status = format!("ffmpeg exited with code {code}");
-            self.log.push(self.status.clone());
             self.rx = None;
+            if let Some(path) = self.preview_target.take() {
+                if code == "0" {
+                    self.status = "preview ready".to_string();
+                    self.log.push(format!("$ ffplay {path}"));
+                    if let Err(e) = ffmpeg::play(&path) {
+                        self.status = format!("couldn't launch ffplay: {e:#}");
+                        self.log.push(self.status.clone());
+                    }
+                } else {
+                    self.status = format!("preview render failed (exit code {code})");
+                    self.log.push(self.status.clone());
+                }
+            } else {
+                self.status = format!("ffmpeg exited with code {code}");
+                self.log.push(self.status.clone());
+            }
         }
     }
 }

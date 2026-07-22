@@ -375,15 +375,67 @@ impl Graph {
         }
     }
 
+    /// Builds the `-map`/`-c`/`-metadata`/`-f`/path argument block for a
+    /// single output node, or `None` if it has nothing resolvable to map
+    /// (see `build_ffmpeg_args`). `path_override` writes somewhere other
+    /// than the node's own configured path, and `extra_args` are spliced in
+    /// just before the path -- both exist so `build_preview_args` can reuse
+    /// this for a short, temp-file rendition of one output instead of
+    /// duplicating the section-building logic.
+    fn build_output_section(
+        &self,
+        output: &OutputNode,
+        path_override: Option<&str>,
+        extra_args: &[String],
+    ) -> Option<Vec<String>> {
+        let resolved: Vec<Resolved> = self
+            .incoming(Target::Output(output.id))
+            .into_iter()
+            .filter_map(|wi| self.resolve(self.wires[wi].from))
+            .collect();
+        if resolved.is_empty() {
+            return None;
+        }
+
+        let mut args = Vec::new();
+        for r in &resolved {
+            if let Some(input) = self.input(r.from_node)
+                && let Some(stream) = input.streams.get(r.from_stream_idx) {
+                    args.push("-map".to_string());
+                    args.push(format!("{}:{}", input.file_index, stream.index));
+                }
+        }
+        args.push("-c".to_string());
+        args.push("copy".to_string());
+        // Stream specifiers like -c:0/-metadata:s:0 are scoped to the
+        // *current* output section, so the index here is local to this
+        // output's own resolved list, not a position in self.wires.
+        for (local_i, r) in resolved.iter().enumerate() {
+            if let Some(name) = r.codec.ffmpeg_name() {
+                args.push(format!("-c:{local_i}"));
+                args.push(name.to_string());
+            }
+            for (key, value) in &r.metadata {
+                args.push(format!("-metadata:s:{local_i}"));
+                args.push(format!("{key}={value}"));
+            }
+        }
+        if let Some(container) = &output.container {
+            args.push("-f".to_string());
+            args.push(container.clone());
+        }
+        args.extend_from_slice(extra_args);
+        args.push(path_override.unwrap_or(&output.path).to_string());
+        Some(args)
+    }
+
     /// Build the `ffmpeg` argument list for the current graph: all inputs
     /// up front, then one output "section" per output node that has at
-    /// least one resolvable connection (`-map`s, `-c copy` plus any
-    /// per-stream codec/metadata overrides picked up from modifier chains,
-    /// `-f` if an explicit container was chosen, then the output path) --
-    /// mirroring ffmpeg's own multi-output command syntax. Outputs with
-    /// nothing resolvable are skipped entirely: handing ffmpeg an output
-    /// path with no `-map` would trigger its default stream
-    /// auto-selection, which isn't what an empty output node means here.
+    /// least one resolvable connection -- mirroring ffmpeg's own
+    /// multi-output command syntax. Outputs with nothing resolvable are
+    /// skipped entirely: handing ffmpeg an output path with no `-map` would
+    /// trigger its default stream auto-selection, which isn't what an empty
+    /// output node means here.
     pub fn build_ffmpeg_args(&self) -> Vec<String> {
         let mut args = vec!["-y".to_string()];
         for input in &self.inputs {
@@ -391,43 +443,26 @@ impl Graph {
             args.push(input.path.clone());
         }
         for output in &self.outputs {
-            let resolved: Vec<Resolved> = self
-                .incoming(Target::Output(output.id))
-                .into_iter()
-                .filter_map(|wi| self.resolve(self.wires[wi].from))
-                .collect();
-            if resolved.is_empty() {
-                continue;
+            if let Some(section) = self.build_output_section(output, None, &[]) {
+                args.extend(section);
             }
-
-            for r in &resolved {
-                if let Some(input) = self.input(r.from_node)
-                    && let Some(stream) = input.streams.get(r.from_stream_idx) {
-                        args.push("-map".to_string());
-                        args.push(format!("{}:{}", input.file_index, stream.index));
-                    }
-            }
-            args.push("-c".to_string());
-            args.push("copy".to_string());
-            // Stream specifiers like -c:0/-metadata:s:0 are scoped to the
-            // *current* output section, so the index here is local to this
-            // output's own resolved list, not a position in self.wires.
-            for (local_i, r) in resolved.iter().enumerate() {
-                if let Some(name) = r.codec.ffmpeg_name() {
-                    args.push(format!("-c:{local_i}"));
-                    args.push(name.to_string());
-                }
-                for (key, value) in &r.metadata {
-                    args.push(format!("-metadata:s:{local_i}"));
-                    args.push(format!("{key}={value}"));
-                }
-            }
-            if let Some(container) = &output.container {
-                args.push("-f".to_string());
-                args.push(container.clone());
-            }
-            args.push(output.path.clone());
         }
         args
+    }
+
+    /// Args for rendering just one output to `preview_path`, capped to its
+    /// first `duration_secs` seconds (as an output-scoped `-t`, so it stops
+    /// that output early without truncating what's read from the inputs) --
+    /// `None` if that output has nothing resolvable, same as a real render.
+    pub fn build_preview_args(&self, output_id: NodeId, preview_path: &str, duration_secs: u32) -> Option<Vec<String>> {
+        let output = self.outputs.iter().find(|o| o.id == output_id)?;
+        let mut args = vec!["-y".to_string()];
+        for input in &self.inputs {
+            args.push("-i".to_string());
+            args.push(input.path.clone());
+        }
+        let extra = vec!["-t".to_string(), duration_secs.to_string()];
+        args.extend(self.build_output_section(output, Some(preview_path), &extra)?);
+        Some(args)
     }
 }

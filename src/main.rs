@@ -92,6 +92,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('f') => app.open_container_picker(),
             KeyCode::Char('x') => app.delete_focused_node(),
             KeyCode::Char('r') => app.start_render(),
+            KeyCode::Char('p') => app.start_preview(),
             KeyCode::Esc => app.armed = None,
             _ => {}
         },

@@ -773,6 +773,59 @@ fn filtered_indices_matches_case_insensitive_substring() {
     assert!(filtered_indices(&options, "nonexistent").is_empty());
 }
 
+/// 'p' with an input or modifier focused (rather than an output) should
+/// refuse with a hint instead of silently doing nothing.
+#[test]
+fn start_preview_requires_an_output_focused() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
+    app.focus = Focus::Input(idx);
+
+    app.start_preview();
+
+    assert!(!app.running);
+    assert!(app.log.last().unwrap().contains("focus an output node first"));
+}
+
+/// 'p' on a focused output with nothing mapped to it should refuse with a
+/// hint, the same way 'r' does for a graph with no wires at all.
+#[test]
+fn start_preview_requires_something_mapped_to_the_output() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    app.focus = Focus::Output(0);
+
+    app.start_preview();
+
+    assert!(!app.running);
+    assert!(app.log.last().unwrap().contains("nothing mapped"));
+}
+
+/// 'p' while a render or another preview is already in flight should
+/// refuse rather than stomp on it with a second concurrent ffmpeg job.
+#[test]
+fn start_preview_refuses_while_a_job_is_already_running() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    app.focus = Focus::Output(0);
+
+    app.start_preview();
+    assert!(app.running, "first preview should have started a job");
+    let log_len = app.log.len();
+
+    app.start_preview();
+    assert_eq!(app.log.len(), log_len + 1);
+    assert!(app.log.last().unwrap().contains("already running"));
+}
+
 // ---------------------------------------------------------------------
 // UI rendering
 // ---------------------------------------------------------------------
@@ -1175,6 +1228,63 @@ fn two_outputs_produce_two_separate_files_in_one_ffmpeg_run() {
     let audio_streams = ffmpeg::probe(audio_out.to_str().unwrap()).unwrap();
     assert_eq!(audio_streams.len(), 1);
     assert_eq!(audio_streams[0].kind, StreamKind::Audio);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// build_preview_args should target a caller-given path (not the output
+/// node's own configured one) and cap the render with an output-scoped -t,
+/// while still honoring whatever codec/metadata a modifier chain sets --
+/// verified end-to-end against real ffmpeg, since -t's placement relative
+/// to -map/-c/-metadata determines whether it's read as an input or output
+/// option.
+#[test]
+fn preview_args_cap_duration_and_write_to_the_given_path() {
+    let dir = std::env::temp_dir().join(format!("tff-test-preview-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source_path = dir.join("source.mp4");
+    let preview_path = dir.join("preview.mkv");
+
+    run_ok(Command::new("ffmpeg").args([
+        "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=duration=5:size=160x120:rate=5",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
+        "-c:v", "libx264", "-c:a", "aac", "-shortest", source_path.to_str().unwrap(),
+    ]));
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let unconnected_out = graph.add_output();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let modifier = graph.add_modifier(ModifierKind::Metadata { fields: metadata_fields(&[("language", "eng")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+
+    // An output with nothing mapped to it has nothing resolvable to
+    // preview, same as it has nothing to render for real.
+    assert!(graph.build_preview_args(unconnected_out, preview_path.to_str().unwrap(), 2).is_none());
+
+    let args = graph.build_preview_args(out, preview_path.to_str().unwrap(), 2).expect("resolvable");
+    run_ok(Command::new("ffmpeg").args(&args));
+
+    assert!(!dir.join(&graph.outputs[0].path).exists(), "preview must not touch the output's own configured path");
+
+    let probe_out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", preview_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let duration: f64 = String::from_utf8_lossy(&probe_out.stdout)
+        .trim()
+        .strip_prefix("duration=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(duration <= 3.0, "expected the preview capped near 2s, got {duration}");
+
+    let tags = ffmpeg::probe(preview_path.to_str().unwrap()).unwrap();
+    assert_eq!(tags[0].lang.as_deref(), Some("eng"), "modifier chain's metadata should still apply to the preview");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
