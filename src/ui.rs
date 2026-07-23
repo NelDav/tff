@@ -31,7 +31,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect) {
     let line = TextLine::from(
-        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  a add-input  O add-output  m add-modifier  o output-path  c arm/connect  d disconnect  e edit  f container  x delete-node  r render  p preview  q quit ",
+        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  a add-input  O add-output  m add-modifier  o output-path  c arm/connect  d disconnect  e edit  f container  g extra args  x delete-node  r render  p preview  q quit ",
     )
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_widget(Paragraph::new(line), area);
@@ -60,6 +60,8 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                 crate::app::TextTarget::ModifierMetadataValue { key, .. } => format!("{key}: "),
                 crate::app::TextTarget::ModifierCustomKey(_) => "custom metadata key: ".to_string(),
                 crate::app::TextTarget::ModifierFilterValue { key, .. } => format!("{key}: "),
+                crate::app::TextTarget::ExtraArgValue { key, .. } => format!("{key}: "),
+                crate::app::TextTarget::ExtraArgCustomKey(_) => "custom extra-arg key: ".to_string(),
             };
             TextLine::from(vec![
                 Span::styled(prompt, Style::default().fg(Color::Yellow)),
@@ -98,8 +100,22 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn node_rows(n_streams: usize) -> u16 {
-    (2 + n_streams.max(1)) as u16
+/// An input/output node's box gets the same two-part body a Metadata/
+/// Filter/Disposition modifier has: an upper section listing its extra
+/// ffmpeg args (if any), a divider, then its usual content (streams for an
+/// input, mapped connections for an output). Unlike those modifier kinds,
+/// the upper section is entirely absent (not even a placeholder row) when
+/// there's nothing to show -- extra_args is a rare, advanced add-on here,
+/// not the node's whole reason for existing, so it shouldn't add a blank
+/// line to every ordinary input/output node the way it does for e.g. an
+/// empty Metadata node (where showing "(no metadata set)" makes sense
+/// because setting metadata *is* that node's entire purpose).
+fn extra_args_field_rows(extra_args: &std::collections::BTreeMap<String, String>) -> u16 {
+    if extra_args.is_empty() { 0 } else { extra_args.len() as u16 + 1 } // + divider
+}
+
+fn node_rows(n_streams: usize, extra_args: &std::collections::BTreeMap<String, String>) -> u16 {
+    2 + extra_args_field_rows(extra_args) + n_streams.max(1) as u16
 }
 
 /// A Metadata modifier's box has an upper section (one row per field it
@@ -162,7 +178,7 @@ fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
 fn compute_rects(app: &App, area: Rect) -> Vec<(NodeId, Rect)> {
     let mut rects = Vec::new();
     for input in &app.graph.inputs {
-        let rows = node_rows(input.streams.len());
+        let rows = node_rows(input.streams.len(), &input.extra_args);
         if let Some(r) = node_rect(area, input.pos, input.width, rows) {
             rects.push((input.id, r));
         }
@@ -174,7 +190,7 @@ fn compute_rects(app: &App, area: Rect) -> Vec<(NodeId, Rect)> {
         }
     }
     for output in &app.graph.outputs {
-        let rows = node_rows(app.graph.incoming(Target::Output(output.id)).len());
+        let rows = node_rows(app.graph.incoming(Target::Output(output.id)).len(), &output.extra_args);
         if let Some(r) = node_rect(area, output.pos, output.width, rows) {
             rects.push((output.id, r));
         }
@@ -211,7 +227,10 @@ fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
         };
         let Some(src_rect) = rect_for(&rects, src_id) else { continue };
         let (src_row_offset, src_row) = match wire.from {
-            Endpoint::Stream { stream_idx, .. } => (1u16, stream_idx),
+            Endpoint::Stream { node, stream_idx } => {
+                let offset = app.graph.input(node).map(|n| 1 + extra_args_field_rows(&n.extra_args)).unwrap_or(1);
+                (offset, stream_idx) // stream rows sit below the extra-args section, if any
+            }
             Endpoint::ModifierOut(mid) => {
                 let row = app.graph.outgoing(wire.from).iter().position(|&wi| wi == wire_idx).unwrap_or(0);
                 let offset = app.graph.modifier(mid).map(|m| modifier_outgoing_start_row(&m.kind)).unwrap_or(2);
@@ -230,9 +249,10 @@ fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
                 let offset = app.graph.modifier(mid).map(|m| modifier_incoming_row(&m.kind)).unwrap_or(1);
                 (offset, 0u16) // a modifier only ever has one incoming row
             }
-            Target::Output(_) => {
+            Target::Output(id) => {
                 let row = app.graph.incoming(wire.to).iter().position(|&wi| wi == wire_idx).unwrap_or(0);
-                (1u16, row as u16)
+                let offset = app.graph.output(id).map(|n| 1 + extra_args_field_rows(&n.extra_args)).unwrap_or(1);
+                (offset, row as u16) // mapped rows sit below the extra-args section, if any
             }
         };
         let dst = Position::new(dst_rect.x.saturating_sub(1), dst_rect.y + dst_row_offset + dst_row);
@@ -370,13 +390,21 @@ fn draw_input_node(
     row_idx: usize,
     armed: Option<Endpoint>,
 ) {
-    let rows = node_rows(node.streams.len());
+    let rows = node_rows(node.streams.len(), &node.extra_args);
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
     let border_color = if focused { Color::Yellow } else { Color::White };
 
     let mut lines = Vec::new();
+    if !node.extra_args.is_empty() {
+        for (key, value) in &node.extra_args {
+            let text = if value.is_empty() { format!("-{key}") } else { format!("-{key} {value}") };
+            lines.push(TextLine::from(text));
+        }
+        let divider_width = rect.width.saturating_sub(2) as usize;
+        lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
+    }
     if node.streams.is_empty() {
         lines.push(TextLine::from("(no streams)"));
     }
@@ -523,7 +551,7 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
 
 fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &OutputNode) {
     let incoming = app.graph.incoming(Target::Output(node.id));
-    let rows = node_rows(incoming.len());
+    let rows = node_rows(incoming.len(), &node.extra_args);
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
@@ -531,6 +559,14 @@ fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usiz
     let border_color = if focused { Color::Yellow } else { Color::Cyan };
 
     let mut lines = Vec::new();
+    if !node.extra_args.is_empty() {
+        for (key, value) in &node.extra_args {
+            let text = if value.is_empty() { format!("-{key}") } else { format!("-{key} {value}") };
+            lines.push(TextLine::from(text));
+        }
+        let divider_width = rect.width.saturating_sub(2) as usize;
+        lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
+    }
     if incoming.is_empty() {
         lines.push(TextLine::from("(nothing mapped — arm a stream with 'c')"));
     }

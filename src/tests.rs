@@ -75,6 +75,50 @@ fn convert_modifier_sets_codec_override() {
     assert!(joined.contains("-c:0 libx265"), "expected the convert node's codec as an override: {joined}");
 }
 
+/// An input's extra_args (the advanced escape hatch for global input
+/// options not otherwise modeled) should be spliced in immediately before
+/// that input's own `-i <path>`, each entry as `-<key> <value>`. An
+/// empty-string value (a valueless switch flag like `-re`) should emit just
+/// the bare flag with no operand token.
+#[test]
+fn input_extra_args_are_spliced_before_its_own_dash_i() {
+    let mut graph = Graph::new();
+    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "2.5"), ("re", "")]);
+
+    let args = graph.build_ffmpeg_args();
+    let joined = args.join(" ");
+    assert!(joined.contains("-itsoffset 2.5"), "{joined}");
+    assert!(joined.contains("-re -i in.mp4"), "a valueless flag should have no operand token: {joined}");
+}
+
+/// An output's extra_args should be appended after everything else that
+/// output's section builds (map/codec/metadata/disposition/container), just
+/// before the output path -- and an empty map (the default/cleared state)
+/// should add nothing at all.
+#[test]
+fn output_extra_args_are_appended_before_the_output_path() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000"), ("movflags", "+faststart")]);
+
+    let args = graph.build_ffmpeg_args();
+    assert_eq!(
+        args.last().unwrap(),
+        &graph.outputs[0].path,
+        "the output path must still be the very last argument"
+    );
+    let joined = args.join(" ");
+    assert!(joined.contains("-max_interleave_delta 5000000"), "{joined}");
+    assert!(joined.contains("-movflags +faststart output.mkv"), "{joined}");
+
+    graph.outputs[0].extra_args = BTreeMap::new();
+    let args = graph.build_ffmpeg_args();
+    assert!(!args.join(" ").contains("-max_interleave_delta"), "clearing extra_args should remove the tokens");
+}
+
 /// A Metadata modifier's language/title should show up as -metadata:s:N
 /// arguments.
 #[test]
@@ -1149,9 +1193,239 @@ fn poll_ffmpeg_hands_off_a_finished_preview_via_preview_ready() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 'g' with a modifier focused should refuse -- the extra-args escape hatch
+/// only applies to input/output nodes, since a modifier's own settings are
+/// already reachable via 'e'.
+#[test]
+fn start_edit_extra_args_refuses_on_modifier_focus() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.start_edit_extra_args();
+
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.log.last().unwrap().contains("focus an input or output node first"));
+}
+
+/// 'g' on a focused input should open a picker listing every curated input
+/// flag, with a checkbox for the valueless one (`re`) and "key: value" for
+/// the rest, reflecting whatever's already set.
+#[test]
+fn start_edit_extra_args_on_input_opens_field_picker_with_current_values() {
+    use crate::app::{App, Focus, Mode, PickerKind};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    app.graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "1.0")]);
+    let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
+    app.focus = Focus::Input(idx);
+
+    app.start_edit_extra_args();
+
+    let Mode::Picker { kind, options, .. } = &app.mode else { panic!("expected picker mode") };
+    assert!(matches!(kind, PickerKind::ExtraArgField { target } if matches!(target, crate::app::ExtraArgsTarget::Input(nid) if *nid == id)));
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert!(options.iter().any(|o| o.display == "itsoffset: 1.0"), "{displays:?}");
+    assert!(options.iter().any(|o| o.display == "stream_loop: (not set)"), "{displays:?}");
+    assert!(options.iter().any(|o| o.display == "[ ] re"), "{displays:?}");
+    assert_eq!(options.last().unwrap().display, "custom key…");
+}
+
+/// 'g' on a focused output should behave the same way (same underlying
+/// flow, different curated list and graph accessor).
+#[test]
+fn start_edit_extra_args_on_output_opens_field_picker_with_current_values() {
+    use crate::app::{App, Focus, Mode, PickerKind};
+
+    let mut app = App::new();
+    app.graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000")]);
+    app.focus = Focus::Output(0);
+    let id = app.graph.outputs[0].id;
+
+    app.start_edit_extra_args();
+
+    let Mode::Picker { kind, options, .. } = &app.mode else { panic!("expected picker mode") };
+    assert!(matches!(kind, PickerKind::ExtraArgField { target } if matches!(target, crate::app::ExtraArgsTarget::Output(nid) if *nid == id)));
+    assert!(options.iter().any(|o| o.display == "max_interleave_delta: 5000000"));
+    assert!(options.iter().any(|o| o.display == "[ ] shortest"));
+}
+
+/// Picking a curated valueless flag (e.g. "re") should toggle it in place
+/// and keep the picker open -- same idea as disposition flags -- rather
+/// than opening a value prompt for a flag that doesn't take one.
+#[test]
+fn extra_args_picker_toggles_valueless_flag_in_place() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
+    app.focus = Focus::Input(idx);
+    app.start_edit_extra_args();
+
+    let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let re_row = options.iter().position(|o| o.display == "[ ] re").unwrap();
+    app.picker_move(re_row as isize);
+
+    app.picker_confirm();
+
+    assert!(matches!(app.mode, Mode::Picker { .. }), "picker should stay open after toggling");
+    assert_eq!(app.graph.input(id).unwrap().extra_args.get("re"), Some(&String::new()));
+    let Mode::Picker { options, .. } = &app.mode else { unreachable!() };
+    assert!(options.iter().any(|o| o.display == "[x] re"));
+
+    app.picker_confirm(); // toggle back off
+
+    assert!(!app.graph.input(id).unwrap().extra_args.contains_key("re"));
+}
+
+/// Picking a curated value-taking key should open a value text input, and
+/// confirming a value should store it -- same round trip as Metadata/Filter
+/// fields.
+#[test]
+fn extra_args_picker_value_field_opens_text_input_and_stores() {
+    use crate::app::{App, Focus, Mode, TextTarget};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
+    app.focus = Focus::Input(idx);
+    app.start_edit_extra_args();
+
+    let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let row = options.iter().position(|o| o.value.as_deref() == Some("itsoffset")).unwrap();
+    app.picker_move(row as isize);
+    app.picker_confirm();
+
+    let Mode::TextInput { target, buffer, .. } = &app.mode else { panic!("expected text input mode") };
+    assert!(matches!(target, TextTarget::ExtraArgValue { key, .. } if key == "itsoffset"));
+    assert_eq!(buffer, "");
+
+    for c in "1.5".chars() {
+        app.text_input_char(c);
+    }
+    app.confirm_text_input();
+
+    assert_eq!(app.graph.input(id).unwrap().extra_args.get("itsoffset"), Some(&"1.5".to_string()));
+}
+
+/// "custom key..." should prompt for the key name first, then chain into
+/// the value prompt for it -- same two-step flow as Metadata's custom key.
+#[test]
+fn extra_args_picker_custom_key_flow_prompts_for_key_then_value() {
+    use crate::app::{App, Focus, Mode, TextTarget};
+
+    let mut app = App::new();
+    app.focus = Focus::Output(0);
+    app.start_edit_extra_args();
+
+    let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let last = options.len() - 1;
+    app.picker_move(last as isize);
+    app.picker_confirm();
+
+    let Mode::TextInput { target, .. } = &app.mode else { panic!("expected text input mode") };
+    assert!(matches!(target, TextTarget::ExtraArgCustomKey(_)));
+
+    for c in "fflags".chars() {
+        app.text_input_char(c);
+    }
+    app.confirm_text_input();
+
+    let Mode::TextInput { target, buffer, .. } = &app.mode else { panic!("expected value prompt to open") };
+    assert!(matches!(target, TextTarget::ExtraArgValue { key, .. } if key == "fflags"));
+    assert_eq!(buffer, "");
+
+    for c in "+genpts".chars() {
+        app.text_input_char(c);
+    }
+    app.confirm_text_input();
+
+    assert_eq!(app.graph.outputs[0].extra_args.get("fflags"), Some(&"+genpts".to_string()));
+}
+
 // ---------------------------------------------------------------------
 // UI rendering
 // ---------------------------------------------------------------------
+
+/// A set extra_args should show up as a title tag on both input and output
+/// nodes -- the only visible indicator that one of these is configured,
+/// since (unlike Metadata/Filter nodes) input/output boxes have no
+/// dedicated upper section to list it in.
+#[test]
+fn ui_renders_extra_args_in_upper_section_not_the_title() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = crate::app::App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    app.graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "1.0")]);
+    app.graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000")]);
+    app.graph.outputs[0].width = 60; // wide enough that the line isn't truncated, same box-width truncation as long paths already get elsewhere
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(screen.contains("-itsoffset 1.0"), "expected the input's extra_args in its upper section:\n{screen}");
+    assert!(
+        screen.contains("-max_interleave_delta 5000000"),
+        "expected the output's extra_args in its upper section:\n{screen}"
+    );
+    // Titles should be back to their plain, un-tagged form -- the whole
+    // point of moving this into the body.
+    assert!(screen.contains("[0] in.mp4 "), "expected an untagged input title:\n{screen}");
+    assert!(screen.contains("OUTPUT 1: output.mkv "), "expected an untagged output title:\n{screen}");
+}
+
+/// Regression test for the row-offset math that places wire endpoints on
+/// input/output nodes: an input's extra-args section pushes its stream
+/// rows down, and an output's pushes its mapped-connection rows down, so
+/// wires must attach below those sections rather than at a row hardcoded
+/// to right-after-the-title.
+#[test]
+fn input_and_output_wires_attach_below_their_extra_args_section() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams());
+    app.graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "1.0"), ("stream_loop", "2")]);
+    app.graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000")]);
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let src_line = screen.lines().find(|l| l.contains("○ v:0 h264")).expect("stream row present");
+    assert!(
+        src_line.contains("─│"),
+        "wire from the input should leave from the stream row itself, not drift onto another row:\n{src_line}"
+    );
+
+    let dst_line = screen.lines().find(|l| l.contains("v:0 h264") && l.contains("<-")).expect("mapped row present");
+    assert!(
+        dst_line.contains("│─"),
+        "wire into the output should land on the mapped row itself, not drift onto another row:\n{dst_line}"
+    );
+}
 
 /// A modifier node should render its incoming source summary and its
 /// outgoing connection(s), and a wire leaving a non-Copy Convert node
@@ -1846,6 +2120,47 @@ fn filter_chain_of_two_modifiers_applies_both_in_order_end_to_end() {
     // own "iw"/"ih" default on the unscaled 160x120 source): still wrong.
     // 50x50 is reachable only if both stages actually ran in order.
     assert!(text.contains("width=50|height=50"), "expected both scale and crop to apply in order:\n{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// End-to-end check of the extra-args escape hatch, using a real, easily
+/// verified flag: global (format-level) `-metadata`, which is distinct from
+/// the per-stream `-metadata:s:<i>` the Metadata modifier node already
+/// covers -- this is actually the one thing the escape hatch can reach that
+/// nothing else in the graph model can. Not exercising the option that
+/// prompted this feature (`-max_interleave_delta`) directly, since its
+/// effect is internal muxer buffering behavior with no observable output to
+/// assert on; that one's covered by a plain arg-construction test instead.
+#[test]
+fn output_extra_args_apply_a_real_global_metadata_flag_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-extra-args-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    graph.outputs[0].extra_args = filter_fields(&[("metadata", "comment=hello_from_tff")]);
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-show_entries", "format_tags=comment",
+            "-of", "default=noprint_wrappers=1", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        text.to_lowercase().contains("comment=hello_from_tff"),
+        "expected the global (format-level) comment tag, not a per-stream one:\n{text}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

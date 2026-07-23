@@ -163,6 +163,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('d') => app.disconnect_focused(),
             KeyCode::Char('e') => app.activate_modifier(),
             KeyCode::Char('f') => app.open_container_picker(),
+            KeyCode::Char('g') => app.start_edit_extra_args(),
             KeyCode::Char('x') => app.delete_focused_node(),
             KeyCode::Char('r') => app.start_render(),
             KeyCode::Char('p') => app.start_preview(),

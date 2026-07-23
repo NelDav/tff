@@ -108,6 +108,14 @@ pub struct InputNode {
     /// Position of this input in the `ffmpeg -i` argument list (0-based).
     pub file_index: usize,
     pub streams: Vec<StreamInfo>,
+    /// Advanced escape hatch for global *input* options not otherwise
+    /// covered by the node graph (e.g. `itsoffset -> "2.5"`). Each entry is
+    /// emitted as `-<key>` immediately before this input's own `-i <path>`,
+    /// followed by the value as a separate token if it's non-empty -- an
+    /// empty value represents a valueless switch flag (e.g. `-re`, which
+    /// takes no operand at all), not "unset"; "unset" is the key being
+    /// absent from the map entirely. See `input_extra_arg_keys`.
+    pub extra_args: BTreeMap<String, String>,
     pub pos: (f64, f64),
     pub width: u16,
 }
@@ -119,8 +127,41 @@ pub struct OutputNode {
     /// as `-f <name>`. `None` means "infer from the output path's
     /// extension", ffmpeg's own default behavior.
     pub container: Option<String>,
+    /// Advanced escape hatch for global *output* options not otherwise
+    /// covered by the node graph (e.g. `max_interleave_delta -> "5000000"`).
+    /// Same emission shape as `InputNode::extra_args` -- `-<key>` plus an
+    /// optional value token -- appended after everything else this output's
+    /// section builds, just before the output path. See
+    /// `output_extra_arg_keys`.
+    pub extra_args: BTreeMap<String, String>,
     pub pos: (f64, f64),
     pub width: u16,
+}
+
+/// Curated global *input* options offered by the extra-args picker ('g' on
+/// an input node), verified via `ffmpeg -h full`: a shift for sync issues
+/// (`itsoffset`), looping (`stream_loop`), and reading at native rate
+/// (`re`, useful for simulating a live source). The `bool` marks a
+/// valueless switch flag (no ffmpeg operand) that's toggled on pick rather
+/// than prompting for a value, same idea as `disposition_flags`' checkboxes.
+/// A "custom key..." escape hatch in the picker covers anything else.
+pub fn input_extra_arg_keys() -> &'static [(&'static str, bool)] {
+    &[("itsoffset", false), ("stream_loop", false), ("re", true)]
+}
+
+/// Curated global *output* options, same shape as `input_extra_arg_keys`.
+/// `max_interleave_delta` is the option that prompted this feature;
+/// `movflags`/`avoid_negative_ts`/`fflags` are common muxing-correctness
+/// knobs; `shortest` (stop encoding once the shortest mapped stream ends)
+/// is the curated valueless switch.
+pub fn output_extra_arg_keys() -> &'static [(&'static str, bool)] {
+    &[
+        ("max_interleave_delta", false),
+        ("movflags", false),
+        ("avoid_negative_ts", false),
+        ("fflags", false),
+        ("shortest", true),
+    ]
 }
 
 /// The stream-metadata keys offered by the metadata picker for a given
@@ -391,6 +432,19 @@ pub struct Resolved {
     pub filters: Vec<(FilterName, BTreeMap<String, String>)>,
 }
 
+/// Flattens an extra_args map into ffmpeg CLI tokens: `-<key>`, plus the
+/// value as its own token when non-empty (see `InputNode::extra_args`'s doc
+/// comment for why an empty value isn't just skipped).
+fn extra_arg_tokens(args: &BTreeMap<String, String>) -> impl Iterator<Item = String> + '_ {
+    args.iter().flat_map(|(key, value)| {
+        let mut tokens = vec![format!("-{key}")];
+        if !value.is_empty() {
+            tokens.push(value.clone());
+        }
+        tokens
+    })
+}
+
 pub struct Graph {
     pub inputs: Vec<InputNode>,
     pub modifiers: Vec<ModifierNode>,
@@ -422,6 +476,7 @@ impl Graph {
             path,
             file_index,
             streams,
+            extra_args: BTreeMap::new(),
             pos: (2.0, y),
             width: 34,
         });
@@ -438,6 +493,7 @@ impl Graph {
             id,
             path,
             container: None,
+            extra_args: BTreeMap::new(),
             pos: (74.0, y),
             width: 30,
         });
@@ -480,6 +536,14 @@ impl Graph {
 
     pub fn input(&self, id: NodeId) -> Option<&InputNode> {
         self.inputs.iter().find(|n| n.id == id)
+    }
+
+    pub fn input_mut(&mut self, id: NodeId) -> Option<&mut InputNode> {
+        self.inputs.iter_mut().find(|n| n.id == id)
+    }
+
+    pub fn output(&self, id: NodeId) -> Option<&OutputNode> {
+        self.outputs.iter().find(|n| n.id == id)
     }
 
     pub fn output_mut(&mut self, id: NodeId) -> Option<&mut OutputNode> {
@@ -698,6 +762,7 @@ impl Graph {
             args.push("-f".to_string());
             args.push(container.clone());
         }
+        args.extend(extra_arg_tokens(&output.extra_args));
         args.extend_from_slice(extra_args);
         args.push(path_override.unwrap_or(&output.path).to_string());
         Some(args)
@@ -713,6 +778,7 @@ impl Graph {
     pub fn build_ffmpeg_args(&self) -> Vec<String> {
         let mut args = vec!["-y".to_string()];
         for input in &self.inputs {
+            args.extend(extra_arg_tokens(&input.extra_args));
             args.push("-i".to_string());
             args.push(input.path.clone());
         }
@@ -745,6 +811,7 @@ impl Graph {
         let output = self.outputs.iter().find(|o| o.id == output_id)?;
         let mut args = vec!["-y".to_string()];
         for input in &self.inputs {
+            args.extend(extra_arg_tokens(&input.extra_args));
             args.push("-i".to_string());
             args.push(input.path.clone());
         }

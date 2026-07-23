@@ -46,6 +46,26 @@ pub enum TextTarget {
         modifier: NodeId,
         key: String,
     },
+    /// Typing the value for a specific extra-ffmpeg-arg key (curated or
+    /// custom) on an input or output node.
+    ExtraArgValue {
+        target: ExtraArgsTarget,
+        key: String,
+    },
+    /// Step one of extra-args' "custom key...": typing the key name itself,
+    /// before the value prompt for it opens.
+    ExtraArgCustomKey(ExtraArgsTarget),
+}
+
+/// Which node's `extra_args` map a picker/text-input session is editing --
+/// input and output nodes share the exact same editing flow (curated-keys
+/// picker with a custom-key escape hatch, see `graph::input_extra_arg_keys`
+/// / `output_extra_arg_keys`), so this lets one set of picker/text-input
+/// plumbing serve both instead of duplicating it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExtraArgsTarget {
+    Input(NodeId),
+    Output(NodeId),
 }
 
 pub enum PickerKind {
@@ -79,6 +99,14 @@ pub enum PickerKind {
     FilterFieldValue {
         modifier: NodeId,
         key: String,
+    },
+    /// Choosing which extra ffmpeg arg to edit on an input or output node.
+    /// Like `DispositionFlags`, a curated valueless key (e.g. `shortest`,
+    /// `re`) toggles in place and leaves the picker open instead of
+    /// closing it; a value-taking key (curated or custom) opens
+    /// `ExtraArgValue`'s text input instead, same as `FilterField`.
+    ExtraArgField {
+        target: ExtraArgsTarget,
     },
 }
 
@@ -360,6 +388,39 @@ impl App {
         };
     }
 
+    /// 'g': edit the focused input's or output's raw extra ffmpeg args --
+    /// the advanced escape hatch for options the node graph doesn't model
+    /// (e.g. `-itsoffset 2.5` on an input, `-max_interleave_delta 5000000`
+    /// on an output). No-op on a modifier or with nothing focused, same as
+    /// 'o'/'f' refusing outside their own node kind.
+    pub fn start_edit_extra_args(&mut self) {
+        let target = match self.focus {
+            Focus::Input(i) => {
+                let Some(input) = self.graph.inputs.get(i) else { return };
+                ExtraArgsTarget::Input(input.id)
+            }
+            Focus::Output(i) => {
+                let Some(output) = self.graph.outputs.get(i) else { return };
+                ExtraArgsTarget::Output(output.id)
+            }
+            Focus::Modifier(_) => {
+                self.log.push(
+                    "focus an input or output node first, then 'g' edits its extra ffmpeg args"
+                        .to_string(),
+                );
+                return;
+            }
+        };
+        self.mode = Mode::Picker {
+            kind: PickerKind::ExtraArgField { target },
+            title: "extra ffmpeg args: choose flag".to_string(),
+            options: extra_args_picker_options(&self.graph, target),
+            selected: 0,
+            query: String::new(),
+            searching: false,
+        };
+    }
+
     /// The stream kind flowing into a modifier, if it's connected --
     /// traced back through however many other modifiers sit upstream.
     fn modifier_input_kind(&self, modifier_id: NodeId) -> Option<StreamKind> {
@@ -564,6 +625,32 @@ impl App {
                         self.log.push(format!("{key} set to {value}"));
                     }
                 }
+            }
+            TextTarget::ExtraArgValue { target, key } => {
+                let value = buffer.trim().to_string();
+                if let Some(fields) = extra_args_of_mut(&mut self.graph, target) {
+                    if value.is_empty() {
+                        fields.remove(&key);
+                        self.log.push(format!("{key} cleared"));
+                    } else {
+                        fields.insert(key.clone(), value.clone());
+                        self.log.push(format!("{key} set to {value}"));
+                    }
+                }
+            }
+            TextTarget::ExtraArgCustomKey(target) => {
+                let key = buffer.trim().to_string();
+                if key.is_empty() {
+                    return;
+                }
+                let current =
+                    extra_args_of(&self.graph, target).and_then(|f| f.get(&key).cloned()).unwrap_or_default();
+                self.mode = Mode::TextInput {
+                    target: TextTarget::ExtraArgValue { target, key },
+                    buffer: current,
+                    suggestions: Vec::new(),
+                    selected: 0,
+                };
             }
         }
     }
@@ -933,6 +1020,38 @@ impl App {
             return;
         }
 
+        // A curated valueless extra-arg key (e.g. "shortest", "re") toggles
+        // in place, same idea as a disposition flag -- everything else
+        // (a value-taking curated key, an already-set custom key, or
+        // "custom key..." itself) falls through to the normal match below,
+        // which opens a value text input instead.
+        if let PickerKind::ExtraArgField { target } = kind {
+            let selected_key = real_idx.and_then(|i| options.get(i)).and_then(|e| e.value.clone());
+            let is_boolean = selected_key
+                .as_deref()
+                .is_some_and(|k| curated_extra_arg_keys(target).iter().any(|&(ck, b)| ck == k && b));
+            if is_boolean {
+                let key = selected_key.unwrap();
+                if let Some(fields) = extra_args_of_mut(&mut self.graph, target) {
+                    if fields.remove(&key).is_some() {
+                        self.log.push(format!("{key} disabled"));
+                    } else {
+                        fields.insert(key.clone(), String::new());
+                        self.log.push(format!("{key} enabled"));
+                    }
+                }
+                self.mode = Mode::Picker {
+                    kind: PickerKind::ExtraArgField { target },
+                    title,
+                    options: extra_args_picker_options(&self.graph, target),
+                    selected,
+                    query,
+                    searching,
+                };
+                return;
+            }
+        }
+
         let Some(entry) = real_idx.and_then(|i| options.into_iter().nth(i)) else {
             return;
         };
@@ -1078,6 +1197,29 @@ impl App {
                             fields.remove(&key);
                             self.log.push(format!("{key} cleared"));
                         }
+                    }
+                }
+            }
+            PickerKind::ExtraArgField { target } => {
+                let current =
+                    entry.value.as_ref().and_then(|key| extra_args_of(&self.graph, target).and_then(|f| f.get(key).cloned()));
+                match entry.value {
+                    Some(key) => {
+                        self.mode = Mode::TextInput {
+                            target: TextTarget::ExtraArgValue { target, key },
+                            buffer: current.unwrap_or_default(),
+                            suggestions: Vec::new(),
+                            selected: 0,
+                        };
+                    }
+                    None => {
+                        // "custom key..." -- first ask for the key name itself.
+                        self.mode = Mode::TextInput {
+                            target: TextTarget::ExtraArgCustomKey(target),
+                            buffer: String::new(),
+                            suggestions: Vec::new(),
+                            selected: 0,
+                        };
                     }
                 }
             }
@@ -1406,4 +1548,59 @@ fn disposition_picker_options(flags: &BTreeSet<String>) -> Vec<PickerEntry> {
             }
         })
         .collect()
+}
+
+fn curated_extra_arg_keys(target: ExtraArgsTarget) -> &'static [(&'static str, bool)] {
+    match target {
+        ExtraArgsTarget::Input(_) => crate::graph::input_extra_arg_keys(),
+        ExtraArgsTarget::Output(_) => crate::graph::output_extra_arg_keys(),
+    }
+}
+
+fn extra_args_of(graph: &Graph, target: ExtraArgsTarget) -> Option<&BTreeMap<String, String>> {
+    match target {
+        ExtraArgsTarget::Input(id) => graph.input(id).map(|n| &n.extra_args),
+        ExtraArgsTarget::Output(id) => graph.output(id).map(|n| &n.extra_args),
+    }
+}
+
+fn extra_args_of_mut(graph: &mut Graph, target: ExtraArgsTarget) -> Option<&mut BTreeMap<String, String>> {
+    match target {
+        ExtraArgsTarget::Input(id) => graph.input_mut(id).map(|n| &mut n.extra_args),
+        ExtraArgsTarget::Output(id) => graph.output_mut(id).map(|n| &mut n.extra_args),
+    }
+}
+
+/// The extra-args picker's option list: one entry per curated key --
+/// a `[x]`/`[ ]` checkbox for a valueless switch flag (toggled in place),
+/// or "key: value"/"key: (not set)" for one that takes an operand -- plus
+/// any already-set custom key outside the curated list and the "custom
+/// key..." escape hatch itself, mirroring `field_picker_options`.
+fn extra_args_picker_options(graph: &Graph, target: ExtraArgsTarget) -> Vec<PickerEntry> {
+    let empty = BTreeMap::new();
+    let fields = extra_args_of(graph, target).unwrap_or(&empty);
+    let curated = curated_extra_arg_keys(target);
+
+    let mut options: Vec<PickerEntry> = curated
+        .iter()
+        .map(|&(key, is_boolean)| {
+            let display = if is_boolean {
+                let mark = if fields.contains_key(key) { "x" } else { " " };
+                format!("[{mark}] {key}")
+            } else {
+                match fields.get(key) {
+                    Some(v) => format!("{key}: {v}"),
+                    None => format!("{key}: (not set)"),
+                }
+            };
+            PickerEntry { display, value: Some(key.to_string()) }
+        })
+        .collect();
+    for (k, v) in fields {
+        if !curated.iter().any(|&(ck, _)| ck == k) {
+            options.push(PickerEntry { display: format!("{k}: {v}"), value: Some(k.clone()) });
+        }
+    }
+    options.push(PickerEntry { display: "custom key…".to_string(), value: None });
+    options
 }
