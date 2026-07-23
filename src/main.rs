@@ -5,9 +5,12 @@ mod graph;
 mod tests;
 mod ui;
 
+use std::io::stdout;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::execute;
 
 use app::{App, Mode};
 
@@ -23,6 +26,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
 
     loop {
         app.poll_ffmpeg();
+        if let Some(path) = app.preview_ready.take() {
+            play_preview(terminal, &mut app, &path);
+        }
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))?
@@ -38,6 +44,73 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Plays a finished preview render. `ffplay` opens its own window and is
+/// left running detached, so the TUI keeps going undisturbed underneath
+/// it; with no display to open one on (a bare SSH session with no X
+/// forwarding, the common case this whole app exists for), there's nowhere
+/// for ffplay to draw, so this falls back to mpv's terminal video output
+/// (`--vo=tct`) directly in this terminal instead -- which means yielding
+/// the TUI's alternate screen for the duration (mpv draws straight to this
+/// process's own stdout) and forcing a full repaint once it's done.
+fn play_preview(terminal: &mut ratatui::DefaultTerminal, app: &mut App, path: &str) {
+    if ffmpeg::has_display() {
+        app.log.push(format!("$ ffplay {path}"));
+        if let Err(e) = ffmpeg::play(path) {
+            app.status = format!("couldn't launch ffplay: {e:#}");
+            app.log.push(app.status.clone());
+        }
+        return;
+    }
+
+    app.log.push(format!("no display available -- playing in the terminal via mpv: {path}"));
+    if let Err(e) = suspend_tui() {
+        app.status = format!("couldn't suspend the TUI to play the preview: {e}");
+        app.log.push(app.status.clone());
+        return;
+    }
+    let result = ffmpeg::play_in_terminal(path);
+    if let Err(e) = resume_tui(terminal) {
+        // The TUI's own terminal state may now be inconsistent, but this is
+        // already reported to stderr by the resume attempt itself; nothing
+        // more productive to do than keep going with whatever draws next.
+        app.log.push(format!("couldn't restore the TUI after mpv: {e}"));
+    }
+    if let Err(e) = result {
+        app.status = format!("couldn't play preview via mpv: {e:#}");
+        app.log.push(app.status.clone());
+    }
+}
+
+/// Leaves the TUI's alternate screen and disables raw mode so an external
+/// terminal-drawing process (mpv, via `--vo=tct`) can take over this
+/// process's stdout, the same way a shell suspends its own terminal
+/// handling for `$EDITOR`.
+fn suspend_tui() -> std::io::Result<()> {
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// Reverses `suspend_tui` and forces a full repaint on the next `draw`,
+/// since whatever mpv left on the primary screen buffer has no relation
+/// to ratatui's last-known buffer state.
+///
+/// Deliberately uses `resize` rather than `Terminal::clear`: `clear`
+/// queries the backend's cursor position first (to restore it afterward),
+/// which sends a DSR escape sequence and blocks waiting for the terminal's
+/// reply -- verified to time out under some pty conditions (a genuine "The
+/// cursor position could not be read within a normal duration" error),
+/// which would abort the clear entirely, leaving stale content on screen.
+/// `resize` forces the same full-repaint side effect for a fullscreen
+/// viewport (the only kind `ratatui::init()`'s `DefaultTerminal` uses)
+/// without touching cursor position at all.
+fn resume_tui(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen)?;
+    let area = terminal.size()?.into();
+    terminal.resize(area)
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {

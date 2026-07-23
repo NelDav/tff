@@ -1110,6 +1110,45 @@ fn start_preview_refuses_while_a_job_is_already_running() {
     assert!(app.log.last().unwrap().contains("already running"));
 }
 
+/// A successful preview render should hand the finished path off via
+/// `preview_ready` rather than playing it directly -- App has no terminal
+/// to play it on (only main.rs does), so `poll_ffmpeg` must not call
+/// `ffmpeg::play`/`play_in_terminal` itself, only stage the path for
+/// main.rs to pick up.
+#[test]
+fn poll_ffmpeg_hands_off_a_finished_preview_via_preview_ready() {
+    use crate::app::{App, Focus};
+
+    let dir = std::env::temp_dir().join(format!("tff-test-preview-handoff-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let id = app.graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    app.focus = Focus::Output(0);
+
+    app.start_preview();
+    assert!(app.running);
+    assert!(app.preview_ready.is_none());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.running && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.poll_ffmpeg();
+    }
+
+    assert!(!app.running, "preview render did not finish in time");
+    assert_eq!(app.status, "preview ready");
+    let path = app.preview_ready.take().expect("preview_ready should hold the finished file's path");
+    assert!(std::path::Path::new(&path).exists(), "the path handed off should actually exist: {path}");
+
+    let _ = std::fs::remove_file(&path); // lands in the global temp dir, not `dir`
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------
 // UI rendering
 // ---------------------------------------------------------------------
@@ -1953,6 +1992,25 @@ fn preview_args_cap_duration_and_write_to_the_given_path() {
     assert_eq!(tags[0].lang.as_deref(), Some("eng"), "modifier chain's metadata should still apply to the preview");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Grounded against this dev environment, which is known to have a real
+/// display available (both DISPLAY and WAYLAND_DISPLAY are set) --
+/// confirms has_display isn't, say, checking a typo'd env var name and
+/// always reporting false regardless of the real environment.
+#[test]
+fn has_display_detects_the_real_dev_environment() {
+    assert!(ffmpeg::has_display(), "expected a display to be detected in this dev environment");
+}
+
+/// mpv exiting non-zero -- whether because it's not installed, its own
+/// install is broken, or simply because /dev/null isn't a real media file
+/// -- should surface as an Err from play_in_terminal, not silently report
+/// success. Deliberately doesn't depend on mpv actually working here, so
+/// this stays valid however this machine's local mpv install fares.
+#[test]
+fn play_in_terminal_surfaces_a_failing_mpv_as_an_error() {
+    assert!(ffmpeg::play_in_terminal("/dev/null").is_err(), "expected an error from a bogus media path");
 }
 
 /// Sanity-checks the -encoders/-muxers parsers against whatever real ffmpeg

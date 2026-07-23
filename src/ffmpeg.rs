@@ -168,6 +168,36 @@ pub fn play(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a graphical display is available for `ffplay` to open a window
+/// on -- checked via the same env vars X11 and Wayland clients both rely
+/// on. `false` in a bare SSH session with no X forwarding, which is when
+/// `play_in_terminal` (mpv's terminal video output) is used instead.
+pub fn has_display() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// Play a rendered preview file directly in the terminal via `mpv`'s
+/// truecolor terminal video output (`--vo=tct`, Unicode half-block
+/// characters + ANSI truecolor -- no X11/Wayland involved) -- the fallback
+/// for when `play` has no display to open an ffplay window on. Unlike
+/// `play`, this blocks until playback finishes: mpv draws straight to this
+/// process's own stdout, so there's no separate window to leave running
+/// detached, and the caller is responsible for having already yielded the
+/// TUI's terminal (raw mode / alternate screen) before calling this and
+/// restoring it again afterward. No explicit "exit when done" flag needed,
+/// unlike `play`'s `-autoexit`/tplay's `--auto-exit`: exiting once playback
+/// finishes is mpv's own default CLI behavior.
+pub fn play_in_terminal(path: &str) -> Result<()> {
+    let status = Command::new("mpv")
+        .args(["--vo=tct", path])
+        .status()
+        .context("failed to run mpv (is it installed and on PATH?)")?;
+    if !status.success() {
+        bail!("mpv exited with an error");
+    }
+    Ok(())
+}
+
 /// Spawn ffmpeg with the given arguments, streaming stdout+stderr lines
 /// through `tx` as they arrive, and a final "__DONE__<code>" sentinel line.
 /// Intended to run on its own thread; owns everything it needs ('static).

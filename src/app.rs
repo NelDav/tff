@@ -149,9 +149,15 @@ pub struct App {
     pub running: bool,
     rx: Option<Receiver<String>>,
     /// Set while the in-flight ffmpeg job (tracked via `rx`/`running`) is a
-    /// preview render rather than a real one -- the temp file path to hand
-    /// to `ffplay` once it finishes successfully.
+    /// preview render rather than a real one -- the temp file path it's
+    /// rendering to, so `poll_ffmpeg` knows what finished.
     preview_target: Option<String>,
+    /// Set once a preview render finishes successfully -- App has no
+    /// terminal to play it on (only main.rs does, and only main.rs can
+    /// yield the TUI's alternate screen for mpv's fallback rendering), so
+    /// this just hands off the finished path; main.rs takes it and decides
+    /// how to actually show it.
+    pub preview_ready: Option<String>,
     pub should_quit: bool,
     /// The real encoders/muxers this machine's ffmpeg build supports,
     /// queried once at startup. Empty if the query failed, in which case
@@ -182,6 +188,7 @@ impl App {
             running: false,
             rx: None,
             preview_target: None,
+            preview_ready: None,
             should_quit: false,
             available_encoders,
             available_muxers,
@@ -1217,11 +1224,7 @@ impl App {
             if let Some(path) = self.preview_target.take() {
                 if code == "0" {
                     self.status = "preview ready".to_string();
-                    self.log.push(format!("$ ffplay {path}"));
-                    if let Err(e) = ffmpeg::play(&path) {
-                        self.status = format!("couldn't launch ffplay: {e:#}");
-                        self.log.push(self.status.clone());
-                    }
+                    self.preview_ready = Some(path);
                 } else {
                     self.status = format!("preview render failed (exit code {code})");
                     self.log.push(self.status.clone());
