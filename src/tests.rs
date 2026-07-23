@@ -450,14 +450,14 @@ fn disconnect_is_bulk_on_input_and_precise_elsewhere() {
     assert!(app.graph.wires.is_empty());
 }
 
-/// 'm' should open a picker; confirming "convert" should add a Convert
+/// 'a' should open a picker; confirming "convert" should add a Convert
 /// modifier node (defaulting to Copy) and focus it.
 #[test]
 fn add_modifier_picker_confirm_convert_creates_and_focuses_node() {
     use crate::app::{App, Focus, Mode};
 
     let mut app = App::new();
-    app.open_add_modifier_picker();
+    app.open_add_node_picker();
     let idx = match &app.mode {
         Mode::Picker { options, .. } => {
             options.iter().position(|o| o.value.as_deref() == Some("convert")).unwrap()
@@ -480,7 +480,7 @@ fn add_modifier_picker_confirm_metadata_creates_node() {
     use crate::app::{App, Mode};
 
     let mut app = App::new();
-    app.open_add_modifier_picker();
+    app.open_add_node_picker();
     let idx = match &app.mode {
         Mode::Picker { options, .. } => {
             options.iter().position(|o| o.value.as_deref() == Some("metadata")).unwrap()
@@ -1193,29 +1193,31 @@ fn poll_ffmpeg_hands_off_a_finished_preview_via_preview_ready() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 'g' with a modifier focused should refuse -- the extra-args escape hatch
-/// only applies to input/output nodes, since a modifier's own settings are
-/// already reachable via 'e'.
+/// 'e' with a modifier focused should dispatch to the same thing
+/// `activate_modifier` does directly -- one key, "edit this node,"
+/// regardless of what kind of node is focused.
 #[test]
-fn start_edit_extra_args_refuses_on_modifier_focus() {
-    use crate::app::{App, Focus, Mode};
+fn activate_focused_on_modifier_dispatches_to_activate_modifier() {
+    use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
     app.focus = Focus::Modifier(modifier_idx);
 
-    app.start_edit_extra_args();
+    app.activate_focused();
 
-    assert!(matches!(app.mode, Mode::Normal));
-    assert!(app.log.last().unwrap().contains("focus an input or output node first"));
+    let Mode::Picker { kind, .. } = &app.mode else { panic!("expected picker mode") };
+    assert!(matches!(kind, PickerKind::Codec { .. }), "expected the codec picker, same as activate_modifier");
 }
 
-/// 'g' on a focused input should open a picker listing every curated input
+/// 'e' on a focused input should open a picker listing every curated input
 /// flag, with a checkbox for the valueless one (`re`) and "key: value" for
 /// the rest, reflecting whatever's already set.
 #[test]
-fn start_edit_extra_args_on_input_opens_field_picker_with_current_values() {
+fn activate_focused_on_input_opens_extra_args_field_picker_with_current_values() {
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
@@ -1224,7 +1226,7 @@ fn start_edit_extra_args_on_input_opens_field_picker_with_current_values() {
     let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
     app.focus = Focus::Input(idx);
 
-    app.start_edit_extra_args();
+    app.activate_focused();
 
     let Mode::Picker { kind, options, .. } = &app.mode else { panic!("expected picker mode") };
     assert!(matches!(kind, PickerKind::ExtraArgField { target } if matches!(target, crate::app::ExtraArgsTarget::Input(nid) if *nid == id)));
@@ -1235,10 +1237,10 @@ fn start_edit_extra_args_on_input_opens_field_picker_with_current_values() {
     assert_eq!(options.last().unwrap().display, "custom key…");
 }
 
-/// 'g' on a focused output should behave the same way (same underlying
+/// 'e' on a focused output should behave the same way (same underlying
 /// flow, different curated list and graph accessor).
 #[test]
-fn start_edit_extra_args_on_output_opens_field_picker_with_current_values() {
+fn activate_focused_on_output_opens_extra_args_field_picker_with_current_values() {
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
@@ -1246,7 +1248,7 @@ fn start_edit_extra_args_on_output_opens_field_picker_with_current_values() {
     app.focus = Focus::Output(0);
     let id = app.graph.outputs[0].id;
 
-    app.start_edit_extra_args();
+    app.activate_focused();
 
     let Mode::Picker { kind, options, .. } = &app.mode else { panic!("expected picker mode") };
     assert!(matches!(kind, PickerKind::ExtraArgField { target } if matches!(target, crate::app::ExtraArgsTarget::Output(nid) if *nid == id)));
@@ -1265,7 +1267,7 @@ fn extra_args_picker_toggles_valueless_flag_in_place() {
     let id = app.graph.add_input("in.mp4".to_string(), video_stream());
     let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
     app.focus = Focus::Input(idx);
-    app.start_edit_extra_args();
+    app.activate_focused();
 
     let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
     let re_row = options.iter().position(|o| o.display == "[ ] re").unwrap();
@@ -1294,7 +1296,7 @@ fn extra_args_picker_value_field_opens_text_input_and_stores() {
     let id = app.graph.add_input("in.mp4".to_string(), video_stream());
     let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
     app.focus = Focus::Input(idx);
-    app.start_edit_extra_args();
+    app.activate_focused();
 
     let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
     let row = options.iter().position(|o| o.value.as_deref() == Some("itsoffset")).unwrap();
@@ -1321,7 +1323,7 @@ fn extra_args_picker_custom_key_flow_prompts_for_key_then_value() {
 
     let mut app = App::new();
     app.focus = Focus::Output(0);
-    app.start_edit_extra_args();
+    app.activate_focused();
 
     let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
     let last = options.len() - 1;

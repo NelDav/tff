@@ -76,8 +76,12 @@ pub enum PickerKind {
     Container {
         output: NodeId,
     },
-    /// Choosing which kind of modifier node 'm' should create.
-    NewModifier,
+    /// Choosing which kind of node 'a' should add -- an input, an output,
+    /// or any modifier kind. Input/output aren't structurally special
+    /// enough to deserve their own dedicated add-keys the way they used to
+    /// (that was 'a' + 'O'); this is the same list a modifier picks from,
+    /// just with two more entries at the top.
+    NewNode,
     /// Choosing which metadata field to edit on a Metadata node.
     MetadataKey {
         modifier: NodeId,
@@ -114,7 +118,7 @@ pub struct PickerEntry {
     pub display: String,
     /// `None` is the "reset" choice: Copy for a codec picker, "infer from
     /// extension" for the container picker. `Some(name)` is an explicit
-    /// ffmpeg encoder/muxer name, or (for `NewModifier`) a kind tag.
+    /// ffmpeg encoder/muxer name, or (for `NewNode`) a kind tag.
     pub value: Option<String>,
 }
 
@@ -299,6 +303,8 @@ impl App {
         }
     }
 
+    /// Reached via the 'a' node picker's "input file..." entry -- prompts
+    /// for a path, and on confirm probes it and adds the input.
     pub fn start_add_input(&mut self) {
         let buffer = String::new();
         let suggestions = path_suggestions(&buffer);
@@ -310,16 +316,30 @@ impl App {
         };
     }
 
-    /// 'O': add a new output node and focus it.
+    /// Reached via the 'a' node picker's "output" entry -- adds a new
+    /// output node and focuses it immediately, no prompt needed (it starts
+    /// with a sensible default path, editable afterward with 'o').
     pub fn add_output_node(&mut self) {
         self.graph.add_output();
         self.set_focus_index(self.node_count() - 1);
         self.log.push("added output node".to_string());
     }
 
-    /// 'm': open a picker to choose which kind of modifier node to add.
-    pub fn open_add_modifier_picker(&mut self) {
+    /// 'a': open a picker to choose what to add to the graph -- an input
+    /// file, an output, or any modifier kind. Input/output aren't
+    /// structurally special enough to deserve their own dedicated keys (that
+    /// used to be 'a' + 'O', separate from 'm' for modifiers); this is one
+    /// list for "add a node," full stop.
+    pub fn open_add_node_picker(&mut self) {
         let options = vec![
+            PickerEntry {
+                display: "input file...".to_string(),
+                value: Some("input".to_string()),
+            },
+            PickerEntry {
+                display: "output".to_string(),
+                value: Some("output".to_string()),
+            },
             PickerEntry {
                 display: "convert (codec)".to_string(),
                 value: Some("convert".to_string()),
@@ -358,8 +378,8 @@ impl App {
             },
         ];
         self.mode = Mode::Picker {
-            kind: PickerKind::NewModifier,
-            title: "add modifier node".to_string(),
+            kind: PickerKind::NewNode,
+            title: "add node".to_string(),
             options,
             selected: 0,
             query: String::new(),
@@ -368,7 +388,10 @@ impl App {
     }
 
     /// 'o': edit the focused output's path. No-op unless an output is
-    /// focused -- there's nothing to edit on an input or modifier node.
+    /// focused -- deliberately doesn't extend to inputs: an input's path is
+    /// where its whole stream list came from, so "editing" it would mean
+    /// re-probing and potentially invalidating existing wires. Simpler and
+    /// less surprising to just add a new input node for a different file.
     pub fn start_edit_output(&mut self) {
         let Focus::Output(i) = self.focus else {
             self.log
@@ -388,29 +411,30 @@ impl App {
         };
     }
 
-    /// 'g': edit the focused input's or output's raw extra ffmpeg args --
-    /// the advanced escape hatch for options the node graph doesn't model
-    /// (e.g. `-itsoffset 2.5` on an input, `-max_interleave_delta 5000000`
-    /// on an output). No-op on a modifier or with nothing focused, same as
-    /// 'o'/'f' refusing outside their own node kind.
-    pub fn start_edit_extra_args(&mut self) {
-        let target = match self.focus {
+    /// 'e': edit the focused node's primary setting, whatever kind of node
+    /// it is -- a modifier's own fields (see `activate_modifier`), or an
+    /// input/output's extra ffmpeg args. One key for "edit this node"
+    /// regardless of kind, rather than 'e' for modifiers and a separate key
+    /// for everything else.
+    pub fn activate_focused(&mut self) {
+        match self.focus {
+            Focus::Modifier(_) => self.activate_modifier(),
             Focus::Input(i) => {
                 let Some(input) = self.graph.inputs.get(i) else { return };
-                ExtraArgsTarget::Input(input.id)
+                self.open_extra_args_picker(ExtraArgsTarget::Input(input.id));
             }
             Focus::Output(i) => {
                 let Some(output) = self.graph.outputs.get(i) else { return };
-                ExtraArgsTarget::Output(output.id)
+                self.open_extra_args_picker(ExtraArgsTarget::Output(output.id));
             }
-            Focus::Modifier(_) => {
-                self.log.push(
-                    "focus an input or output node first, then 'g' edits its extra ffmpeg args"
-                        .to_string(),
-                );
-                return;
-            }
-        };
+        }
+    }
+
+    /// Opens the extra-ffmpeg-args picker (the advanced escape hatch for
+    /// options the node graph doesn't model, e.g. `-itsoffset 2.5` on an
+    /// input, `-max_interleave_delta 5000000` on an output) for a given
+    /// input or output.
+    fn open_extra_args_picker(&mut self, target: ExtraArgsTarget) {
         self.mode = Mode::Picker {
             kind: PickerKind::ExtraArgField { target },
             title: "extra ffmpeg args: choose flag".to_string(),
@@ -1089,7 +1113,18 @@ impl App {
                     ),
                 }
             }
-            PickerKind::NewModifier => {
+            PickerKind::NewNode => {
+                match entry.value.as_deref() {
+                    Some("input") => {
+                        self.start_add_input();
+                        return;
+                    }
+                    Some("output") => {
+                        self.add_output_node();
+                        return;
+                    }
+                    _ => {}
+                }
                 let (kind, name) = match entry.value.as_deref() {
                     Some("metadata") => (
                         ModifierKind::Metadata {

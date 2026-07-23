@@ -31,7 +31,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect) {
     let line = TextLine::from(
-        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  a add-input  O add-output  m add-modifier  o output-path  c arm/connect  d disconnect  e edit  f container  g extra args  x delete-node  r render  p preview  q quit ",
+        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  a add-node  o output-path  c arm/connect  d disconnect  e edit  f container  x delete-node  r render  p preview  q quit ",
     )
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_widget(Paragraph::new(line), area);
