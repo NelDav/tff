@@ -5,11 +5,22 @@ use std::sync::mpsc::Sender;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::graph::{StreamInfo, StreamKind};
+use crate::graph::{Chapter, StreamInfo, StreamKind};
+
+/// What `probe` reports about a file: its real media streams (empty for a
+/// chapters-only FFMETADATA text file added as an input) and its chapters
+/// (empty for a file with none) -- see `probe`'s doc comment.
+pub struct ProbeResult {
+    pub streams: Vec<StreamInfo>,
+    pub chapters: Vec<Chapter>,
+}
 
 #[derive(Deserialize)]
 struct ProbeOutput {
+    #[serde(default)]
     streams: Vec<ProbeStream>,
+    #[serde(default)]
+    chapters: Vec<ProbeChapter>,
 }
 
 #[derive(Deserialize)]
@@ -26,12 +37,36 @@ struct ProbeTags {
     language: Option<String>,
 }
 
-/// Run ffprobe on a file and return the streams it reports.
-pub fn probe(path: &str) -> Result<Vec<StreamInfo>> {
+#[derive(Deserialize)]
+struct ProbeChapter {
+    start_time: String,
+    end_time: String,
+    #[serde(default)]
+    tags: Option<ProbeChapterTags>,
+}
+
+#[derive(Deserialize)]
+struct ProbeChapterTags {
+    title: Option<String>,
+}
+
+/// Run ffprobe on a file and return the streams and chapters it reports.
+///
+/// Verified against a real ffprobe build that this also works, unmodified,
+/// for a plain FFMETADATA text file (the same format `chapters_ffmetadata`
+/// writes): ffprobe autodetects it from content (no explicit `-f` needed),
+/// reports an empty `streams` array and a populated `chapters` one, exit
+/// code 0 -- so a chapters-only text file added as an input needs no
+/// special-case handling here at all, it's just a file whose `streams`
+/// happens to come back empty. A real chaptered media file reports both
+/// arrays populated, same shape. Only a genuinely unreadable/invalid file
+/// fails outright, which is when this still bails as before.
+pub fn probe(path: &str) -> Result<ProbeResult> {
     let output = Command::new("ffprobe")
         .args([
             "-v", "error",
             "-show_streams",
+            "-show_chapters",
             "-of", "json",
             path,
         ])
@@ -48,8 +83,8 @@ pub fn probe(path: &str) -> Result<Vec<StreamInfo>> {
     let parsed: ProbeOutput =
         serde_json::from_slice(&output.stdout).context("failed to parse ffprobe output")?;
 
-    if parsed.streams.is_empty() {
-        bail!("ffprobe found no streams in '{path}'");
+    if parsed.streams.is_empty() && parsed.chapters.is_empty() {
+        bail!("ffprobe found no streams or chapters in '{path}'");
     }
 
     let streams = parsed
@@ -68,7 +103,22 @@ pub fn probe(path: &str) -> Result<Vec<StreamInfo>> {
         })
         .collect();
 
-    Ok(streams)
+    // ffprobe already reports start_time/end_time as decimal seconds
+    // (converted from whatever the source's own TIMEBASE is), so there's no
+    // manual timebase math to do here, unlike this app's own FFMETADATA
+    // writer which has to construct that fraction itself.
+    let chapters = parsed
+        .chapters
+        .into_iter()
+        .filter_map(|c| {
+            let start_secs = c.start_time.trim().parse::<f64>().ok()?;
+            let end_secs = c.end_time.trim().parse::<f64>().ok()?;
+            let title = c.tags.and_then(|t| t.title).unwrap_or_default();
+            Some(Chapter::new(start_secs, end_secs, title))
+        })
+        .collect();
+
+    Ok(ProbeResult { streams, chapters })
 }
 
 /// Ask ffmpeg which encoders it was actually built with, so the codec picker

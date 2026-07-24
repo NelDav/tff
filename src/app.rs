@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::ffmpeg;
-use crate::graph::{Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, StreamKind, Target};
+use crate::graph::{Chapter, Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, StreamKind, Target};
 
 /// Common containers offered first in the picker, ahead of the rest of
 /// ffmpeg's discovered muxer list. Paired with the file extension to switch
@@ -55,6 +55,26 @@ pub enum TextTarget {
     /// Step one of extra-args' "custom key...": typing the key name itself,
     /// before the value prompt for it opens.
     ExtraArgCustomKey(ExtraArgsTarget),
+    /// Typing a chapter's start or end time (see `ChapterTimeField`), on a
+    /// `ChapterEdit` modifier node.
+    ChapterTime {
+        modifier: NodeId,
+        index: usize,
+        field: ChapterTimeField,
+    },
+    /// Typing a chapter's title, on a `ChapterEdit` modifier node.
+    ChapterTitle {
+        modifier: NodeId,
+        index: usize,
+    },
+}
+
+/// Which of a chapter's two time fields a `ChapterTime` text-input session
+/// is editing.
+#[derive(Clone, Copy)]
+pub enum ChapterTimeField {
+    Start,
+    End,
 }
 
 /// Which node's `extra_args` map a picker/text-input session is editing --
@@ -111,6 +131,17 @@ pub enum PickerKind {
     /// `ExtraArgValue`'s text input instead, same as `FilterField`.
     ExtraArgField {
         target: ExtraArgsTarget,
+    },
+    /// Choosing which chapter to edit on a `ChapterEdit` modifier, or to
+    /// add a new one / import from whatever's connected to its input.
+    /// Reached via 'e' on a focused `ChapterEdit` node.
+    ChapterList {
+        modifier: NodeId,
+    },
+    /// Editing one chapter's start/end/title, or deleting it.
+    ChapterField {
+        modifier: NodeId,
+        index: usize,
     },
 }
 
@@ -267,18 +298,21 @@ impl App {
 
     /// Up/Down while a node is focused: cycles the selected stream (input),
     /// selected outgoing connection (modifier), or selected incoming
-    /// connection (output).
+    /// connection (output) -- an output's row list includes one more row
+    /// than its mapped-stream count when its chapters slot is connected
+    /// (see `disconnect_focused`'s Output branch), same as an unconnected
+    /// chapters slot doesn't get a row at all in the UI.
     pub fn cycle_row(&mut self, forward: bool) {
         let len = match self.focus {
             Focus::Input(i) => self.graph.inputs.get(i).map_or(0, |n| n.streams.len()),
             Focus::Modifier(i) => self.graph.modifiers.get(i).map_or(0, |m| {
                 self.graph.outgoing(Endpoint::ModifierOut(m.id)).len()
             }),
-            Focus::Output(i) => self
-                .graph
-                .outputs
-                .get(i)
-                .map_or(0, |o| self.graph.incoming(Target::Output(o.id)).len()),
+            Focus::Output(i) => self.graph.outputs.get(i).map_or(0, |o| {
+                let mapped = self.graph.incoming(Target::Output(o.id)).len();
+                let has_chapters = !self.graph.incoming(Target::OutputChapters(o.id)).is_empty();
+                mapped + usize::from(has_chapters)
+            }),
         };
         if len == 0 {
             return;
@@ -351,6 +385,10 @@ impl App {
             PickerEntry {
                 display: "disposition (default / forced / ...)".to_string(),
                 value: Some("disposition".to_string()),
+            },
+            PickerEntry {
+                display: "chapters (add / edit / remove)".to_string(),
+                value: Some("chapters".to_string()),
             },
             PickerEntry {
                 display: "shift (audio/video sync delay)".to_string(),
@@ -445,6 +483,50 @@ impl App {
         };
     }
 
+    /// Opens the chapter list for a `ChapterEdit` modifier: one row per
+    /// existing chapter, plus "add chapter..." and, if something's wired
+    /// into this node's input, "import from connected input...".
+    fn open_chapter_list_picker(&mut self, modifier: NodeId) {
+        self.mode = Mode::Picker {
+            kind: PickerKind::ChapterList { modifier },
+            title: "chapters".to_string(),
+            options: chapter_list_picker_options(&self.graph, modifier),
+            selected: 0,
+            query: String::new(),
+            searching: false,
+        };
+    }
+
+    /// Opens the field editor (start/end/title/delete) for one chapter.
+    /// No-op if `index` is out of range (e.g. the chapter was just
+    /// deleted).
+    fn open_chapter_field_picker(&mut self, modifier: NodeId, index: usize) {
+        let Some(chapter) = chapter_edit_chapters(&self.graph, modifier).and_then(|cs| cs.get(index)) else {
+            return;
+        };
+        let options = vec![
+            PickerEntry {
+                display: format!("start: {}", crate::graph::format_time(chapter.start_secs)),
+                value: Some("start".to_string()),
+            },
+            PickerEntry {
+                display: format!("end: {}", crate::graph::format_time(chapter.end_secs)),
+                value: Some("end".to_string()),
+            },
+            PickerEntry { display: format!("title: {}", chapter.title), value: Some("title".to_string()) },
+            PickerEntry { display: "delete this chapter".to_string(), value: Some("delete".to_string()) },
+        ];
+        self.mode = Mode::Picker {
+            kind: PickerKind::ChapterField { modifier, index },
+            title: "edit chapter".to_string(),
+            options,
+            selected: 0,
+            query: String::new(),
+            searching: false,
+        };
+    }
+
+
     /// The stream kind flowing into a modifier, if it's connected --
     /// traced back through however many other modifiers sit upstream.
     fn modifier_input_kind(&self, modifier_id: NodeId) -> Option<StreamKind> {
@@ -453,9 +535,30 @@ impl App {
             .wires
             .iter()
             .find(|w| w.to == Target::ModifierIn(modifier_id))?;
-        let resolved = self.graph.resolve(incoming.from)?;
-        let input = self.graph.input(resolved.from_node)?;
-        input.streams.get(resolved.from_stream_idx).map(|s| s.kind)
+        self.endpoint_stream_kind(incoming.from)
+    }
+
+    /// The stream kind an endpoint ultimately carries -- a `ChapterEdit`
+    /// modifier's output is always `Chapter` (its own list is
+    /// authoritative regardless of what, if anything, feeds it; see
+    /// `graph::ModifierKind::ChapterEdit`), otherwise this traces back
+    /// through `resolve` to whatever real input stream is at the root.
+    /// Used to decide which of an output's two connection targets an armed
+    /// endpoint should land on (see `toggle_connect`'s `Focus::Output` arm).
+    fn endpoint_stream_kind(&self, ep: Endpoint) -> Option<StreamKind> {
+        match ep {
+            Endpoint::Stream { node, stream_idx } => {
+                self.graph.input(node)?.streams.get(stream_idx).map(|s| s.kind)
+            }
+            Endpoint::ModifierOut(mid) => match &self.graph.modifier(mid)?.kind {
+                ModifierKind::ChapterEdit { .. } => Some(StreamKind::Chapter),
+                _ => {
+                    let resolved = self.graph.resolve(ep)?;
+                    let input = self.graph.input(resolved.from_node)?;
+                    input.streams.get(resolved.from_stream_idx).map(|s| s.kind)
+                }
+            },
+        }
     }
 
     /// 'e': edit the focused modifier's primary setting -- opens the codec
@@ -560,6 +663,9 @@ impl App {
                     searching: false,
                 };
             }
+            ModifierKind::ChapterEdit { .. } => {
+                self.open_chapter_list_picker(mid);
+            }
         }
     }
 
@@ -580,9 +686,13 @@ impl App {
                     return;
                 }
                 match ffmpeg::probe(&path) {
-                    Ok(streams) => {
-                        let id = self.graph.add_input(path.clone(), streams);
+                    Ok(result) => {
+                        let chapter_count = result.chapters.len();
+                        let id = self.graph.add_input(path.clone(), result.streams, result.chapters);
                         self.log.push(format!("added input: {path}"));
+                        if chapter_count > 0 {
+                            self.log.push(format!("found {chapter_count} chapter(s) in {path}"));
+                        }
                         let idx = self.graph.inputs.len() - 1;
                         debug_assert_eq!(self.graph.inputs[idx].id, id);
                         self.set_focus_index(idx);
@@ -626,7 +736,8 @@ impl App {
                         ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
                         ModifierKind::Convert(_)
                         | ModifierKind::Disposition { .. }
-                        | ModifierKind::Filter { .. } => None,
+                        | ModifierKind::Filter { .. }
+                        | ModifierKind::ChapterEdit { .. } => None,
                     })
                     .unwrap_or_default();
                 self.mode = Mode::TextInput {
@@ -675,6 +786,39 @@ impl App {
                     suggestions: Vec::new(),
                     selected: 0,
                 };
+            }
+            TextTarget::ChapterTime { modifier, index, field } => {
+                match crate::graph::parse_time(&buffer) {
+                    Some(secs) => {
+                        if let Some(chapter) = chapter_edit_chapters_mut(&mut self.graph, modifier)
+                            .and_then(|cs| cs.get_mut(index))
+                        {
+                            match field {
+                                ChapterTimeField::Start => chapter.start_secs = secs,
+                                ChapterTimeField::End => chapter.end_secs = secs,
+                            }
+                        }
+                        self.log.push(format!("chapter time set to {}", crate::graph::format_time(secs)));
+                    }
+                    None => {
+                        self.log.push(format!(
+                            "couldn't parse '{}' as a time -- try seconds (12.5) or HH:MM:SS",
+                            buffer.trim()
+                        ));
+                    }
+                }
+                // Return to the field editor either way, so a mistyped
+                // time doesn't lose the user's place in the chapter.
+                self.open_chapter_field_picker(modifier, index);
+            }
+            TextTarget::ChapterTitle { modifier, index } => {
+                if let Some(chapter) =
+                    chapter_edit_chapters_mut(&mut self.graph, modifier).and_then(|cs| cs.get_mut(index))
+                {
+                    chapter.title = buffer.trim().to_string();
+                }
+                self.log.push("chapter title set".to_string());
+                self.open_chapter_field_picker(modifier, index);
             }
         }
     }
@@ -783,7 +927,9 @@ impl App {
                         self.armed = None; // disarm
                     }
                     Some(source) => {
-                        self.graph.connect(source, Target::ModifierIn(m.id));
+                        let mid = m.id;
+                        self.graph.connect(source, Target::ModifierIn(mid));
+                        sync_chapter_edit_import(&mut self.graph, mid);
                         self.armed = None;
                         self.log.push("connected".to_string());
                     }
@@ -802,7 +948,12 @@ impl App {
                 };
                 match self.armed.take() {
                     Some(source) => {
-                        self.graph.connect(source, Target::Output(output.id));
+                        let target = if self.endpoint_stream_kind(source) == Some(StreamKind::Chapter) {
+                            Target::OutputChapters(output.id)
+                        } else {
+                            Target::Output(output.id)
+                        };
+                        self.graph.connect(source, target);
                         self.log.push("connected to output".to_string());
                     }
                     None => {
@@ -833,11 +984,15 @@ impl App {
                     stream_idx: self.row_idx,
                 };
                 let label = stream.label();
+                let affected = chapter_edit_modifiers_fed_by(&self.graph, |w| w.from == ep);
                 let before = self.graph.wires.len();
                 self.graph.wires.retain(|w| w.from != ep);
                 if self.graph.wires.len() != before {
                     self.log
                         .push(format!("disconnected {label} from everything downstream"));
+                }
+                for mid in affected {
+                    sync_chapter_edit_import(&mut self.graph, mid);
                 }
             }
             Focus::Modifier(i) => {
@@ -857,17 +1012,24 @@ impl App {
                 }
             }
             Focus::Output(i) => {
-                let Some(output) = self.graph.outputs.get(i) else {
+                let Some(output_id) = self.graph.outputs.get(i).map(|o| o.id) else {
                     return;
                 };
-                let target = Target::Output(output.id);
-                let incoming = self.graph.incoming(target);
-                let Some(&wi) = incoming.get(self.row_idx) else {
+                let incoming = self.graph.incoming(Target::Output(output_id));
+                // The chapters slot is always one more row after the
+                // mapped-stream rows (see `cycle_row`'s Output arm).
+                if self.row_idx >= incoming.len() {
+                    let chapter_wires = self.graph.incoming(Target::OutputChapters(output_id));
+                    if let Some(&wi) = chapter_wires.first() {
+                        self.graph.remove_wire_at(wi);
+                        self.log.push("chapters disconnected".to_string());
+                    }
                     return;
-                };
+                }
+                let wi = incoming[self.row_idx];
                 self.graph.remove_wire_at(wi);
                 self.log.push("disconnected".to_string());
-                let new_len = self.graph.incoming(target).len();
+                let new_len = self.graph.incoming(Target::Output(output_id)).len();
                 if new_len > 0 && self.row_idx >= new_len {
                     self.row_idx = new_len - 1;
                 }
@@ -1138,6 +1300,7 @@ impl App {
                         },
                         "disposition",
                     ),
+                    Some("chapters") => (ModifierKind::ChapterEdit { chapters: Vec::new() }, "chapters"),
                     Some("shift") => (filter_modifier(FilterName::Shift), "shift"),
                     Some("volume") => (filter_modifier(FilterName::Volume), "volume"),
                     Some("scale") => (filter_modifier(FilterName::Scale), "scale"),
@@ -1159,7 +1322,8 @@ impl App {
                             ModifierKind::Metadata { fields } => fields.get(&key).cloned(),
                             ModifierKind::Convert(_)
                             | ModifierKind::Disposition { .. }
-                            | ModifierKind::Filter { .. } => None,
+                            | ModifierKind::Filter { .. }
+                            | ModifierKind::ChapterEdit { .. } => None,
                         })
                         .unwrap_or_default();
                     self.mode = Mode::TextInput {
@@ -1258,6 +1422,69 @@ impl App {
                     }
                 }
             }
+            PickerKind::ChapterList { modifier } => match entry.value.as_deref() {
+                Some("add") => {
+                    let index = chapter_edit_chapters(&self.graph, modifier).map_or(0, |cs| cs.len());
+                    let start = chapter_edit_chapters(&self.graph, modifier)
+                        .and_then(|cs| cs.last())
+                        .map_or(0.0, |c| c.end_secs);
+                    if let Some(chapters) = chapter_edit_chapters_mut(&mut self.graph, modifier) {
+                        chapters.push(Chapter::new(start, start, String::new()));
+                    }
+                    self.log.push("added chapter".to_string());
+                    self.open_chapter_field_picker(modifier, index);
+                }
+                Some(idx_str) => {
+                    if let Ok(index) = idx_str.parse::<usize>() {
+                        self.open_chapter_field_picker(modifier, index);
+                    }
+                }
+                None => {}
+            },
+            PickerKind::ChapterField { modifier, index } => match entry.value.as_deref() {
+                Some("start") | Some("end") => {
+                    let Some(chapter) = chapter_edit_chapters(&self.graph, modifier).and_then(|cs| cs.get(index))
+                    else {
+                        return;
+                    };
+                    let field = if entry.value.as_deref() == Some("start") {
+                        ChapterTimeField::Start
+                    } else {
+                        ChapterTimeField::End
+                    };
+                    let current = match field {
+                        ChapterTimeField::Start => chapter.start_secs,
+                        ChapterTimeField::End => chapter.end_secs,
+                    };
+                    self.mode = Mode::TextInput {
+                        target: TextTarget::ChapterTime { modifier, index, field },
+                        buffer: crate::graph::format_time(current),
+                        suggestions: Vec::new(),
+                        selected: 0,
+                    };
+                }
+                Some("title") => {
+                    let current = chapter_edit_chapters(&self.graph, modifier)
+                        .and_then(|cs| cs.get(index))
+                        .map(|c| c.title.clone());
+                    self.mode = Mode::TextInput {
+                        target: TextTarget::ChapterTitle { modifier, index },
+                        buffer: current.unwrap_or_default(),
+                        suggestions: Vec::new(),
+                        selected: 0,
+                    };
+                }
+                Some("delete") => {
+                    if let Some(chapters) = chapter_edit_chapters_mut(&mut self.graph, modifier)
+                        && index < chapters.len()
+                    {
+                        chapters.remove(index);
+                        self.log.push("chapter deleted".to_string());
+                    }
+                    self.open_chapter_list_picker(modifier);
+                }
+                _ => {}
+            },
         }
     }
 
@@ -1272,7 +1499,13 @@ impl App {
                 };
                 let id = node.id;
                 let path = node.path.clone();
+                let affected = chapter_edit_modifiers_fed_by(&self.graph, |w| {
+                    matches!(w.from, Endpoint::Stream { node, .. } if node == id)
+                });
                 self.graph.remove_input(id);
+                for mid in affected {
+                    sync_chapter_edit_import(&mut self.graph, mid);
+                }
                 self.armed = self
                     .armed
                     .filter(|e| !matches!(e, Endpoint::Stream { node, .. } if *node == id));
@@ -1312,6 +1545,38 @@ impl App {
         }
     }
 
+    /// Writes each `ChapterEdit` modifier's chapter list (if it has one)
+    /// out as a temp FFMETADATA file, keyed by that node's id, ready to
+    /// hand to `Graph::build_ffmpeg_args`/`build_preview_args` as an extra
+    /// input -- an output whose chapters trace straight back to a real
+    /// input file (no `ChapterEdit` node in the chain) needs no file at
+    /// all, since `-map_chapters` can just point at that input directly
+    /// (see `Graph::resolve_chapters`). `Graph` itself does no file I/O, so
+    /// this lives here rather than there. A write failure just skips that
+    /// node's chapters (logged) instead of blocking the whole render --
+    /// consistent with how a filtergraph error or similar isn't treated as
+    /// fatal until ffmpeg itself reports it.
+    fn write_chapter_files(&mut self) -> BTreeMap<NodeId, String> {
+        let mut files = BTreeMap::new();
+        for modifier in &self.graph.modifiers {
+            let ModifierKind::ChapterEdit { chapters } = &modifier.kind else { continue };
+            if chapters.is_empty() {
+                continue;
+            }
+            let path = std::env::temp_dir().join(format!("tff-chapters-{}.ffmeta", modifier.id));
+            let content = crate::graph::chapters_ffmetadata(chapters);
+            match std::fs::write(&path, content) {
+                Ok(()) => {
+                    files.insert(modifier.id, path.to_string_lossy().into_owned());
+                }
+                Err(e) => {
+                    self.log.push(format!("couldn't write chapter metadata: {e}"));
+                }
+            }
+        }
+        files
+    }
+
     pub fn start_render(&mut self) {
         if self.running {
             return;
@@ -1323,11 +1588,12 @@ impl App {
             );
             return;
         }
+        let chapter_files = self.write_chapter_files();
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
         self.rx = Some(rx);
         self.running = true;
         self.status = "running ffmpeg...".to_string();
-        let args = self.graph.build_ffmpeg_args();
+        let args = self.graph.build_ffmpeg_args(&chapter_files);
         self.log.push(format!("$ ffmpeg {}", args.join(" ")));
         thread::spawn(move || {
             ffmpeg::run_args(args, tx);
@@ -1363,9 +1629,10 @@ impl App {
             .to_string_lossy()
             .into_owned();
 
+        let chapter_files = self.write_chapter_files();
         let Some(args) = self
             .graph
-            .build_preview_args(output_id, &preview_path, PREVIEW_SECONDS)
+            .build_preview_args(output_id, &preview_path, PREVIEW_SECONDS, &chapter_files)
         else {
             self.log.push(
                 "nothing mapped to this output yet — arm a stream with 'c', then focus it and press 'c' again"
@@ -1616,26 +1883,119 @@ fn extra_args_picker_options(graph: &Graph, target: ExtraArgsTarget) -> Vec<Pick
     let fields = extra_args_of(graph, target).unwrap_or(&empty);
     let curated = curated_extra_arg_keys(target);
 
-    let mut options: Vec<PickerEntry> = curated
-        .iter()
-        .map(|&(key, is_boolean)| {
-            let display = if is_boolean {
-                let mark = if fields.contains_key(key) { "x" } else { " " };
-                format!("[{mark}] {key}")
-            } else {
-                match fields.get(key) {
-                    Some(v) => format!("{key}: {v}"),
-                    None => format!("{key}: (not set)"),
-                }
-            };
-            PickerEntry { display, value: Some(key.to_string()) }
-        })
-        .collect();
+    let mut options: Vec<PickerEntry> = curated.iter().map(|&(key, is_boolean)| {
+        let display = if is_boolean {
+            let mark = if fields.contains_key(key) { "x" } else { " " };
+            format!("[{mark}] {key}")
+        } else {
+            match fields.get(key) {
+                Some(v) => format!("{key}: {v}"),
+                None => format!("{key}: (not set)"),
+            }
+        };
+        PickerEntry { display, value: Some(key.to_string()) }
+    }).collect();
     for (k, v) in fields {
         if !curated.iter().any(|&(ck, _)| ck == k) {
             options.push(PickerEntry { display: format!("{k}: {v}"), value: Some(k.clone()) });
         }
     }
     options.push(PickerEntry { display: "custom key…".to_string(), value: None });
+    options
+}
+
+/// A `ChapterEdit` modifier's own chapter list, if `id` refers to one.
+fn chapter_edit_chapters(graph: &Graph, id: NodeId) -> Option<&Vec<Chapter>> {
+    match graph.modifier(id).map(|m| &m.kind) {
+        Some(ModifierKind::ChapterEdit { chapters }) => Some(chapters),
+        _ => None,
+    }
+}
+
+fn chapter_edit_chapters_mut(graph: &mut Graph, id: NodeId) -> Option<&mut Vec<Chapter>> {
+    match graph.modifier_mut(id).map(|m| &mut m.kind) {
+        Some(ModifierKind::ChapterEdit { chapters }) => Some(chapters),
+        _ => None,
+    }
+}
+
+/// The chapters connected to a `ChapterEdit` node's input, if its single
+/// incoming wire resolves to a chapter-kind source -- used by
+/// `sync_chapter_edit_import` to keep that node's auto-imported entries in
+/// sync with whatever's currently wired in.
+fn connected_input_chapters(graph: &Graph, modifier: NodeId) -> Option<Vec<Chapter>> {
+    let wire = graph.wires.iter().find(|w| w.to == Target::ModifierIn(modifier))?;
+    let Endpoint::Stream { node, stream_idx } = wire.from else { return None };
+    let input = graph.input(node)?;
+    (input.streams.get(stream_idx)?.kind == StreamKind::Chapter).then(|| input.chapters.clone())
+}
+
+/// Reconciles a `ChapterEdit` node's auto-imported entries against
+/// whatever's *currently* wired into its input: strips every entry
+/// previously tagged `imported` (see `graph::Chapter::imported`'s doc
+/// comment), then, if a chapter-kind source is connected, re-imports its
+/// current chapters fresh, merging them in alongside whatever manually
+/// added entries remain untouched.
+///
+/// Idempotent and safe to call any time this node's own incoming wire
+/// might have changed -- covers connecting a new source, reconnecting to a
+/// different one (a modifier's input only ever holds one wire, so this
+/// naturally replaces the old imported set with the new one), and
+/// disconnecting entirely (nothing to re-import, so the old set is simply
+/// removed). No-op if `id` isn't a `ChapterEdit` node. Deliberately *not*
+/// called on every graph mutation -- only from the handful of call sites
+/// that can actually change *this* node's own incoming wire -- since
+/// running it unconditionally would silently discard a user's edits to an
+/// already-imported chapter the next time anything else in the graph
+/// happened to change.
+fn sync_chapter_edit_import(graph: &mut Graph, id: NodeId) {
+    let Some(chapters) = chapter_edit_chapters_mut(graph, id) else { return };
+    chapters.retain(|c| !c.imported);
+    if let Some(imported) = connected_input_chapters(graph, id) {
+        let Some(chapters) = chapter_edit_chapters_mut(graph, id) else { return };
+        chapters.extend(imported.into_iter().map(|c| Chapter::imported(c.start_secs, c.end_secs, c.title)));
+    }
+}
+
+/// The `ChapterEdit` modifier ids fed by any wire matching `predicate`,
+/// collected *before* a bulk wire removal so the affected nodes' imported
+/// chapters can be resynced afterward via `sync_chapter_edit_import` --
+/// removing the wire first would make it impossible to tell which nodes
+/// were affected.
+fn chapter_edit_modifiers_fed_by(graph: &Graph, predicate: impl Fn(&crate::graph::Wire) -> bool) -> Vec<NodeId> {
+    graph
+        .wires
+        .iter()
+        .filter(|w| predicate(w))
+        .filter_map(|w| match w.to {
+            Target::ModifierIn(mid) if matches!(graph.modifier(mid).map(|m| &m.kind), Some(ModifierKind::ChapterEdit { .. })) => {
+                Some(mid)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The chapter-list picker's option list: one row per existing chapter
+/// (tagged with its index, as a string, so `picker_confirm` can parse it
+/// back out) formatted as "start–end  title", plus "add chapter..." and,
+/// only if this node's input is actually fed by a chapter-kind source,
+/// "import from connected input...". Neither collides with a real index,
+/// since indices are always plain digit strings.
+fn chapter_list_picker_options(graph: &Graph, modifier: NodeId) -> Vec<PickerEntry> {
+    let mut options = Vec::new();
+    if let Some(chapters) = chapter_edit_chapters(graph, modifier) {
+        for (i, c) in chapters.iter().enumerate() {
+            let label = if c.title.is_empty() { "(untitled)" } else { &c.title };
+            let imported_tag = if c.imported { " [imported]" } else { "" };
+            let display = format!(
+                "{}–{}  {label}{imported_tag}",
+                crate::graph::format_time(c.start_secs),
+                crate::graph::format_time(c.end_secs)
+            );
+            options.push(PickerEntry { display, value: Some(i.to_string()) });
+        }
+    }
+    options.push(PickerEntry { display: "add chapter…".to_string(), value: Some("add".to_string()) });
     options
 }

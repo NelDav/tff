@@ -8,6 +8,11 @@ pub enum StreamKind {
     Video,
     Audio,
     Subtitle,
+    /// A chapter list -- not a real ffmpeg stream (no `-map file:idx` for
+    /// it), but exposed as one more port on an input node so it can be
+    /// wired around the graph the same way a video/audio stream is. See
+    /// `InputNode::chapters` and `Graph::resolve_chapters`.
+    Chapter,
     Other,
 }
 
@@ -17,6 +22,7 @@ impl fmt::Display for StreamKind {
             StreamKind::Video => "v",
             StreamKind::Audio => "a",
             StreamKind::Subtitle => "s",
+            StreamKind::Chapter => "c",
             StreamKind::Other => "?",
         };
         write!(f, "{s}")
@@ -31,6 +37,7 @@ impl StreamKind {
             StreamKind::Video => "video",
             StreamKind::Audio => "audio",
             StreamKind::Subtitle => "subtitle",
+            StreamKind::Chapter => "chapters",
             StreamKind::Other => "other",
         }
     }
@@ -55,7 +62,7 @@ impl Codec {
             StreamKind::Video => &["libx264", "libx265", "libvpx-vp9"],
             StreamKind::Audio => &["aac", "libmp3lame", "libopus", "flac"],
             StreamKind::Subtitle => &["mov_text", "srt"],
-            StreamKind::Other => &[],
+            StreamKind::Chapter | StreamKind::Other => &[],
         };
         names.iter().map(|n| Codec::Encode(n.to_string())).collect()
     }
@@ -95,6 +102,11 @@ pub struct StreamInfo {
 
 impl StreamInfo {
     pub fn label(&self) -> String {
+        // A chapter "stream" has no real per-file index or codec -- `codec`
+        // just holds a plain chapter count for this case (see `add_input`).
+        if self.kind == StreamKind::Chapter {
+            return format!("chapters: {}", self.codec);
+        }
         match &self.lang {
             Some(lang) => format!("{}:{} {} ({lang})", self.kind, self.index, self.codec),
             None => format!("{}:{} {}", self.kind, self.index, self.codec),
@@ -108,6 +120,15 @@ pub struct InputNode {
     /// Position of this input in the `ffmpeg -i` argument list (0-based).
     pub file_index: usize,
     pub streams: Vec<StreamInfo>,
+    /// Chapters found in this input, whether real embedded ones (probed
+    /// from an ordinary media file's own chapter list) or the entire
+    /// content of a plain FFMETADATA text file added as an input --
+    /// ffprobe reports both the same way (see `ffmpeg::probe`), so this
+    /// app doesn't need to tell the two apart. Non-empty exactly when
+    /// `streams` has one `StreamKind::Chapter` entry (see `add_input`),
+    /// which is what makes this input's chapters wireable elsewhere in the
+    /// graph the same way a video/audio stream is.
+    pub chapters: Vec<Chapter>,
     /// Advanced escape hatch for global *input* options not otherwise
     /// covered by the node graph (e.g. `itsoffset -> "2.5"`). Each entry is
     /// emitted as `-<key>` immediately before this input's own `-i <path>`,
@@ -138,7 +159,115 @@ pub struct OutputNode {
     pub width: u16,
 }
 
-/// Curated global *input* options offered by the extra-args picker ('g' on
+/// One chapter marker. Ordering in a `ModifierKind::ChapterEdit` node's
+/// list is append order (however the user added them), not automatically
+/// sorted by time -- deliberately: `add chapter...` prefills a new
+/// chapter's start from the *last* entry's end, which matches the natural
+/// workflow of building a chapter list forward through the timeline
+/// without needing to re-sort.
+#[derive(Clone, Debug)]
+pub struct Chapter {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub title: String,
+    /// Whether this entry was auto-imported into a `ChapterEdit` node from
+    /// a connected input's own chapters, as opposed to being added
+    /// directly by the user -- see `ModifierKind::ChapterEdit`'s doc
+    /// comment. Meaningless outside a `ChapterEdit` node's own list: always
+    /// `false` on an `InputNode`'s probed chapters, and ignored entirely
+    /// by `chapters_ffmetadata` (which only reads the other three fields).
+    pub imported: bool,
+}
+
+impl Chapter {
+    pub fn new(start_secs: f64, end_secs: f64, title: String) -> Self {
+        Chapter { start_secs, end_secs, title, imported: false }
+    }
+
+    /// Same as `new`, but flagged as auto-imported -- see the `imported`
+    /// field's doc comment.
+    pub fn imported(start_secs: f64, end_secs: f64, title: String) -> Self {
+        Chapter { start_secs, end_secs, title, imported: true }
+    }
+}
+
+/// Parses a chapter time field: either `HH:MM:SS`/`MM:SS` (colon-separated,
+/// each part may have a fractional seconds component on the last one) or a
+/// plain number of seconds. Returns `None` for anything that doesn't
+/// unambiguously parse, rather than guessing.
+pub fn parse_time(input: &str) -> Option<f64> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains(':') {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.is_empty() || parts.len() > 3 || parts.iter().any(|p| p.is_empty()) {
+            return None;
+        }
+        let mut secs = 0.0;
+        for part in &parts {
+            secs = secs * 60.0 + part.parse::<f64>().ok()?;
+        }
+        Some(secs)
+    } else {
+        s.parse::<f64>().ok()
+    }
+}
+
+/// Renders seconds as `HH:MM:SS` (or `HH:MM:SS.mmm` if there's a
+/// sub-second remainder) for display -- the inverse of `parse_time`'s
+/// colon-separated form, always fully-padded so chapter rows line up.
+pub fn format_time(secs: f64) -> String {
+    let total_ms = (secs.max(0.0) * 1000.0).round() as i64;
+    let ms = total_ms % 1000;
+    let total_secs = total_ms / 1000;
+    let s = total_secs % 60;
+    let total_mins = total_secs / 60;
+    let m = total_mins % 60;
+    let h = total_mins / 60;
+    if ms == 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+    }
+}
+
+/// Escapes the characters FFMETADATA treats specially in a value
+/// (`=`, `;`, `#`, `\`, newline) -- verified against a real ffmpeg-exported
+/// file that this is exactly the escaping it itself uses for chapter
+/// titles.
+fn escape_ffmetadata(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '=' | ';' | '#' | '\\' | '\n') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Renders a chapter list as an FFMETADATA1 file's content -- ffmpeg's only
+/// mechanism for setting chapters that didn't come straight from an
+/// existing input file (see `Graph::resolve_chapters`'s doc comment).
+/// Always writes `TIMEBASE=1/1000` (milliseconds), since this app only
+/// ever holds `f64` seconds internally by the time it gets here.
+pub fn chapters_ffmetadata(chapters: &[Chapter]) -> String {
+    let mut out = String::from(";FFMETADATA1\n");
+    for c in chapters {
+        let start_ms = (c.start_secs * 1000.0).round() as i64;
+        let end_ms = (c.end_secs * 1000.0).round() as i64;
+        out.push_str("[CHAPTER]\n");
+        out.push_str("TIMEBASE=1/1000\n");
+        out.push_str(&format!("START={start_ms}\n"));
+        out.push_str(&format!("END={end_ms}\n"));
+        out.push_str(&format!("title={}\n", escape_ffmetadata(&c.title)));
+    }
+    out
+}
+
+/// Curated global *input* options offered by the extra-args picker ('e' on
 /// an input node), verified via `ffmpeg -h full`: a shift for sync issues
 /// (`itsoffset`), looping (`stream_loop`), and reading at native rate
 /// (`re`, useful for simulating a live source). The `bool` marks a
@@ -356,6 +485,14 @@ pub enum ModifierKind {
     /// A `-filter_complex` effect; `fields` holds whatever `name.fields()`
     /// asks for, same shape/editing flow as Metadata's fields.
     Filter { name: FilterName, fields: BTreeMap<String, String> },
+    /// Add/edit/remove chapters. Unlike every other kind, this doesn't
+    /// decorate whatever flows through it -- its `chapters` list is fully
+    /// authoritative on its own (buildable from scratch with no upstream
+    /// connection at all), and if something *is* wired into its input, the
+    /// only effect is offering an explicit "import from connected input"
+    /// convenience action in the picker (see `Graph::resolve_chapters`,
+    /// which deliberately doesn't look upstream past a node of this kind).
+    ChapterEdit { chapters: Vec<Chapter> },
 }
 
 impl ModifierKind {
@@ -367,6 +504,7 @@ impl ModifierKind {
             ModifierKind::Metadata { .. } => "metadata".to_string(),
             ModifierKind::Disposition { .. } => "disposition".to_string(),
             ModifierKind::Filter { name, .. } => name.label().to_string(),
+            ModifierKind::ChapterEdit { .. } => "chapters".to_string(),
         }
     }
 }
@@ -393,11 +531,14 @@ pub enum Endpoint {
 }
 
 /// The destination side of a connection: a modifier's single input slot,
-/// or an output file.
+/// an output file's mapped-stream list (any number of incoming wires), or
+/// an output's chapters slot (like `ModifierIn`, only one wire at a time --
+/// see `Graph::connect`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     ModifierIn(NodeId),
     Output(NodeId),
+    OutputChapters(NodeId),
 }
 
 /// A connection in the graph. Deliberately carries no settings of its own
@@ -430,6 +571,19 @@ pub struct Resolved {
     /// applied), even though this is built up walking backward from the
     /// output.
     pub filters: Vec<(FilterName, BTreeMap<String, String>)>,
+}
+
+/// Where a resolved chapter stream ultimately comes from -- see
+/// `Graph::resolve_chapters`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChapterSource {
+    /// Straight from a real input file's own chapters -- `-map_chapters`
+    /// can point directly at this file index, no synthesized file needed.
+    FromInput { input_file_index: usize },
+    /// Materialized by a `ChapterEdit` modifier node -- needs a synthesized
+    /// FFMETADATA temp file (see `chapters_ffmetadata`), one per distinct
+    /// node even if it feeds more than one output.
+    Edited { modifier_id: NodeId },
 }
 
 /// Flattens an extra_args map into ffmpeg CLI tokens: `-<key>`, plus the
@@ -466,16 +620,32 @@ impl Graph {
         graph
     }
 
-    pub fn add_input(&mut self, path: String, streams: Vec<StreamInfo>) -> NodeId {
+    /// `chapters` is whatever ffprobe reported for this file (see
+    /// `ffmpeg::probe`) -- empty for a file with no chapters, or the whole
+    /// content of a plain FFMETADATA text file added as an input, since
+    /// ffprobe reports both the same way. When non-empty, a synthetic
+    /// `StreamKind::Chapter` entry is appended to `streams` so the chapter
+    /// list becomes one more wireable port on this node, exactly like a
+    /// real video/audio stream.
+    pub fn add_input(&mut self, path: String, mut streams: Vec<StreamInfo>, chapters: Vec<Chapter>) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
         let file_index = self.inputs.len();
+        if !chapters.is_empty() {
+            streams.push(StreamInfo {
+                index: 0, // unused for chapters -- there's no per-file stream index to map by
+                kind: StreamKind::Chapter,
+                codec: chapters.len().to_string(),
+                lang: None,
+            });
+        }
         let y = 2.0 + (self.inputs.len() as f64) * 12.0;
         self.inputs.push(InputNode {
             id,
             path,
             file_index,
             streams,
+            chapters,
             extra_args: BTreeMap::new(),
             pos: (2.0, y),
             width: 34,
@@ -525,7 +695,7 @@ impl Graph {
 
     pub fn remove_output(&mut self, id: NodeId) {
         self.outputs.retain(|n| n.id != id);
-        self.wires.retain(|w| w.to != Target::Output(id));
+        self.wires.retain(|w| w.to != Target::Output(id) && w.to != Target::OutputChapters(id));
     }
 
     pub fn remove_modifier(&mut self, id: NodeId) {
@@ -572,15 +742,16 @@ impl Graph {
     }
 
     /// Connect (or, if it already exists, disconnect) `from` -> `to`. A
-    /// modifier's input accepts only one connection at a time, so wiring a
-    /// new source into an already-fed `ModifierIn` replaces the old one; an
-    /// output accepts any number, matching multi-output fan-in.
+    /// modifier's input and an output's chapters slot each accept only one
+    /// connection at a time, so wiring a new source into an already-fed one
+    /// replaces the old one; an output's regular mapped-stream slot accepts
+    /// any number, matching multi-output fan-in.
     pub fn connect(&mut self, from: Endpoint, to: Target) {
         if let Some(i) = self.wires.iter().position(|w| w.from == from && w.to == to) {
             self.wires.remove(i);
             return;
         }
-        if let Target::ModifierIn(_) = to {
+        if let Target::ModifierIn(_) | Target::OutputChapters(_) = to {
             self.wires.retain(|w| w.to != to);
         }
         self.wires.push(Wire { from, to });
@@ -596,8 +767,10 @@ impl Graph {
     /// through however many modifiers sit in between and accumulating the
     /// codec/metadata each one sets (first one encountered walking
     /// backward -- i.e. closest to the output -- wins per field). Returns
-    /// `None` if the chain is broken (a modifier with nothing feeding it)
-    /// or forms a cycle (guarded by a bounded number of hops).
+    /// `None` if the chain is broken (a modifier with nothing feeding it),
+    /// forms a cycle (guarded by a bounded number of hops), or passes
+    /// through a `ChapterEdit` node -- that kind never produces a
+    /// resolvable media stream; see `resolve_chapters` for its own path.
     pub fn resolve(&self, from: Endpoint) -> Option<Resolved> {
         let mut codec = Codec::Copy;
         let mut metadata = BTreeMap::new();
@@ -642,11 +815,49 @@ impl Graph {
                         ModifierKind::Filter { name, fields } => {
                             filters.insert(0, (*name, fields.clone()));
                         }
+                        ModifierKind::ChapterEdit { .. } => return None,
                     }
                     let incoming = self.wires.iter().find(|w| w.to == Target::ModifierIn(mid))?;
                     current = incoming.from;
                 }
             }
+        }
+    }
+
+    /// Where an output's (or, mid-chain, a `ChapterEdit` node's) chapters
+    /// ultimately come from, per `resolve_chapters`.
+    pub fn output_chapters(&self, output_id: NodeId) -> Option<ChapterSource> {
+        let wi = self.incoming(Target::OutputChapters(output_id)).into_iter().next()?;
+        self.resolve_chapters(self.wires[wi].from)
+    }
+
+    /// Chapters, unlike video/audio, don't have an underlying stream that
+    /// gets decorated -- the chapter *list itself* is the payload, so this
+    /// doesn't walk a chain accumulating settings the way `resolve` does.
+    /// Instead it looks at exactly one hop from `from`:
+    /// - a real input's own chapter port resolves to a direct reference to
+    ///   that input file (`FromInput`) -- ffmpeg can point `-map_chapters`
+    ///   straight at it, no extra file needed (verified against a real
+    ///   ffmpeg run: `-map_chapters` accepts any input index, not just an
+    ///   FFMETADATA one);
+    /// - a `ChapterEdit` modifier's output resolves to a reference to that
+    ///   node (`Edited`) -- its own list is authoritative regardless of
+    ///   whatever (if anything) feeds its input, so nothing further
+    ///   upstream is examined;
+    /// - anything else (an unconnected port, or a non-`ChapterEdit`
+    ///   modifier sitting where a chapter source was expected) is `None`.
+    pub fn resolve_chapters(&self, from: Endpoint) -> Option<ChapterSource> {
+        match from {
+            Endpoint::Stream { node, stream_idx } => {
+                let input = self.input(node)?;
+                let stream = input.streams.get(stream_idx)?;
+                (stream.kind == StreamKind::Chapter)
+                    .then_some(ChapterSource::FromInput { input_file_index: input.file_index })
+            }
+            Endpoint::ModifierOut(mid) => match &self.modifier(mid)?.kind {
+                ModifierKind::ChapterEdit { .. } => Some(ChapterSource::Edited { modifier_id: mid }),
+                _ => None,
+            },
         }
     }
 
@@ -672,6 +883,7 @@ impl Graph {
         path_override: Option<&str>,
         extra_args: &[String],
         filter_complex: &mut Vec<String>,
+        chapter_input: Option<usize>,
     ) -> Option<Vec<String>> {
         let resolved: Vec<Resolved> = self
             .incoming(Target::Output(output.id))
@@ -762,6 +974,10 @@ impl Graph {
             args.push("-f".to_string());
             args.push(container.clone());
         }
+        if let Some(idx) = chapter_input {
+            args.push("-map_chapters".to_string());
+            args.push(idx.to_string());
+        }
         args.extend(extra_arg_tokens(&output.extra_args));
         args.extend_from_slice(extra_args);
         args.push(path_override.unwrap_or(&output.path).to_string());
@@ -775,17 +991,51 @@ impl Graph {
     /// skipped entirely: handing ffmpeg an output path with no `-map` would
     /// trigger its default stream auto-selection, which isn't what an empty
     /// output node means here.
-    pub fn build_ffmpeg_args(&self) -> Vec<String> {
+    ///
+    /// `chapter_files` maps a `ChapterEdit` modifier's `NodeId` to the path
+    /// of an already-written FFMETADATA file holding its chapters (see
+    /// `chapters_ffmetadata`) -- `Graph` stays free of file I/O itself, so
+    /// the caller (`App`) writes these first and passes the paths in.
+    /// Resolved via `output_chapters`: an output whose chapters trace
+    /// straight back to a real input file needs no entry here at all
+    /// (`-map_chapters` just points at that input directly); one whose
+    /// chapters were materialized by a `ChapterEdit` node gets that node's
+    /// temp file appended as an extra `-i` after the real inputs (never
+    /// disturbing their own `file_index`-based `-map` references) -- once
+    /// per distinct node, even if it feeds more than one output. An output
+    /// needing a `ChapterEdit` node's file with no entry here (e.g. the
+    /// write failed) simply renders without chapters rather than erroring.
+    pub fn build_ffmpeg_args(&self, chapter_files: &BTreeMap<NodeId, String>) -> Vec<String> {
         let mut args = vec!["-y".to_string()];
         for input in &self.inputs {
             args.extend(extra_arg_tokens(&input.extra_args));
             args.push("-i".to_string());
             args.push(input.path.clone());
         }
+        let chapter_sources: BTreeMap<NodeId, ChapterSource> =
+            self.outputs.iter().filter_map(|o| self.output_chapters(o.id).map(|src| (o.id, src))).collect();
+        let mut next_input_index = self.inputs.len();
+        let mut chapter_modifier_index: BTreeMap<NodeId, usize> = BTreeMap::new();
+        for source in chapter_sources.values() {
+            if let ChapterSource::Edited { modifier_id } = source
+                && !chapter_modifier_index.contains_key(modifier_id)
+                && let Some(path) = chapter_files.get(modifier_id)
+            {
+                args.push("-i".to_string());
+                args.push(path.clone());
+                chapter_modifier_index.insert(*modifier_id, next_input_index);
+                next_input_index += 1;
+            }
+        }
         let mut filter_complex = Vec::new();
         let mut sections = Vec::new();
         for output in &self.outputs {
-            if let Some(section) = self.build_output_section(output, None, &[], &mut filter_complex) {
+            let chapter_input = match chapter_sources.get(&output.id) {
+                Some(ChapterSource::FromInput { input_file_index }) => Some(*input_file_index),
+                Some(ChapterSource::Edited { modifier_id }) => chapter_modifier_index.get(modifier_id).copied(),
+                None => None,
+            };
+            if let Some(section) = self.build_output_section(output, None, &[], &mut filter_complex, chapter_input) {
                 sections.push(section);
             }
         }
@@ -807,7 +1057,15 @@ impl Graph {
     /// first `duration_secs` seconds (as an output-scoped `-t`, so it stops
     /// that output early without truncating what's read from the inputs) --
     /// `None` if that output has nothing resolvable, same as a real render.
-    pub fn build_preview_args(&self, output_id: NodeId, preview_path: &str, duration_secs: u32) -> Option<Vec<String>> {
+    /// `chapter_files` is the same map `build_ffmpeg_args` takes, keyed the
+    /// same way even though only `output_id`'s entry (if any) is relevant.
+    pub fn build_preview_args(
+        &self,
+        output_id: NodeId,
+        preview_path: &str,
+        duration_secs: u32,
+        chapter_files: &BTreeMap<NodeId, String>,
+    ) -> Option<Vec<String>> {
         let output = self.outputs.iter().find(|o| o.id == output_id)?;
         let mut args = vec!["-y".to_string()];
         for input in &self.inputs {
@@ -815,9 +1073,19 @@ impl Graph {
             args.push("-i".to_string());
             args.push(input.path.clone());
         }
+        let chapter_input = match self.output_chapters(output.id) {
+            Some(ChapterSource::FromInput { input_file_index }) => Some(input_file_index),
+            Some(ChapterSource::Edited { modifier_id }) => chapter_files.get(&modifier_id).map(|path| {
+                let idx = self.inputs.len();
+                args.push("-i".to_string());
+                args.push(path.clone());
+                idx
+            }),
+            None => None,
+        };
         let mut filter_complex = Vec::new();
         let extra = vec!["-t".to_string(), duration_secs.to_string()];
-        let section = self.build_output_section(output, Some(preview_path), &extra, &mut filter_complex)?;
+        let section = self.build_output_section(output, Some(preview_path), &extra, &mut filter_complex, chapter_input)?;
         if !filter_complex.is_empty() {
             args.push("-filter_complex".to_string());
             args.push(filter_complex.join(";"));

@@ -3,7 +3,7 @@ use std::process::Command;
 use std::sync::mpsc;
 
 use crate::ffmpeg;
-use crate::graph::{Codec, Endpoint, FilterName, Graph, ModifierKind, StreamInfo, StreamKind, Target};
+use crate::graph::{Chapter, Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, StreamInfo, StreamKind, Target};
 
 fn video_stream() -> Vec<StreamInfo> {
     vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }]
@@ -39,7 +39,7 @@ fn filter_fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 fn direct_wire_resolves_to_stream_copy() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let src = Endpoint::Stream { node: id, stream_idx: 0 };
     graph.connect(src, Target::Output(out));
 
@@ -49,7 +49,7 @@ fn direct_wire_resolves_to_stream_copy() {
     assert_eq!(resolved.codec, Codec::Copy);
     assert!(resolved.metadata.is_empty());
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
     assert!(joined.contains("-c:0 copy"), "expected an explicit per-stream copy default: {joined}");
 }
@@ -60,7 +60,7 @@ fn direct_wire_resolves_to_stream_copy() {
 fn convert_modifier_sets_codec_override() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
 
     let src = Endpoint::Stream { node: id, stream_idx: 0 };
@@ -70,7 +70,7 @@ fn convert_modifier_sets_codec_override() {
     let resolved = graph.resolve(Endpoint::ModifierOut(modifier)).unwrap();
     assert_eq!(resolved.codec, Codec::Encode("libx265".to_string()));
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
     assert!(joined.contains("-c:0 libx265"), "expected the convert node's codec as an override: {joined}");
 }
@@ -83,10 +83,10 @@ fn convert_modifier_sets_codec_override() {
 #[test]
 fn input_extra_args_are_spliced_before_its_own_dash_i() {
     let mut graph = Graph::new();
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "2.5"), ("re", "")]);
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
     assert!(joined.contains("-itsoffset 2.5"), "{joined}");
     assert!(joined.contains("-re -i in.mp4"), "a valueless flag should have no operand token: {joined}");
@@ -100,11 +100,11 @@ fn input_extra_args_are_spliced_before_its_own_dash_i() {
 fn output_extra_args_are_appended_before_the_output_path() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
     graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000"), ("movflags", "+faststart")]);
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     assert_eq!(
         args.last().unwrap(),
         &graph.outputs[0].path,
@@ -115,7 +115,7 @@ fn output_extra_args_are_appended_before_the_output_path() {
     assert!(joined.contains("-movflags +faststart output.mkv"), "{joined}");
 
     graph.outputs[0].extra_args = BTreeMap::new();
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     assert!(!args.join(" ").contains("-max_interleave_delta"), "clearing extra_args should remove the tokens");
 }
 
@@ -125,7 +125,7 @@ fn output_extra_args_are_appended_before_the_output_path() {
 fn metadata_modifier_sets_language_and_title_override() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Metadata {
         fields: metadata_fields(&[("language", "eng"), ("title", "Director's Commentary")]),
     });
@@ -134,7 +134,7 @@ fn metadata_modifier_sets_language_and_title_override() {
     graph.connect(src, Target::ModifierIn(modifier));
     graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
     assert!(joined.contains("-metadata:s:0 language=eng"), "{joined}");
     assert!(joined.contains("-metadata:s:0 title=Director's Commentary"), "{joined}");
@@ -152,13 +152,13 @@ fn metadata_modifier_sets_language_and_title_override() {
 fn filter_modifier_routes_through_filter_complex_and_skips_copy_default() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier =
         graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: filter_fields(&[("width", "640")]) });
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
     assert!(joined.contains("-filter_complex"), "{joined}");
     assert!(joined.contains("[0:0]scale=w=640:h=-1[f0]"), "{joined}");
@@ -173,12 +173,12 @@ fn filter_modifier_routes_through_filter_complex_and_skips_copy_default() {
 fn unconfigured_filter_modifier_is_a_no_op() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
     assert!(!joined.contains("-filter_complex"), "{joined}");
     assert!(joined.contains("-map 0:0"), "{joined}");
@@ -191,7 +191,7 @@ fn unconfigured_filter_modifier_is_a_no_op() {
 fn chain_of_convert_then_metadata_combines_both_effects() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let convert = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
     let metadata = graph.add_modifier(ModifierKind::Metadata { fields: metadata_fields(&[("language", "jpn")]) });
 
@@ -212,7 +212,7 @@ fn chain_of_convert_then_metadata_combines_both_effects() {
 fn closest_to_output_modifier_wins_on_conflicting_fields() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let first = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx264".to_string())));
     let second = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
 
@@ -239,7 +239,7 @@ fn broken_chain_resolves_to_none_and_is_skipped_in_args() {
 
     assert!(graph.resolve(Endpoint::ModifierOut(modifier)).is_none());
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     assert!(!args.contains(&"output.mkv".to_string()), "an output with only a broken chain should be skipped");
 }
 
@@ -263,8 +263,8 @@ fn cyclic_chain_does_not_panic_or_hang() {
 fn connecting_into_a_modifier_input_replaces_any_existing_wire() {
     let mut graph = Graph::new();
     let modifier = graph.add_modifier(ModifierKind::Convert(Codec::Copy));
-    let a = graph.add_input("a.mp4".to_string(), video_stream());
-    let b = graph.add_input("b.mp4".to_string(), video_stream());
+    let a = graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
 
     graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(modifier));
     graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(modifier));
@@ -280,7 +280,7 @@ fn connecting_into_a_modifier_input_replaces_any_existing_wire() {
 fn connecting_the_same_pair_twice_toggles_it_off() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let src = Endpoint::Stream { node: id, stream_idx: 0 };
 
     graph.connect(src, Target::Output(out));
@@ -295,7 +295,7 @@ fn connecting_the_same_pair_twice_toggles_it_off() {
 fn removing_a_modifier_prunes_its_wires_only() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input("in.mp4".to_string(), video_audio_streams());
+    let id = graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Convert(Codec::Copy));
 
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
@@ -319,7 +319,7 @@ fn ffmpeg_args_use_local_stream_indices_per_output_section() {
     let mut graph = Graph::new();
     let out1 = graph.outputs[0].id;
     let out2 = graph.add_output();
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let c1 = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx264".to_string())));
     let c2 = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
 
@@ -329,7 +329,7 @@ fn ffmpeg_args_use_local_stream_indices_per_output_section() {
     graph.connect(src, Target::ModifierIn(c2));
     graph.connect(Endpoint::ModifierOut(c2), Target::Output(out2));
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
     assert!(joined.contains("-c:0 libx264"), "{joined}");
     assert!(joined.contains("-c:0 libx265"), "{joined}");
@@ -343,12 +343,342 @@ fn ffmpeg_args_use_local_stream_indices_per_output_section() {
 fn ffmpeg_args_skip_outputs_with_no_resolvable_connection() {
     let mut graph = Graph::new();
     graph.add_output(); // second output, left empty
-    let id = graph.add_input("in.mp4".to_string(), video_stream());
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(graph.outputs[0].id));
 
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     assert!(args.contains(&"output.mkv".to_string()));
     assert!(!args.contains(&"output2.mkv".to_string()), "empty output should not appear: {args:?}");
+}
+
+// ---------------------------------------------------------------------
+// Chapters: time parsing/formatting, FFMETADATA read/write
+// ---------------------------------------------------------------------
+
+#[test]
+fn parse_time_accepts_plain_seconds_and_colon_forms() {
+    use crate::graph::parse_time;
+
+    assert_eq!(parse_time("12.5"), Some(12.5));
+    assert_eq!(parse_time("0"), Some(0.0));
+    assert_eq!(parse_time("1:23"), Some(83.0)); // 1m23s
+    assert_eq!(parse_time("1:02:03"), Some(3723.0)); // 1h2m3s
+    assert_eq!(parse_time("0:00:01.5"), Some(1.5));
+    assert_eq!(parse_time(""), None);
+    assert_eq!(parse_time("not a time"), None);
+    assert_eq!(parse_time("1:2:3:4"), None, "more than HH:MM:SS shouldn't parse");
+    assert_eq!(parse_time(":30"), None, "an empty component shouldn't parse");
+}
+
+#[test]
+fn format_time_pads_and_only_shows_millis_when_present() {
+    use crate::graph::format_time;
+
+    assert_eq!(format_time(0.0), "00:00:00");
+    assert_eq!(format_time(65.0), "00:01:05");
+    assert_eq!(format_time(3723.0), "01:02:03");
+    assert_eq!(format_time(1.5), "00:00:01.500");
+}
+
+/// format_time's output should always be accepted back by parse_time and
+/// land on (approximately) the same number of seconds -- the picker
+/// round-trips a chapter's stored value through exactly this pair every
+/// time it's opened for editing.
+#[test]
+fn format_time_and_parse_time_round_trip() {
+    use crate::graph::{format_time, parse_time};
+
+    for secs in [0.0, 1.0, 59.999, 60.0, 3599.5, 7384.25] {
+        let formatted = format_time(secs);
+        let parsed = parse_time(&formatted).unwrap_or_else(|| panic!("expected {formatted} to parse"));
+        assert!((parsed - secs).abs() < 0.001, "round-trip drifted: {secs} -> {formatted} -> {parsed}");
+    }
+}
+
+/// The written FFMETADATA should escape the characters the format treats
+/// specially in a title, matching what a real ffmpeg-exported file does
+/// (verified separately against a real build).
+#[test]
+fn chapters_ffmetadata_escapes_special_characters_in_titles() {
+    use crate::graph::{chapters_ffmetadata, Chapter};
+
+    let chapters = vec![Chapter::new(0.0, 5.0, "Chapter #1: A=B; C\\D".to_string())];
+    let content = chapters_ffmetadata(&chapters);
+
+    assert!(content.starts_with(";FFMETADATA1\n"));
+    assert!(content.contains("[CHAPTER]\n"));
+    assert!(content.contains("TIMEBASE=1/1000\n"));
+    assert!(content.contains("START=0\n"));
+    assert!(content.contains("END=5000\n"));
+    assert!(content.contains(r"title=Chapter \#1: A\=B\; C\\D"), "{content}");
+}
+
+/// A plain FFMETADATA text file added as an input should probe with an
+/// empty stream list and a populated chapter list -- verified against a
+/// real ffprobe build: it autodetects the format from content (no `-f`
+/// needed) and reports exactly this shape (`streams: []`, `chapters: [...]`
+/// ), same as `ffmpeg::probe` now asks for via `-show_chapters`.
+#[test]
+fn probe_reads_chapters_from_a_plain_ffmetadata_text_file() {
+    let dir = std::env::temp_dir().join(format!("tff-test-probe-ffmeta-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("chapters.ffmeta");
+    std::fs::write(
+        &path,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=5000\ntitle=Intro\n\
+         [CHAPTER]\nTIMEBASE=1/1000\nSTART=5000\nEND=10000\ntitle=Main Part\n",
+    )
+    .unwrap();
+
+    let result = ffmpeg::probe(path.to_str().unwrap()).unwrap();
+
+    assert!(result.streams.is_empty(), "{:?}", result.streams);
+    assert_eq!(result.chapters.len(), 2);
+    assert_eq!(result.chapters[0].title, "Intro");
+    assert_eq!(result.chapters[0].start_secs, 0.0);
+    assert_eq!(result.chapters[0].end_secs, 5.0);
+    assert_eq!(result.chapters[1].title, "Main Part");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `add_input` should expose a synthetic `StreamKind::Chapter` port
+/// whenever the probed chapters are non-empty, appended after the real
+/// streams -- this is what makes a chapters-only text-file input wireable
+/// the same way a video/audio stream is, with no special-cased node kind.
+#[test]
+fn add_input_exposes_a_synthetic_chapter_stream_when_chapters_are_present() {
+    let mut graph = Graph::new();
+    let chapters = vec![Chapter::new(0.0, 5.0, "Intro".to_string())];
+    let id = graph.add_input("chapters.ffmeta".to_string(), Vec::new(), chapters);
+
+    let input = graph.input(id).unwrap();
+    assert_eq!(input.streams.len(), 1, "{:?}", input.streams);
+    assert_eq!(input.streams[0].kind, StreamKind::Chapter);
+    assert_eq!(input.chapters.len(), 1);
+    assert!(input.streams[0].label().contains("chapters"), "{}", input.streams[0].label());
+}
+
+/// No chapters -> no synthetic port, same as a real file with no chapter
+/// data: an ordinary video-only input shouldn't grow an extra chapter row.
+#[test]
+fn add_input_omits_the_chapter_stream_when_there_are_no_chapters() {
+    let mut graph = Graph::new();
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    assert!(graph.input(id).unwrap().streams.iter().all(|s| s.kind != StreamKind::Chapter));
+}
+
+/// A chapter endpoint wired straight from a real input to an output's
+/// chapters slot should resolve to `FromInput`, referencing that input's
+/// own file index -- no `ChapterEdit` node needed for a pure passthrough.
+#[test]
+fn resolve_chapters_from_a_direct_input_connection() {
+    use crate::graph::ChapterSource;
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let chapters = vec![Chapter::new(0.0, 5.0, "Intro".to_string())];
+    let id = graph.add_input("chapters.ffmeta".to_string(), Vec::new(), chapters);
+    let chapter_stream_idx = graph.input(id).unwrap().streams.len() - 1;
+    graph.connect(
+        Endpoint::Stream { node: id, stream_idx: chapter_stream_idx },
+        Target::OutputChapters(out),
+    );
+
+    let source = graph.output_chapters(out);
+    assert_eq!(source, Some(ChapterSource::FromInput { input_file_index: 0 }));
+}
+
+/// A `ChapterEdit` modifier's output resolves to `Edited`, referencing the
+/// node itself -- its own list is authoritative regardless of what (if
+/// anything) feeds its input.
+#[test]
+fn resolve_chapters_through_a_chapter_edit_node() {
+    use crate::graph::{ChapterSource, ModifierKind};
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let modifier = graph.add_modifier(ModifierKind::ChapterEdit {
+        chapters: vec![Chapter::new(0.0, 1.0, "A".to_string())],
+    });
+    graph.connect(Endpoint::ModifierOut(modifier), Target::OutputChapters(out));
+
+    assert_eq!(graph.output_chapters(out), Some(ChapterSource::Edited { modifier_id: modifier }));
+}
+
+/// A `ChapterEdit` node closest to the output wins outright and nothing
+/// further upstream is consulted -- mirrors how Convert's codec and
+/// Disposition's flags already behave (first modifier walking backward
+/// wins), applied here to the whole chapter list rather than a single
+/// field, and needed because the picker's "import from connected input"
+/// action deliberately doesn't create any kind of live link back to the
+/// source once the copy is made.
+#[test]
+fn chapter_edit_wins_outright_over_whatever_feeds_its_input() {
+    use crate::graph::{ChapterSource, ModifierKind};
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let input_chapters = vec![Chapter::new(0.0, 1.0, "FromInput".to_string())];
+    let input_id = graph.add_input("chapters.ffmeta".to_string(), Vec::new(), input_chapters);
+    let chapter_stream_idx = graph.input(input_id).unwrap().streams.len() - 1;
+    let modifier =
+        graph.add_modifier(ModifierKind::ChapterEdit { chapters: vec![Chapter::new(0.0, 2.0, "Edited".to_string())] });
+    graph.connect(Endpoint::Stream { node: input_id, stream_idx: chapter_stream_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::OutputChapters(out));
+
+    assert_eq!(graph.output_chapters(out), Some(ChapterSource::Edited { modifier_id: modifier }));
+}
+
+/// An output's chapters slot behaves like a modifier's input slot, not
+/// like its regular mapped-stream slot: wiring a second source into it
+/// replaces the first rather than fanning in -- explicit user requirement
+/// ("keep it like it is already for video/audio ports... only one
+/// incoming wire per port").
+#[test]
+fn output_chapters_slot_accepts_only_one_wire_at_a_time() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let a = graph.add_input("a.ffmeta".to_string(), Vec::new(), vec![Chapter::new(0.0, 1.0, "A".to_string())]);
+    let b = graph.add_input("b.ffmeta".to_string(), Vec::new(), vec![Chapter::new(0.0, 1.0, "B".to_string())]);
+    let a_idx = graph.input(a).unwrap().streams.len() - 1;
+    let b_idx = graph.input(b).unwrap().streams.len() - 1;
+
+    graph.connect(Endpoint::Stream { node: a, stream_idx: a_idx }, Target::OutputChapters(out));
+    graph.connect(Endpoint::Stream { node: b, stream_idx: b_idx }, Target::OutputChapters(out));
+
+    let incoming = graph.incoming(Target::OutputChapters(out));
+    assert_eq!(incoming.len(), 1, "wiring a second source should replace the first, not add to it");
+    assert_eq!(graph.wires[incoming[0]].from, Endpoint::Stream { node: b, stream_idx: b_idx });
+}
+
+/// Removing an output should clean up a wire feeding its chapters slot the
+/// same way it already does for its regular mapped-stream wires.
+#[test]
+fn remove_output_cleans_up_its_chapters_wire() {
+    let mut graph = Graph::new();
+    let out = graph.add_output();
+    let id = graph.add_input("chapters.ffmeta".to_string(), Vec::new(), vec![Chapter::new(0.0, 1.0, "A".to_string())]);
+    let idx = graph.input(id).unwrap().streams.len() - 1;
+    graph.connect(Endpoint::Stream { node: id, stream_idx: idx }, Target::OutputChapters(out));
+    assert_eq!(graph.wires.len(), 1);
+
+    graph.remove_output(out);
+
+    assert!(graph.wires.is_empty(), "{:?}", graph.wires);
+}
+
+/// End-to-end check of the direct-passthrough path: a real input file's
+/// own chapters, wired straight to an output with no `ChapterEdit` in the
+/// chain, should need no extra `-i` at all -- `-map_chapters` points
+/// directly at the real input's file index.
+#[test]
+fn output_chapters_from_direct_input_apply_end_to_end_with_no_extra_input() {
+    let dir = std::env::temp_dir().join(format!("tff-test-chapters-direct-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let chapters_path = dir.join("chapters.ffmeta");
+    std::fs::write(
+        &chapters_path,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=Intro\n\
+         [CHAPTER]\nTIMEBASE=1/1000\nSTART=500\nEND=1000\ntitle=Outro\n",
+    )
+    .unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    let video = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_id = graph.add_input(source_path.to_str().unwrap().to_string(), video.streams, Vec::new());
+    graph.connect(Endpoint::Stream { node: video_id, stream_idx: 0 }, Target::Output(out));
+
+    let chapters = ffmpeg::probe(chapters_path.to_str().unwrap()).unwrap();
+    assert!(chapters.streams.is_empty());
+    let chapters_id = graph.add_input(chapters_path.to_str().unwrap().to_string(), chapters.streams, chapters.chapters);
+    let chapter_stream_idx = graph.input(chapters_id).unwrap().streams.len() - 1;
+    graph.connect(Endpoint::Stream { node: chapters_id, stream_idx: chapter_stream_idx }, Target::OutputChapters(out));
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new()); // no ChapterEdit node, so no temp file needed
+    assert!(args.iter().filter(|a| a.as_str() == "-i").count() == 2, "expected exactly the two real -i inputs: {args:?}");
+    assert!(args.windows(2).any(|w| w == ["-map_chapters", "1"]), "expected -map_chapters pointing at the chapters input (index 1): {args:?}");
+    run_ok(Command::new("ffmpeg").args(&args));
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_chapters", "-of", "json", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&probe.stdout);
+    assert!(text.contains("\"title\": \"Intro\""), "{text}");
+    assert!(text.contains("\"title\": \"Outro\""), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// End-to-end check of the `ChapterEdit` path: chapters authored directly
+/// in a modifier node (no source file at all) get synthesized to a temp
+/// FFMETADATA file and threaded in as an extra `-i`, and two outputs
+/// sharing the same node reuse that single extra input rather than each
+/// getting their own.
+#[test]
+fn output_chapters_from_chapter_edit_apply_end_to_end_and_are_shared_across_outputs() {
+    use crate::graph::ModifierKind;
+
+    let dir = std::env::temp_dir().join(format!("tff-test-chapters-edited-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 160, 120);
+    let out1_path = dir.join("out1.mkv");
+    let out2_path = dir.join("out2.mkv");
+    let chapter_file_path = dir.join("edited.ffmeta");
+
+    let mut graph = Graph::new();
+    let out1 = graph.outputs[0].id;
+    graph.outputs[0].path = out1_path.to_str().unwrap().to_string();
+    let out2 = graph.add_output();
+    graph.output_mut(out2).unwrap().path = out2_path.to_str().unwrap().to_string();
+
+    let video = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let video_id = graph.add_input(source_path.to_str().unwrap().to_string(), video.streams, Vec::new());
+    graph.connect(Endpoint::Stream { node: video_id, stream_idx: 0 }, Target::Output(out1));
+    graph.connect(Endpoint::Stream { node: video_id, stream_idx: 0 }, Target::Output(out2));
+
+    let chapters = vec![
+        Chapter::new(0.0, 0.5, "Intro".to_string()),
+        Chapter::new(0.5, 1.0, "Outro".to_string()),
+    ];
+    let modifier = graph.add_modifier(ModifierKind::ChapterEdit { chapters: chapters.clone() });
+    graph.connect(Endpoint::ModifierOut(modifier), Target::OutputChapters(out1));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::OutputChapters(out2));
+
+    std::fs::write(&chapter_file_path, crate::graph::chapters_ffmetadata(&chapters)).unwrap();
+    let mut chapter_files = BTreeMap::new();
+    chapter_files.insert(modifier, chapter_file_path.to_str().unwrap().to_string());
+
+    let args = graph.build_ffmpeg_args(&chapter_files);
+    assert_eq!(
+        args.iter().filter(|a| a.as_str() == "-i").count(),
+        2,
+        "the shared ChapterEdit node should only add one extra -i, not one per output: {args:?}"
+    );
+    assert_eq!(
+        args.iter().filter(|a| a.as_str() == "-map_chapters").count(),
+        2,
+        "both outputs should still get their own -map_chapters: {args:?}"
+    );
+    run_ok(Command::new("ffmpeg").args(&args));
+
+    for path in [&out1_path, &out2_path] {
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_chapters", "-of", "json", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probe.stdout);
+        assert!(text.contains("\"title\": \"Intro\""), "{path:?}: {text}");
+        assert!(text.contains("\"title\": \"Outro\""), "{path:?}: {text}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------
@@ -363,7 +693,7 @@ fn toggle_connect_wires_armed_stream_into_focused_modifier() {
     use crate::app::{App, Focus};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
 
@@ -389,7 +719,7 @@ fn toggle_connect_arms_a_connected_modifiers_output() {
     use crate::app::{App, Focus};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
@@ -427,7 +757,7 @@ fn disconnect_is_bulk_on_input_and_precise_elsewhere() {
     let mut app = App::new();
     let out1 = app.graph.outputs[0].id;
     let out2 = app.graph.add_output();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let src = Endpoint::Stream { node: id, stream_idx: 0 };
     app.graph.connect(src, Target::Output(out1));
     app.graph.connect(src, Target::Output(out2));
@@ -507,7 +837,7 @@ fn activate_modifier_opens_codec_picker_for_connected_convert_node() {
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
@@ -650,7 +980,7 @@ fn activate_modifier_refuses_filter_field_picker_for_wrong_stream_kind() {
     use crate::app::{App, Focus, Mode};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams());
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::ModifierIn(modifier)); // audio
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
@@ -670,7 +1000,7 @@ fn activate_modifier_on_filter_opens_field_picker_for_its_kind() {
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Filter {
         name: FilterName::Crop,
         fields: filter_fields(&[("width", "640")]),
@@ -702,7 +1032,7 @@ fn filter_field_picker_confirm_opens_value_input_and_stores_it() {
     use crate::app::{App, Focus, Mode, TextTarget};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
@@ -741,7 +1071,7 @@ fn filter_field_with_fixed_values_opens_a_selection_picker_not_free_text() {
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Rotate, fields: BTreeMap::new() });
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
@@ -775,7 +1105,7 @@ fn filter_field_value_picker_reset_entry_clears_the_field() {
     use crate::app::{App, Focus, Mode};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Filter {
         name: FilterName::Rotate,
         fields: filter_fields(&[("direction", "180")]),
@@ -956,7 +1286,7 @@ fn delete_focused_node_on_modifier_removes_it() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     app.graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
@@ -1008,7 +1338,7 @@ fn picker_search_and_escape_work_through_convert_modifier_flow() {
     use crate::app::{App, Focus, Mode};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
@@ -1043,7 +1373,7 @@ fn container_picker_refuses_without_a_focused_output() {
     use crate::app::{App, Focus, Mode};
 
     let mut app = App::new();
-    app.graph.add_input("in.mp4".to_string(), video_stream());
+    app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     app.focus = Focus::Input(0);
 
     app.open_container_picker();
@@ -1061,7 +1391,7 @@ fn container_picker_confirm_sets_override_and_rewrites_known_extension() {
 
     let mut app = App::new(); // focus defaults to Focus::Output(0)
     let out = app.graph.outputs[0].id;
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
 
     app.open_container_picker();
@@ -1079,7 +1409,7 @@ fn container_picker_confirm_sets_override_and_rewrites_known_extension() {
 
     assert_eq!(app.graph.outputs[0].container.as_deref(), Some("webm"));
     assert_eq!(app.graph.outputs[0].path, "output.webm");
-    assert!(app.graph.build_ffmpeg_args().windows(2).any(|w| w == ["-f", "webm"]));
+    assert!(app.graph.build_ffmpeg_args(&BTreeMap::new()).windows(2).any(|w| w == ["-f", "webm"]));
 }
 
 /// The pure filter predicate: case-insensitive substring match, empty query
@@ -1108,7 +1438,7 @@ fn start_preview_requires_an_output_focused() {
     use crate::app::{App, Focus};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
     app.focus = Focus::Input(idx);
 
@@ -1141,7 +1471,7 @@ fn start_preview_refuses_while_a_job_is_already_running() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
     app.focus = Focus::Output(0);
 
@@ -1169,8 +1499,8 @@ fn poll_ffmpeg_hands_off_a_finished_preview_via_preview_ready() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
-    let id = app.graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
+    let id = app.graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
     app.focus = Focus::Output(0);
 
@@ -1201,7 +1531,7 @@ fn activate_focused_on_modifier_dispatches_to_activate_modifier() {
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
@@ -1221,7 +1551,7 @@ fn activate_focused_on_input_opens_extra_args_field_picker_with_current_values()
     use crate::app::{App, Focus, Mode, PickerKind};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     app.graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "1.0")]);
     let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
     app.focus = Focus::Input(idx);
@@ -1264,7 +1594,7 @@ fn extra_args_picker_toggles_valueless_flag_in_place() {
     use crate::app::{App, Focus, Mode};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
     app.focus = Focus::Input(idx);
     app.activate_focused();
@@ -1293,7 +1623,7 @@ fn extra_args_picker_value_field_opens_text_input_and_stores() {
     use crate::app::{App, Focus, Mode, TextTarget};
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
     app.focus = Focus::Input(idx);
     app.activate_focused();
@@ -1351,6 +1681,463 @@ fn extra_args_picker_custom_key_flow_prompts_for_key_then_value() {
 }
 
 // ---------------------------------------------------------------------
+// Chapters: picker flow
+// ---------------------------------------------------------------------
+
+/// A `ChapterEdit` modifier's own chapter list, if `id` refers to one --
+/// mirrors the private helper of the same name in `app.rs`.
+fn chapter_edit_chapters(graph: &Graph, id: NodeId) -> Option<&Vec<Chapter>> {
+    match graph.modifier(id).map(|m| &m.kind) {
+        Some(ModifierKind::ChapterEdit { chapters }) => Some(chapters),
+        _ => None,
+    }
+}
+
+/// Focuses the given `ChapterEdit` modifier by id -- most of these tests
+/// drive the flow starting from 'e' on that node, same as a real user.
+fn focus_modifier(app: &mut crate::app::App, modifier: NodeId) {
+    let idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = crate::app::Focus::Modifier(idx);
+}
+
+/// Drives to a specific chapter's field picker by its index in the
+/// chapter list: focuses the node, 'e' (opens the chapter list directly --
+/// unlike the old output-hosted design, a `ChapterEdit` node's primary
+/// action *is* its chapter list, same pattern as Metadata/Disposition),
+/// then picks the row for `index`.
+fn open_chapter_field(app: &mut crate::app::App, modifier: NodeId, index: usize) {
+    focus_modifier(app, modifier);
+    app.activate_focused();
+    let index_str = index.to_string();
+    let crate::app::Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let row = options.iter().position(|o| o.value.as_deref() == Some(index_str.as_str())).unwrap();
+    app.picker_move(row as isize);
+    app.picker_confirm();
+}
+
+/// Time/title fields prefill their buffer with the current value (like
+/// Metadata's), so replacing it means clearing what's there first --
+/// otherwise the new text is appended onto the old, not substituted.
+fn retype(app: &mut crate::app::App, text: &str) {
+    let crate::app::Mode::TextInput { buffer, .. } = &app.mode else { panic!("expected text input mode") };
+    let len = buffer.chars().count();
+    for _ in 0..len {
+        app.text_input_backspace();
+    }
+    for c in text.chars() {
+        app.text_input_char(c);
+    }
+}
+
+/// 'e' on a focused `ChapterEdit` modifier should open its chapter list
+/// directly (no intermediate picker) -- same one-step pattern as 'e' on a
+/// Metadata or Disposition node.
+#[test]
+fn activate_focused_on_chapter_edit_modifier_opens_chapter_list() {
+    use crate::app::{App, Mode, PickerKind};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit {
+        chapters: vec![Chapter::new(0.0, 65.0, "Intro".to_string())],
+    });
+    focus_modifier(&mut app, modifier);
+
+    app.activate_focused();
+
+    let Mode::Picker { kind, options, .. } = &app.mode else { panic!("expected picker mode") };
+    assert!(matches!(kind, PickerKind::ChapterList { modifier: m } if *m == modifier));
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert!(
+        options[0].display.contains("00:00:00") && options[0].display.contains("00:01:05") && options[0].display.contains("Intro"),
+        "{displays:?}"
+    );
+    assert!(options.iter().any(|o| o.display == "add chapter…"), "{displays:?}");
+    assert!(!options.iter().any(|o| o.display.starts_with("import")), "nothing's connected, so no import entry: {displays:?}");
+}
+
+/// The user explicitly asked that adding a new chapter prefill its start
+/// time with the previous chapter's end time, so a chain of "add
+/// chapter…" -> set end -> "add chapter…" again should carry the end
+/// forward as the next start without the user retyping it.
+#[test]
+fn adding_a_chapter_prefills_start_from_previous_chapters_end() {
+    use crate::app::{App, ChapterTimeField, Mode, PickerKind, TextTarget};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit { chapters: Vec::new() });
+    focus_modifier(&mut app, modifier);
+
+    // First chapter: starts at 0 (no previous chapter).
+    app.activate_focused();
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let add_row = options.iter().position(|o| o.value.as_deref() == Some("add")).unwrap();
+    app.picker_move(add_row as isize);
+    app.picker_confirm();
+
+    let Mode::Picker { kind: PickerKind::ChapterField { modifier: m, index }, .. } = &app.mode else {
+        panic!("expected chapter field picker")
+    };
+    assert_eq!(*index, 0);
+    assert_eq!(chapter_edit_chapters(&app.graph, *m).unwrap()[0].start_secs, 0.0);
+
+    // Set its end time to 90 seconds via the "end" field.
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let end_row = options.iter().position(|o| o.value.as_deref() == Some("end")).unwrap();
+    app.picker_move(end_row as isize);
+    app.picker_confirm();
+    let Mode::TextInput { target, .. } = &app.mode else { panic!("expected time text input") };
+    assert!(matches!(target, TextTarget::ChapterTime { field: ChapterTimeField::End, .. }));
+    retype(&mut app, "1:30");
+    app.confirm_text_input();
+    assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap()[0].end_secs, 90.0);
+
+    // Re-open (no "back" level -- Esc from a picker returns straight to
+    // Normal mode) and add a second chapter.
+    focus_modifier(&mut app, modifier);
+    app.activate_focused();
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let add_row = options.iter().position(|o| o.value.as_deref() == Some("add")).unwrap();
+    app.picker_move(add_row as isize);
+    app.picker_confirm();
+
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert_eq!(chapters.len(), 2);
+    assert_eq!(chapters[1].start_secs, 90.0, "new chapter's start should be prefilled from the previous chapter's end");
+}
+
+/// Both HH:MM:SS and plain-seconds should be accepted when editing a
+/// chapter's start/end, and the stored value should reflect whichever
+/// format was typed.
+#[test]
+fn chapter_time_field_accepts_both_time_formats() {
+    use crate::app::{App, ChapterTimeField, Mode, TextTarget};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit {
+        chapters: vec![Chapter::new(0.0, 0.0, String::new())],
+    });
+
+    open_chapter_field(&mut app, modifier, 0);
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let start_row = options.iter().position(|o| o.value.as_deref() == Some("start")).unwrap();
+    app.picker_move(start_row as isize);
+    app.picker_confirm();
+    let Mode::TextInput { target, .. } = &app.mode else { panic!() };
+    assert!(matches!(target, TextTarget::ChapterTime { field: ChapterTimeField::Start, .. }));
+    retype(&mut app, "5.5");
+    app.confirm_text_input();
+    assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap()[0].start_secs, 5.5);
+
+    open_chapter_field(&mut app, modifier, 0);
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let end_row = options.iter().position(|o| o.value.as_deref() == Some("end")).unwrap();
+    app.picker_move(end_row as isize);
+    app.picker_confirm();
+    retype(&mut app, "00:02:00");
+    app.confirm_text_input();
+    assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap()[0].end_secs, 120.0);
+}
+
+/// An unparsable time should be rejected without modifying the chapter,
+/// and should reopen the same field editor so the user doesn't lose
+/// their place.
+#[test]
+fn chapter_time_field_rejects_unparsable_input_without_modifying() {
+    use crate::app::{App, Mode, PickerKind};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit {
+        chapters: vec![Chapter::new(3.0, 9.0, String::new())],
+    });
+
+    open_chapter_field(&mut app, modifier, 0);
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let start_row = options.iter().position(|o| o.value.as_deref() == Some("start")).unwrap();
+    app.picker_move(start_row as isize);
+    app.picker_confirm();
+    retype(&mut app, "garbage");
+    app.confirm_text_input();
+
+    assert_eq!(
+        chapter_edit_chapters(&app.graph, modifier).unwrap()[0].start_secs,
+        3.0,
+        "unparsable input shouldn't modify the chapter"
+    );
+    assert!(matches!(&app.mode, Mode::Picker { kind: PickerKind::ChapterField { .. }, .. }), "should reopen the field editor");
+}
+
+/// Editing a chapter's title should round-trip through the text input.
+#[test]
+fn chapter_title_field_round_trips() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit {
+        chapters: vec![Chapter::new(0.0, 1.0, String::new())],
+    });
+
+    open_chapter_field(&mut app, modifier, 0);
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let title_row = options.iter().position(|o| o.value.as_deref() == Some("title")).unwrap();
+    app.picker_move(title_row as isize);
+    app.picker_confirm();
+    for c in "The Beginning".chars() {
+        app.text_input_char(c);
+    }
+    app.confirm_text_input();
+
+    assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap()[0].title, "The Beginning");
+}
+
+/// "delete this chapter" should remove it and return to the chapter list.
+#[test]
+fn chapter_field_delete_removes_chapter_and_returns_to_list() {
+    use crate::app::{App, Mode, PickerKind};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit {
+        chapters: vec![
+            Chapter::new(0.0, 1.0, "Keep".to_string()),
+            Chapter::new(1.0, 2.0, "Delete Me".to_string()),
+        ],
+    });
+
+    open_chapter_field(&mut app, modifier, 1);
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let delete_row = options.iter().position(|o| o.value.as_deref() == Some("delete")).unwrap();
+    app.picker_move(delete_row as isize);
+    app.picker_confirm();
+
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert_eq!(chapters.len(), 1);
+    assert_eq!(chapters[0].title, "Keep");
+    assert!(matches!(&app.mode, Mode::Picker { kind: PickerKind::ChapterList { .. }, .. }));
+}
+
+/// Connecting a chapter-kind source into a `ChapterEdit` node's input
+/// should automatically import its chapters -- no separate action needed
+/// -- and merge them alongside whatever the user already added manually,
+/// leaving the manual entry untouched. Connecting a non-chapter (wrong
+/// kind) source shouldn't import anything.
+#[test]
+fn connecting_a_chapter_source_auto_imports_and_merges_with_manual_chapters() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let modifier = app
+        .graph
+        .add_modifier(ModifierKind::ChapterEdit { chapters: vec![Chapter::new(0.0, 1.0, "Manual".to_string())] });
+
+    // Wrong kind: connecting a video stream shouldn't import anything.
+    let video_id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    app.armed = Some(Endpoint::Stream { node: video_id, stream_idx: 0 });
+    focus_modifier(&mut app, modifier);
+    app.toggle_connect();
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert_eq!(chapters.len(), 1, "{chapters:?}");
+    assert!(!chapters[0].imported);
+
+    // Right kind: connecting a chapter stream should auto-import, merging
+    // with the untouched manual entry.
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 2.0, "Imported".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.focus = Focus::Modifier(app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap());
+    app.toggle_connect();
+
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert_eq!(chapters.len(), 2, "{chapters:?}");
+    assert_eq!(chapters[0].title, "Manual");
+    assert!(!chapters[0].imported);
+    assert_eq!(chapters[1].title, "Imported");
+    assert_eq!(chapters[1].end_secs, 2.0);
+    assert!(chapters[1].imported);
+}
+
+/// Disconnecting a `ChapterEdit` node's input (via 'd' on the source
+/// input's stream) should automatically remove exactly the chapters that
+/// were auto-imported from that connection, leaving manually-added
+/// entries -- even ones added after the import -- untouched.
+#[test]
+fn disconnecting_the_source_removes_only_auto_imported_chapters() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit { chapters: Vec::new() });
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 2.0, "Imported".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.focus = Focus::Modifier(app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap());
+    app.toggle_connect();
+    assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap().len(), 1);
+
+    // Add a manual chapter after the import, then disconnect the source.
+    if let Some(chapters) = app.graph.modifier_mut(modifier).map(|m| match &mut m.kind {
+        ModifierKind::ChapterEdit { chapters } => chapters,
+        _ => unreachable!(),
+    }) {
+        chapters.push(Chapter::new(5.0, 6.0, "Manual".to_string()));
+    }
+
+    app.focus = Focus::Input(0);
+    app.row_idx = chapter_idx;
+    app.disconnect_focused();
+
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert_eq!(chapters.len(), 1, "{chapters:?}");
+    assert_eq!(chapters[0].title, "Manual");
+}
+
+/// Reconnecting a `ChapterEdit` node's input to a *different* chapter
+/// source (a modifier's input only ever holds one wire, so wiring a new
+/// source in replaces the old one) should swap out the old auto-imported
+/// set for the new one, without disturbing manually-added entries.
+#[test]
+fn reconnecting_to_a_different_source_replaces_the_auto_imported_set() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let modifier = app
+        .graph
+        .add_modifier(ModifierKind::ChapterEdit { chapters: vec![Chapter::new(0.0, 1.0, "Manual".to_string())] });
+    let a_id =
+        app.graph.add_input("a.ffmeta".to_string(), Vec::new(), vec![Chapter::new(0.0, 1.0, "FromA".to_string())]);
+    let a_idx = app.graph.input(a_id).unwrap().streams.len() - 1;
+    let modifier_focus_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    app.armed = Some(Endpoint::Stream { node: a_id, stream_idx: a_idx });
+    app.focus = Focus::Modifier(modifier_focus_idx);
+    app.toggle_connect();
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert!(chapters.iter().any(|c| c.title == "FromA"), "{chapters:?}");
+
+    let b_id =
+        app.graph.add_input("b.ffmeta".to_string(), Vec::new(), vec![Chapter::new(0.0, 1.0, "FromB".to_string())]);
+    let b_idx = app.graph.input(b_id).unwrap().streams.len() - 1;
+    app.armed = Some(Endpoint::Stream { node: b_id, stream_idx: b_idx });
+    app.focus = Focus::Modifier(modifier_focus_idx);
+    app.toggle_connect();
+
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert!(!chapters.iter().any(|c| c.title == "FromA"), "old import should be gone: {chapters:?}");
+    assert!(chapters.iter().any(|c| c.title == "FromB"), "{chapters:?}");
+    assert!(chapters.iter().any(|c| c.title == "Manual"), "{chapters:?}");
+}
+
+/// Deleting the source input node entirely (not just disconnecting its
+/// stream) should also trigger the same auto-import cleanup.
+#[test]
+fn deleting_the_source_input_node_also_removes_its_imported_chapters() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let modifier = app
+        .graph
+        .add_modifier(ModifierKind::ChapterEdit { chapters: vec![Chapter::new(0.0, 1.0, "Manual".to_string())] });
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 2.0, "Imported".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.focus = Focus::Modifier(app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap());
+    app.toggle_connect();
+    assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap().len(), 2);
+
+    app.focus = Focus::Input(0);
+    app.delete_focused_node();
+
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert_eq!(chapters.len(), 1, "{chapters:?}");
+    assert_eq!(chapters[0].title, "Manual");
+}
+
+/// 'c' to connect an armed chapter-kind endpoint into a focused output
+/// should land it on the chapters slot (`Target::OutputChapters`), not the
+/// regular mapped-stream slot -- a plain video/audio endpoint should still
+/// land on the regular slot as before. Regression guard for the
+/// kind-based dispatch in `toggle_connect`'s `Focus::Output` arm.
+#[test]
+fn toggle_connect_routes_by_endpoint_kind() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+
+    let video_id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    app.armed = Some(Endpoint::Stream { node: video_id, stream_idx: 0 });
+    app.focus = Focus::Output(0);
+    app.toggle_connect();
+    assert_eq!(app.graph.incoming(Target::Output(out)).len(), 1);
+    assert_eq!(app.graph.incoming(Target::OutputChapters(out)).len(), 0);
+
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 1.0, "A".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.toggle_connect();
+    assert_eq!(app.graph.incoming(Target::OutputChapters(out)).len(), 1);
+    assert_eq!(app.graph.incoming(Target::Output(out)).len(), 1, "the earlier video connection should be untouched");
+}
+
+/// An output's row list always has one more row than its mapped-stream
+/// count, for its chapters slot. Disconnecting on that appended row should
+/// only remove the chapters wire, leaving mapped streams untouched.
+#[test]
+fn disconnect_focused_on_the_appended_chapters_row_only_disconnects_chapters() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let video_id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    app.graph.connect(Endpoint::Stream { node: video_id, stream_idx: 0 }, Target::Output(out));
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 1.0, "A".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.graph.connect(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }, Target::OutputChapters(out));
+
+    app.focus = Focus::Output(0);
+    app.row_idx = 1; // the appended chapters row, right after the one mapped stream
+    app.disconnect_focused();
+
+    assert_eq!(app.graph.incoming(Target::OutputChapters(out)).len(), 0);
+    assert_eq!(app.graph.incoming(Target::Output(out)).len(), 1, "the mapped stream should be untouched");
+}
+
+/// The "chapters" entry in the add-node picker should create a
+/// `ChapterEdit` modifier node.
+#[test]
+fn add_node_picker_chapters_entry_creates_chapter_edit_modifier() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.open_add_node_picker();
+    let Mode::Picker { options, .. } = &app.mode else { panic!() };
+    let row = options.iter().position(|o| o.value.as_deref() == Some("chapters")).unwrap();
+    app.picker_move(row as isize);
+    app.picker_confirm();
+
+    assert_eq!(app.graph.modifiers.len(), 1);
+    assert!(matches!(app.graph.modifiers[0].kind, ModifierKind::ChapterEdit { .. }));
+}
+
+
+// ---------------------------------------------------------------------
 // UI rendering
 // ---------------------------------------------------------------------
 
@@ -1364,7 +2151,7 @@ fn ui_renders_extra_args_in_upper_section_not_the_title() {
     use ratatui::Terminal;
 
     let mut app = crate::app::App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     app.graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "1.0")]);
     app.graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000")]);
     app.graph.outputs[0].width = 60; // wide enough that the line isn't truncated, same box-width truncation as long paths already get elsewhere
@@ -1402,7 +2189,7 @@ fn input_and_output_wires_attach_below_their_extra_args_section() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams());
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
     app.graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "1.0"), ("stream_loop", "2")]);
     app.graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000")]);
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
@@ -1429,6 +2216,127 @@ fn input_and_output_wires_attach_below_their_extra_args_section() {
     );
 }
 
+/// An output should always show a chapters row -- "chapters (not
+/// connected)" when nothing's wired in, or a description of whatever is --
+/// as the last row after its mapped streams, and wire attachment math
+/// should still land correctly for both rows when extra_args, a mapped
+/// stream, and a connected chapter source are all present together.
+#[test]
+fn ui_renders_chapters_row_and_wires_still_attach_correctly() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 5.0, "Intro".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.graph.outputs[0].extra_args = filter_fields(&[("max_interleave_delta", "5000000")]);
+    app.graph.outputs[0].width = 60; // wide enough that the extra_args line isn't truncated
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    app.graph.connect(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }, Target::OutputChapters(out));
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(screen.contains("-max_interleave_delta 5000000"), "expected the output's extra_args:\n{screen}");
+    assert!(screen.contains("chapters <-"), "expected a chapters row describing the connected source:\n{screen}");
+
+    let dst_line = screen.lines().find(|l| l.contains("v:0 h264") && l.contains("<-")).expect("mapped row present");
+    assert!(
+        dst_line.contains("─│v:0"),
+        "wire into the output should land on the mapped row itself, not drift because of the chapters row:\n{dst_line}"
+    );
+
+    let chapters_line = screen.lines().find(|l| l.contains("chapters <-")).expect("chapters row present");
+    assert!(
+        chapters_line.contains("─│chapters"),
+        "wire into the output's chapters slot should land on the chapters row itself:\n{chapters_line}"
+    );
+}
+
+/// Regression test: when an output has *only* a chapter stream connected
+/// (no mapped video/audio at all), the mapped section still occupies one
+/// visual row -- the "(nothing mapped)" placeholder -- so the chapters
+/// row sits right below *that*, not at the very top of the box. The wire
+/// into the chapters slot has to land on the same row, not one row above
+/// it.
+#[test]
+fn ui_wire_lands_on_chapters_row_when_output_has_no_mapped_streams() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 5.0, "Intro".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.graph.connect(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }, Target::OutputChapters(out));
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let chapters_line = screen.lines().find(|l| l.contains("chapters <-")).expect("chapters row present");
+    assert!(
+        chapters_line.contains("─│chapters"),
+        "the wire should land on the chapters row itself, not the placeholder row above it:\n{chapters_line}"
+    );
+    // The placeholder row is on the same terminal line as the *source*
+    // input box's own outgoing-wire mark (an unrelated departure, not an
+    // arrival) -- so check specifically for the wire arriving right at the
+    // output box's own left border, immediately before its text, rather
+    // than searching the whole line.
+    let placeholder_line = screen.lines().find(|l| l.contains("(nothing mapped")).expect("placeholder row present");
+    let before_placeholder = &placeholder_line[..placeholder_line.find("(nothing mapped").unwrap()];
+    assert!(
+        !before_placeholder.ends_with("─│"),
+        "the wire shouldn't land on the placeholder row:\n{placeholder_line}"
+    );
+}
+
+/// With nothing wired into it, an output's chapters row should be absent
+/// entirely -- same as an output doesn't get a placeholder row for an
+/// unmapped video/audio stream; a chapter stream isn't special.
+#[test]
+fn ui_omits_the_chapters_row_entirely_when_unconnected() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let app = App::new();
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(!screen.contains("chapters"), "{screen}");
+}
+
 /// A modifier node should render its incoming source summary and its
 /// outgoing connection(s), and a wire leaving a non-Copy Convert node
 /// should carry that codec as a badge.
@@ -1440,7 +2348,7 @@ fn ui_renders_modifier_node_and_codec_badge_on_its_outgoing_wire() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let id = app.graph.add_input("video_a.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("video_a.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     app.graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
@@ -1473,7 +2381,7 @@ fn edge_line_reaches_output_node_not_canvas_origin() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
 
     let backend = TestBackend::new(140, 40);
@@ -1522,9 +2430,9 @@ fn wires_are_colored_by_resolved_stream_kind() {
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
     let mk = |kind: StreamKind| vec![StreamInfo { index: 0, kind, codec: "c".to_string(), lang: None }];
-    let v = app.graph.add_input("v.mp4".to_string(), mk(StreamKind::Video));
-    let a = app.graph.add_input("a.m4a".to_string(), mk(StreamKind::Audio));
-    let s = app.graph.add_input("s.srt".to_string(), mk(StreamKind::Subtitle));
+    let v = app.graph.add_input("v.mp4".to_string(), mk(StreamKind::Video), Vec::new());
+    let a = app.graph.add_input("a.m4a".to_string(), mk(StreamKind::Audio), Vec::new());
+    let s = app.graph.add_input("s.srt".to_string(), mk(StreamKind::Subtitle), Vec::new());
     app.graph.connect(Endpoint::Stream { node: v, stream_idx: 0 }, Target::Output(out));
     app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::Output(out));
     app.graph.connect(Endpoint::Stream { node: s, stream_idx: 0 }, Target::Output(out));
@@ -1602,7 +2510,7 @@ fn run_ok(cmd: &mut Command) {
 }
 
 fn run_graph_and_wait(graph: &Graph) -> Option<String> {
-    let args = graph.build_ffmpeg_args();
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let (tx, rx) = mpsc::channel();
     ffmpeg::run_args(args, tx);
     let mut done_code = None;
@@ -1654,9 +2562,9 @@ fn combines_video_audio_and_subtitle_from_three_files() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id_v = graph.add_input(video_path.to_str().unwrap().to_string(), ffmpeg::probe(video_path.to_str().unwrap()).unwrap());
-    let id_a = graph.add_input(audio_path.to_str().unwrap().to_string(), ffmpeg::probe(audio_path.to_str().unwrap()).unwrap());
-    let id_s = graph.add_input(sub_path.to_str().unwrap().to_string(), ffmpeg::probe(sub_path.to_str().unwrap()).unwrap());
+    let id_v = graph.add_input(video_path.to_str().unwrap().to_string(), ffmpeg::probe(video_path.to_str().unwrap()).unwrap().streams, Vec::new());
+    let id_a = graph.add_input(audio_path.to_str().unwrap().to_string(), ffmpeg::probe(audio_path.to_str().unwrap()).unwrap().streams, Vec::new());
+    let id_s = graph.add_input(sub_path.to_str().unwrap().to_string(), ffmpeg::probe(sub_path.to_str().unwrap()).unwrap().streams, Vec::new());
 
     graph.connect(Endpoint::Stream { node: id_v, stream_idx: 0 }, Target::Output(out));
     graph.connect(Endpoint::Stream { node: id_a, stream_idx: 0 }, Target::Output(out));
@@ -1665,7 +2573,7 @@ fn combines_video_audio_and_subtitle_from_three_files() {
 
     assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
 
-    let out_streams = ffmpeg::probe(out_path.to_str().unwrap()).unwrap();
+    let out_streams = ffmpeg::probe(out_path.to_str().unwrap()).unwrap().streams;
     assert_eq!(out_streams.len(), 3, "expected exactly 3 muxed streams");
     assert!(out_streams.iter().any(|s| s.kind == StreamKind::Video));
     assert!(out_streams.iter().any(|s| s.kind == StreamKind::Audio));
@@ -1692,9 +2600,9 @@ fn convert_modifier_reencodes_a_stream_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let source_streams = ffmpeg::probe(audio_path.to_str().unwrap()).unwrap();
+    let source_streams = ffmpeg::probe(audio_path.to_str().unwrap()).unwrap().streams;
     assert_eq!(source_streams[0].codec, "aac", "test fixture should start as aac");
-    let id = graph.add_input(audio_path.to_str().unwrap().to_string(), source_streams);
+    let id = graph.add_input(audio_path.to_str().unwrap().to_string(), source_streams, Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Convert(Codec::Encode("flac".to_string())));
 
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
@@ -1703,7 +2611,7 @@ fn convert_modifier_reencodes_a_stream_end_to_end() {
 
     assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
 
-    let out_streams = ffmpeg::probe(out_path.to_str().unwrap()).unwrap();
+    let out_streams = ffmpeg::probe(out_path.to_str().unwrap()).unwrap().streams;
     assert_eq!(out_streams.len(), 1);
     assert_eq!(out_streams[0].codec, "flac", "expected the output to be re-encoded to flac");
 
@@ -1728,7 +2636,7 @@ fn metadata_modifier_applies_language_and_title_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input(audio_path.to_str().unwrap().to_string(), ffmpeg::probe(audio_path.to_str().unwrap()).unwrap());
+    let id = graph.add_input(audio_path.to_str().unwrap().to_string(), ffmpeg::probe(audio_path.to_str().unwrap()).unwrap().streams, Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Metadata {
         fields: metadata_fields(&[("language", "eng"), ("title", "Commentary"), ("handler_name", "Custom Handler")]),
     });
@@ -1782,10 +2690,10 @@ fn disposition_modifier_sets_flags_on_the_right_stream_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
     let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
 
     // Video mapped first (stream 0 in the output) with no Disposition
     // modifier, audio mapped second (stream 1) with "forced" set on it --
@@ -1835,9 +2743,9 @@ fn filter_shift_video_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     let modifier =
         graph.add_modifier(ModifierKind::Filter { name: FilterName::Shift, fields: filter_fields(&[("seconds", "1")]) });
     graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
@@ -1870,9 +2778,9 @@ fn filter_shift_audio_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     let modifier =
         graph.add_modifier(ModifierKind::Filter { name: FilterName::Shift, fields: filter_fields(&[("seconds", "1")]) });
     graph.connect(Endpoint::Stream { node: id, stream_idx: audio_idx }, Target::ModifierIn(modifier));
@@ -1904,9 +2812,9 @@ fn filter_volume_reduces_loudness_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     let modifier =
         graph.add_modifier(ModifierKind::Filter { name: FilterName::Volume, fields: filter_fields(&[("factor", "0.1")]) });
     graph.connect(Endpoint::Stream { node: id, stream_idx: audio_idx }, Target::ModifierIn(modifier));
@@ -1946,9 +2854,9 @@ fn filter_scale_resizes_video_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     let modifier =
         graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: filter_fields(&[("width", "80")]) });
     graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
@@ -1979,9 +2887,9 @@ fn filter_crop_crops_video_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Filter {
         name: FilterName::Crop,
         fields: filter_fields(&[("width", "50"), ("height", "40")]),
@@ -2015,9 +2923,9 @@ fn filter_fade_starts_black_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Filter {
         name: FilterName::Fade,
         fields: filter_fields(&[("type", "in"), ("start", "0"), ("duration", "1")]),
@@ -2054,9 +2962,9 @@ fn filter_rotate_swaps_dimensions_end_to_end() {
         let out_path = dir.join(format!("out-{direction}.mkv"));
         let mut graph = Graph::new();
         let out = graph.outputs[0].id;
-        let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+        let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
         let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
-        let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+        let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
         let modifier = graph.add_modifier(ModifierKind::Filter {
             name: FilterName::Rotate,
             fields: filter_fields(&[("direction", direction)]),
@@ -2094,9 +3002,9 @@ fn filter_chain_of_two_modifiers_applies_both_in_order_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
 
     let scale = graph.add_modifier(ModifierKind::Filter {
         name: FilterName::Scale,
@@ -2143,8 +3051,8 @@ fn output_extra_args_apply_a_real_global_metadata_flag_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
     graph.outputs[0].extra_args = filter_fields(&[("metadata", "comment=hello_from_tff")]);
     graph.outputs[0].path = out_path.to_str().unwrap().to_string();
@@ -2184,7 +3092,7 @@ fn chained_convert_and_metadata_apply_both_end_to_end() {
 
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
-    let id = graph.add_input(audio_path.to_str().unwrap().to_string(), ffmpeg::probe(audio_path.to_str().unwrap()).unwrap());
+    let id = graph.add_input(audio_path.to_str().unwrap().to_string(), ffmpeg::probe(audio_path.to_str().unwrap()).unwrap().streams, Vec::new());
     let convert = graph.add_modifier(ModifierKind::Convert(Codec::Encode("flac".to_string())));
     let metadata = graph.add_modifier(ModifierKind::Metadata { fields: metadata_fields(&[("language", "deu")]) });
 
@@ -2196,7 +3104,7 @@ fn chained_convert_and_metadata_apply_both_end_to_end() {
 
     assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
 
-    let out_streams = ffmpeg::probe(out_path.to_str().unwrap()).unwrap();
+    let out_streams = ffmpeg::probe(out_path.to_str().unwrap()).unwrap().streams;
     assert_eq!(out_streams[0].codec, "flac", "expected the convert stage to apply");
 
     let probe = Command::new("ffprobe")
@@ -2231,10 +3139,10 @@ fn two_outputs_produce_two_separate_files_in_one_ffmpeg_run() {
     let mut graph = Graph::new();
     let out1 = graph.outputs[0].id;
     let out2 = graph.add_output();
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
     let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
     let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
 
     graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::Output(out1));
     graph.connect(Endpoint::Stream { node: id, stream_idx: audio_idx }, Target::Output(out2));
@@ -2243,11 +3151,11 @@ fn two_outputs_produce_two_separate_files_in_one_ffmpeg_run() {
 
     assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
 
-    let video_streams = ffmpeg::probe(video_out.to_str().unwrap()).unwrap();
+    let video_streams = ffmpeg::probe(video_out.to_str().unwrap()).unwrap().streams;
     assert_eq!(video_streams.len(), 1);
     assert_eq!(video_streams[0].kind, StreamKind::Video);
 
-    let audio_streams = ffmpeg::probe(audio_out.to_str().unwrap()).unwrap();
+    let audio_streams = ffmpeg::probe(audio_out.to_str().unwrap()).unwrap().streams;
     assert_eq!(audio_streams.len(), 1);
     assert_eq!(audio_streams[0].kind, StreamKind::Audio);
 
@@ -2278,17 +3186,17 @@ fn preview_args_cap_duration_and_write_to_the_given_path() {
     let mut graph = Graph::new();
     let out = graph.outputs[0].id;
     let unconnected_out = graph.add_output();
-    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap();
-    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams);
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
     let modifier = graph.add_modifier(ModifierKind::Metadata { fields: metadata_fields(&[("language", "eng")]) });
     graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
     graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
 
     // An output with nothing mapped to it has nothing resolvable to
     // preview, same as it has nothing to render for real.
-    assert!(graph.build_preview_args(unconnected_out, preview_path.to_str().unwrap(), 2).is_none());
+    assert!(graph.build_preview_args(unconnected_out, preview_path.to_str().unwrap(), 2, &BTreeMap::new()).is_none());
 
-    let args = graph.build_preview_args(out, preview_path.to_str().unwrap(), 2).expect("resolvable");
+    let args = graph.build_preview_args(out, preview_path.to_str().unwrap(), 2, &BTreeMap::new()).expect("resolvable");
     run_ok(Command::new("ffmpeg").args(&args));
 
     assert!(!dir.join(&graph.outputs[0].path).exists(), "preview must not touch the output's own configured path");
@@ -2305,7 +3213,7 @@ fn preview_args_cap_duration_and_write_to_the_given_path() {
         .unwrap();
     assert!(duration <= 3.0, "expected the preview capped near 2s, got {duration}");
 
-    let tags = ffmpeg::probe(preview_path.to_str().unwrap()).unwrap();
+    let tags = ffmpeg::probe(preview_path.to_str().unwrap()).unwrap().streams;
     assert_eq!(tags[0].lang.as_deref(), Some("eng"), "modifier chain's metadata should still apply to the preview");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -2589,7 +3497,7 @@ fn ui_renders_filter_field_picker_and_node_parameter_list() {
     use ratatui::Terminal;
 
     let mut app = App::new();
-    let id = app.graph.add_input("in.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Filter {
         name: FilterName::Scale,
         fields: filter_fields(&[("width", "1280")]),
@@ -2628,7 +3536,7 @@ fn metadata_node_wires_attach_below_its_field_section_not_at_a_fixed_row() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let id = app.graph.add_input("video_a.mp4".to_string(), video_stream());
+    let id = app.graph.add_input("video_a.mp4".to_string(), video_stream(), Vec::new());
     let modifier = app.graph.add_modifier(ModifierKind::Metadata {
         fields: metadata_fields(&[("language", "eng"), ("title", "Commentary"), ("handler_name", "H")]),
     });

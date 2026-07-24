@@ -62,6 +62,11 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                 crate::app::TextTarget::ModifierFilterValue { key, .. } => format!("{key}: "),
                 crate::app::TextTarget::ExtraArgValue { key, .. } => format!("{key}: "),
                 crate::app::TextTarget::ExtraArgCustomKey(_) => "custom extra-arg key: ".to_string(),
+                crate::app::TextTarget::ChapterTime { field, .. } => match field {
+                    crate::app::ChapterTimeField::Start => "start (HH:MM:SS or seconds): ".to_string(),
+                    crate::app::ChapterTimeField::End => "end (HH:MM:SS or seconds): ".to_string(),
+                },
+                crate::app::TextTarget::ChapterTitle { .. } => "chapter title: ".to_string(),
             };
             TextLine::from(vec![
                 Span::styled(prompt, Style::default().fg(Color::Yellow)),
@@ -102,20 +107,32 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
 
 /// An input/output node's box gets the same two-part body a Metadata/
 /// Filter/Disposition modifier has: an upper section listing its extra
-/// ffmpeg args (if any), a divider, then its usual content (streams for an
-/// input, mapped connections for an output). Unlike those modifier kinds,
-/// the upper section is entirely absent (not even a placeholder row) when
-/// there's nothing to show -- extra_args is a rare, advanced add-on here,
-/// not the node's whole reason for existing, so it shouldn't add a blank
-/// line to every ordinary input/output node the way it does for e.g. an
-/// empty Metadata node (where showing "(no metadata set)" makes sense
-/// because setting metadata *is* that node's entire purpose).
+/// ffmpeg args, if any, a divider, then its usual content (streams for an
+/// input, mapped connections plus a chapters row for an output). Unlike
+/// those modifier kinds, the upper section is entirely absent (not even a
+/// placeholder row) when there's nothing to show -- extra_args is a rare,
+/// advanced add-on here, not the node's whole reason for existing, so it
+/// shouldn't add a blank line to every ordinary input/output node the way
+/// it does for e.g. an empty Metadata node (where showing "(no metadata
+/// set)" makes sense because setting metadata *is* that node's entire
+/// purpose).
 fn extra_args_field_rows(extra_args: &std::collections::BTreeMap<String, String>) -> u16 {
     if extra_args.is_empty() { 0 } else { extra_args.len() as u16 + 1 } // + divider
 }
 
-fn node_rows(n_streams: usize, extra_args: &std::collections::BTreeMap<String, String>) -> u16 {
-    2 + extra_args_field_rows(extra_args) + n_streams.max(1) as u16
+fn node_rows(n_streams: usize, upper_section_rows: u16) -> u16 {
+    2 + upper_section_rows + n_streams.max(1) as u16
+}
+
+/// An output's body rows: one per mapped stream (its `incoming` list), plus
+/// one more for its chapters slot -- but only when something's actually
+/// connected there, same as video/audio streams don't get a placeholder
+/// row when unmapped. See `App::cycle_row`'s Output arm, which this
+/// mirrors.
+fn output_body_rows(incoming_count: usize, has_chapters: bool) -> usize {
+    // At least one row for the mapped streams (even with none connected,
+    // that's a "(nothing mapped)" placeholder row -- see `draw_output_node`).
+    incoming_count.max(1) + usize::from(has_chapters)
 }
 
 /// A Metadata modifier's box has an upper section (one row per field it
@@ -128,6 +145,7 @@ fn modifier_field_rows(kind: &ModifierKind) -> u16 {
         ModifierKind::Metadata { fields } => fields.len().max(1) as u16 + 1, // + divider
         ModifierKind::Disposition { flags } => flags.len().max(1) as u16 + 1, // + divider
         ModifierKind::Filter { fields, .. } => fields.len().max(1) as u16 + 1, // + divider
+        ModifierKind::ChapterEdit { chapters } => chapters.len().max(1) as u16 + 1, // + divider
     }
 }
 
@@ -178,7 +196,7 @@ fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
 fn compute_rects(app: &App, area: Rect) -> Vec<(NodeId, Rect)> {
     let mut rects = Vec::new();
     for input in &app.graph.inputs {
-        let rows = node_rows(input.streams.len(), &input.extra_args);
+        let rows = node_rows(input.streams.len(), extra_args_field_rows(&input.extra_args));
         if let Some(r) = node_rect(area, input.pos, input.width, rows) {
             rects.push((input.id, r));
         }
@@ -190,7 +208,9 @@ fn compute_rects(app: &App, area: Rect) -> Vec<(NodeId, Rect)> {
         }
     }
     for output in &app.graph.outputs {
-        let rows = node_rows(app.graph.incoming(Target::Output(output.id)).len(), &output.extra_args);
+        let has_chapters = !app.graph.incoming(Target::OutputChapters(output.id)).is_empty();
+        let body_rows = output_body_rows(app.graph.incoming(Target::Output(output.id)).len(), has_chapters);
+        let rows = node_rows(body_rows, extra_args_field_rows(&output.extra_args));
         if let Some(r) = node_rect(area, output.pos, output.width, rows) {
             rects.push((output.id, r));
         }
@@ -203,6 +223,9 @@ fn rect_for(rects: &[(NodeId, Rect)], id: NodeId) -> Option<Rect> {
 }
 
 fn wire_color(graph: &Graph, from: Endpoint) -> Color {
+    if graph.resolve_chapters(from).is_some() {
+        return kind_color(StreamKind::Chapter);
+    }
     graph
         .resolve(from)
         .and_then(|r| graph.input(r.from_node).and_then(|inp| inp.streams.get(r.from_stream_idx)).map(|s| s.kind))
@@ -242,6 +265,7 @@ fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
         let dst_id = match wire.to {
             Target::ModifierIn(id) => id,
             Target::Output(id) => id,
+            Target::OutputChapters(id) => id,
         };
         let Some(dst_rect) = rect_for(&rects, dst_id) else { continue };
         let (dst_row_offset, dst_row) = match wire.to {
@@ -253,6 +277,17 @@ fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
                 let row = app.graph.incoming(wire.to).iter().position(|&wi| wi == wire_idx).unwrap_or(0);
                 let offset = app.graph.output(id).map(|n| 1 + extra_args_field_rows(&n.extra_args)).unwrap_or(1);
                 (offset, row as u16) // mapped rows sit below the extra-args section, if any
+            }
+            Target::OutputChapters(id) => {
+                // Always the last row, right after every mapped-stream row
+                // -- but the mapped section itself is never less than one
+                // visual row (a "(nothing mapped)" placeholder takes that
+                // row when there are no real wires), so this has to match
+                // that floor too, not just the raw wire count (see
+                // `output_body_rows`).
+                let row = app.graph.incoming(Target::Output(id)).len().max(1);
+                let offset = app.graph.output(id).map(|n| 1 + extra_args_field_rows(&n.extra_args)).unwrap_or(1);
+                (offset, row as u16)
             }
         };
         let dst = Position::new(dst_rect.x.saturating_sub(1), dst_rect.y + dst_row_offset + dst_row);
@@ -390,7 +425,7 @@ fn draw_input_node(
     row_idx: usize,
     armed: Option<Endpoint>,
 ) {
-    let rows = node_rows(node.streams.len(), &node.extra_args);
+    let rows = node_rows(node.streams.len(), extra_args_field_rows(&node.extra_args));
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
@@ -494,6 +529,22 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
             lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
         }
         ModifierKind::Convert(_) => {}
+        ModifierKind::ChapterEdit { chapters } => {
+            if chapters.is_empty() {
+                lines.push(TextLine::styled("(no chapters set)", Style::default().fg(Color::DarkGray)));
+            } else {
+                for c in chapters {
+                    let label = if c.title.is_empty() { "(untitled)" } else { &c.title };
+                    lines.push(TextLine::from(format!(
+                        "{}–{}  {label}",
+                        crate::graph::format_time(c.start_secs),
+                        crate::graph::format_time(c.end_secs)
+                    )));
+                }
+            }
+            let divider_width = rect.width.saturating_sub(2) as usize;
+            lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
+        }
     }
 
     let incoming_wire = app.graph.wires.iter().find(|w| w.to == Target::ModifierIn(node.id));
@@ -529,6 +580,10 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
                 Some(oi) => format!("→ OUTPUT {}: {}", oi + 1, app.graph.outputs[oi].path),
                 None => "→ (?)".to_string(),
             },
+            Target::OutputChapters(id) => match app.graph.outputs.iter().position(|o| o.id == id) {
+                Some(oi) => format!("→ OUTPUT {} chapters", oi + 1),
+                None => "→ (?)".to_string(),
+            },
         };
         let mut style = Style::default();
         if focused && row == app.row_idx {
@@ -551,7 +606,9 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
 
 fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &OutputNode) {
     let incoming = app.graph.incoming(Target::Output(node.id));
-    let rows = node_rows(incoming.len(), &node.extra_args);
+    let chapter_wires = app.graph.incoming(Target::OutputChapters(node.id));
+    let rows =
+        node_rows(output_body_rows(incoming.len(), !chapter_wires.is_empty()), extra_args_field_rows(&node.extra_args));
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
@@ -607,6 +664,23 @@ fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usiz
         lines.push(TextLine::styled(label, style));
     }
 
+    // The chapters slot only gets a row when something's actually
+    // connected to it -- same as an unmapped video/audio stream doesn't
+    // get a placeholder row of its own. When shown, it's always the last
+    // row, right after the mapped streams (see `output_body_rows`/
+    // `App::cycle_row`'s Output arm).
+    if let Some(&wi) = chapter_wires.first() {
+        let chapters_label = match describe_endpoint(&app.graph, app.graph.wires[wi].from) {
+            Some(desc) => format!("chapters <- {desc}"),
+            None => "chapters <- (?)".to_string(),
+        };
+        let mut chapters_style = Style::default().fg(Color::DarkGray);
+        if focused && app.row_idx == incoming.len() {
+            chapters_style = chapters_style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(TextLine::styled(chapters_label, chapters_style));
+    }
+
     let container_tag = match &node.container {
         Some(name) => format!(" [{name}]"),
         None => String::new(),
@@ -628,6 +702,7 @@ fn kind_color(kind: StreamKind) -> Color {
         StreamKind::Video => Color::LightBlue,
         StreamKind::Audio => Color::LightGreen,
         StreamKind::Subtitle => Color::LightMagenta,
+        StreamKind::Chapter => Color::LightYellow,
         StreamKind::Other => Color::Gray,
     }
 }
