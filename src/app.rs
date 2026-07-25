@@ -208,9 +208,23 @@ pub struct App {
     /// connections when an output is focused.
     pub row_idx: usize,
     pub mode: Mode,
-    /// A source endpoint the user has armed, waiting to be wired into
-    /// whichever modifier or output node gets focused next.
-    pub armed: Option<Endpoint>,
+    /// Source endpoints the user has armed, waiting to be wired into
+    /// whichever modifier or output node gets focused next -- 'c' on that
+    /// next node connects every one of them in a single action. A
+    /// modifier's input only ever holds one wire, so connecting rejects
+    /// this if it holds more than one entry; an output has no such limit.
+    pub armed: BTreeSet<Endpoint>,
+    /// Ports explicitly picked (via Space or Shift+Up/Down) but not yet
+    /// armed -- a staging area so several can be gathered, from one input
+    /// node or several, before committing them to `armed` in one 'c'
+    /// press. See `toggle_port_selection`/`extend_port_selection`.
+    pub selected: BTreeSet<Endpoint>,
+    /// The row Shift+Up/Down range-selection started extending from, so
+    /// repeated presses grow/shrink a contiguous range instead of just
+    /// toggling one row at a time. Only meaningful for the input node it
+    /// was set on; reset by anything that isn't itself a Shift+Up/Down
+    /// press (see `extend_port_selection`'s doc comment).
+    selection_anchor: Option<usize>,
     pub log: Vec<String>,
     pub status: String,
     pub running: bool,
@@ -249,7 +263,9 @@ impl App {
             focus: Focus::Output(0),
             row_idx: 0,
             mode: Mode::Normal,
-            armed: None,
+            armed: BTreeSet::new(),
+            selected: BTreeSet::new(),
+            selection_anchor: None,
             log,
             status: String::new(),
             running: false,
@@ -287,6 +303,7 @@ impl App {
             )
         };
         self.row_idx = 0;
+        self.selection_anchor = None; // a fresh Shift+range on the new node should start from here, not carry over
     }
 
     pub fn cycle_focus(&mut self, forward: bool) {
@@ -326,6 +343,54 @@ impl App {
         } else {
             (self.row_idx + len - 1) % len
         };
+        self.selection_anchor = None; // plain navigation ends any in-progress Shift+range
+    }
+
+    /// Space: toggle the currently-hovered stream's membership in the
+    /// pending selection -- only meaningful on an input node, since that's
+    /// the only place multiple distinct ports genuinely exist to choose
+    /// among (a modifier has exactly one output port already toggled
+    /// directly by 'c', see `toggle_connect`). Building up a selection
+    /// this way lets several ports -- even across different input nodes --
+    /// be armed together in one 'c' press instead of one at a time.
+    pub fn toggle_port_selection(&mut self) {
+        let Focus::Input(i) = self.focus else { return };
+        let Some(node) = self.graph.inputs.get(i) else { return };
+        if node.streams.get(self.row_idx).is_none() {
+            return;
+        }
+        let ep = Endpoint::Stream { node: node.id, stream_idx: self.row_idx };
+        self.selection_anchor = None; // an explicit single toggle isn't part of a range
+        if !self.selected.insert(ep) {
+            self.selected.remove(&ep);
+        }
+    }
+
+    /// Shift+Up/Down: extend the pending selection as a contiguous range
+    /// from wherever it started to the row now under the cursor -- the
+    /// same anchor-then-extend model a text editor uses for shift-click
+    /// range selection. Recomputes the range from the anchor on every
+    /// press (rather than incrementally toggling) so shrinking it back
+    /// (Shift+Down then Shift+Up) correctly un-selects rows outside the
+    /// new range instead of leaving stale selections behind; only this
+    /// node's own rows are touched, so a range already picked on a
+    /// different input node is left alone.
+    pub fn extend_port_selection(&mut self, forward: bool) {
+        let Focus::Input(i) = self.focus else { return };
+        let Some(node) = self.graph.inputs.get(i) else { return };
+        let len = node.streams.len();
+        if len == 0 {
+            return;
+        }
+        let node_id = node.id;
+        let anchor = *self.selection_anchor.get_or_insert(self.row_idx);
+        self.row_idx = if forward { (self.row_idx + 1).min(len - 1) } else { self.row_idx.saturating_sub(1) };
+
+        let (lo, hi) = if anchor <= self.row_idx { (anchor, self.row_idx) } else { (self.row_idx, anchor) };
+        self.selected.retain(|ep| !matches!(ep, Endpoint::Stream { node, .. } if *node == node_id));
+        for idx in lo..=hi {
+            self.selected.insert(Endpoint::Stream { node: node_id, stream_idx: idx });
+        }
     }
 
     pub fn move_focused_node(&mut self, dx: f64, dy: f64) {
@@ -860,16 +925,28 @@ impl App {
         }
     }
 
-    /// 'c': arm the focused input stream or modifier output, or -- when
-    /// something is armed and a modifier/output node is focused --
-    /// wire it in. Pressing 'c' again on the exact thing that's currently
-    /// armed disarms it.
+    /// 'c': on an input, arm the whole pending selection at once if
+    /// there's one (see `toggle_port_selection`/`extend_port_selection`),
+    /// else just toggle the single hovered stream in or out of `armed`
+    /// (the original, low-friction one-at-a-time behavior). On a
+    /// modifier, arm/disarm its own single output, or -- if something
+    /// else is armed -- wire it in (rejecting more than one, since a
+    /// modifier's input only ever holds one wire). On an output, connect
+    /// every currently-armed source in one action.
     pub fn toggle_connect(&mut self) {
         match self.focus {
             Focus::Input(i) => {
                 let Some(node) = self.graph.inputs.get(i) else {
                     return;
                 };
+                if !self.selected.is_empty() {
+                    let n = self.selected.len();
+                    self.armed.append(&mut self.selected);
+                    self.log.push(format!(
+                        "armed {n} port(s) — focus a modifier or output, press 'c' to connect"
+                    ));
+                    return;
+                }
                 let Some(stream) = node.streams.get(self.row_idx) else {
                     return;
                 };
@@ -877,76 +954,102 @@ impl App {
                     node: node.id,
                     stream_idx: self.row_idx,
                 };
-                if self.armed == Some(ep) {
-                    self.armed = None; // disarm
+                if !self.armed.insert(ep) {
+                    self.armed.remove(&ep); // was already armed -- toggle off
                 } else {
                     self.log.push(format!(
                         "armed {} from {} — focus a modifier or output, press 'c' to connect",
                         stream.label(),
                         node.path
                     ));
-                    self.armed = Some(ep);
                 }
             }
             Focus::Modifier(i) => {
                 let Some(m) = self.graph.modifiers.get(i) else {
                     return;
                 };
-                let this_output = Endpoint::ModifierOut(m.id);
-                match self.armed {
-                    Some(source) if source == this_output => {
-                        self.armed = None; // disarm
-                    }
-                    Some(source) => {
-                        let mid = m.id;
-                        self.graph.connect(source, Target::ModifierIn(mid));
-                        sync_chapter_edit_import(&mut self.graph, mid);
-                        self.armed = None;
-                        self.log.push("connected".to_string());
-                    }
-                    None => {
-                        self.armed = Some(this_output);
-                        self.log.push(
-                            "armed this node's output — focus the next node, press 'c' to connect"
-                                .to_string(),
-                        );
-                    }
+                let mid = m.id;
+                let this_output = Endpoint::ModifierOut(mid);
+                if self.armed.is_empty() {
+                    self.armed.insert(this_output);
+                    self.log.push(
+                        "armed this node's output — focus the next node, press 'c' to connect"
+                            .to_string(),
+                    );
+                } else if self.armed.len() == 1 && self.armed.contains(&this_output) {
+                    self.armed.remove(&this_output); // disarm
+                } else if self.armed.len() > 1 {
+                    self.log.push(format!(
+                        "can't connect {} streams to a modifier -- it only accepts one",
+                        self.armed.len()
+                    ));
+                } else {
+                    let source = *self.armed.iter().next().expect("checked non-empty above");
+                    self.graph.connect(source, Target::ModifierIn(mid));
+                    sync_chapter_edit_import(&mut self.graph, mid);
+                    self.armed.clear();
+                    self.log.push("connected".to_string());
                 }
             }
             Focus::Output(i) => {
-                let Some(output) = self.graph.outputs.get(i) else {
+                let Some(output_id) = self.graph.outputs.get(i).map(|o| o.id) else {
                     return;
                 };
-                match self.armed.take() {
-                    Some(source) => {
-                        let target = if self.endpoint_stream_kind(source) == Some(StreamKind::Chapter) {
-                            Target::OutputChapters(output.id)
-                        } else {
-                            Target::Output(output.id)
-                        };
-                        self.graph.connect(source, target);
-                        self.log.push("connected to output".to_string());
-                    }
-                    None => {
-                        self.log.push(
-                            "nothing armed -- arm a stream or modifier output first ('c')"
-                                .to_string(),
-                        );
-                    }
+                if self.armed.is_empty() {
+                    self.log.push(
+                        "nothing armed -- arm a stream or modifier output first ('c')".to_string(),
+                    );
+                    return;
                 }
+                let n = self.armed.len();
+                for source in std::mem::take(&mut self.armed) {
+                    let target = if self.endpoint_stream_kind(source) == Some(StreamKind::Chapter) {
+                        Target::OutputChapters(output_id)
+                    } else {
+                        Target::Output(output_id)
+                    };
+                    self.graph.connect(source, target);
+                }
+                self.log.push(if n == 1 {
+                    "connected to output".to_string()
+                } else {
+                    format!("connected {n} ports to output")
+                });
             }
         }
     }
 
-    /// 'd': on an input port, disconnect it from everything downstream; on
-    /// a modifier, disconnect just the selected outgoing connection; on an
-    /// output, disconnect just the selected incoming connection.
+    /// 'd': on an input port, disconnect it from everything downstream --
+    /// or, with a pending selection (see `toggle_port_selection`/
+    /// `extend_port_selection`), disconnect *every* selected port from
+    /// everything downstream in one action, the same way 'c' arms them all
+    /// at once, and regardless of which input node is currently focused
+    /// (the selection is global, same as `armed`). On a modifier,
+    /// disconnect just the selected outgoing connection; on an output,
+    /// disconnect just the selected incoming connection.
     pub fn disconnect_focused(&mut self) {
         match self.focus {
             Focus::Input(i) => {
                 let Some(node) = self.graph.inputs.get(i) else {
                     return;
                 };
+                if !self.selected.is_empty() {
+                    let ports = std::mem::take(&mut self.selected);
+                    let n = ports.len();
+                    let affected = chapter_edit_modifiers_fed_by(&self.graph, |w| ports.contains(&w.from));
+                    let before = self.graph.wires.len();
+                    self.graph.wires.retain(|w| !ports.contains(&w.from));
+                    let removed = before != self.graph.wires.len();
+                    self.log.push(if removed {
+                        format!("disconnected {n} port(s) from everything downstream")
+                    } else {
+                        format!("{n} port(s) had nothing connected")
+                    });
+                    for mid in affected {
+                        sync_chapter_edit_import(&mut self.graph, mid);
+                    }
+                    return;
+                }
                 let Some(stream) = node.streams.get(self.row_idx) else {
                     return;
                 };
@@ -1442,9 +1545,9 @@ impl App {
                 for mid in affected {
                     sync_chapter_edit_import(&mut self.graph, mid);
                 }
-                self.armed = self
-                    .armed
-                    .filter(|e| !matches!(e, Endpoint::Stream { node, .. } if *node == id));
+                let still_from_this_input = |e: &Endpoint| matches!(e, Endpoint::Stream { node, .. } if *node == id);
+                self.armed.retain(|e| !still_from_this_input(e));
+                self.selected.retain(|e| !still_from_this_input(e));
                 self.log.push(format!("removed input: {path}"));
                 let n = self.graph.inputs.len();
                 self.set_focus_index(i.min(n));
@@ -1455,7 +1558,7 @@ impl App {
                 };
                 let id = m.id;
                 self.graph.remove_modifier(id);
-                self.armed = self.armed.filter(|e| *e != Endpoint::ModifierOut(id));
+                self.armed.retain(|e| *e != Endpoint::ModifierOut(id));
                 self.log.push("removed modifier node".to_string());
                 let n = self.node_count();
                 self.set_focus_index((self.graph.inputs.len() + i).min(n.saturating_sub(1)));

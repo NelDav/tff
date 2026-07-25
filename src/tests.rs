@@ -25,6 +25,14 @@ fn video_audio_streams() -> Vec<StreamInfo> {
     ]
 }
 
+fn three_streams() -> Vec<StreamInfo> {
+    vec![
+        StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None },
+        StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None },
+        StreamInfo { index: 2, kind: StreamKind::Subtitle, codec: "srt".to_string(), lang: None },
+    ]
+}
+
 fn metadata_fields(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
@@ -709,12 +717,12 @@ fn toggle_connect_wires_armed_stream_into_focused_modifier() {
     app.focus = Focus::Input(0);
     app.row_idx = 0;
     app.toggle_connect(); // arm the stream
-    assert!(app.armed.is_some());
+    assert!(!app.armed.is_empty());
 
     app.focus = Focus::Modifier(modifier_idx);
     app.toggle_connect(); // connect
 
-    assert!(app.armed.is_none());
+    assert!(app.armed.is_empty());
     let incoming = app.graph.incoming(Target::ModifierIn(modifier));
     assert_eq!(incoming.len(), 1);
     assert_eq!(app.graph.wires[incoming[0]].from, Endpoint::Stream { node: id, stream_idx: 0 });
@@ -736,7 +744,7 @@ fn toggle_connect_arms_a_connected_modifiers_output() {
     app.focus = Focus::Modifier(modifier_idx);
     app.toggle_connect();
 
-    assert_eq!(app.armed, Some(Endpoint::ModifierOut(modifier)));
+    assert_eq!(app.armed, BTreeSet::from([Endpoint::ModifierOut(modifier)]));
 }
 
 /// Pressing 'c' twice on the same modifier with nothing else armed should
@@ -751,9 +759,230 @@ fn toggle_connect_twice_on_same_modifier_disarms() {
 
     app.focus = Focus::Modifier(modifier_idx);
     app.toggle_connect();
-    assert!(app.armed.is_some());
+    assert!(!app.armed.is_empty());
     app.toggle_connect();
-    assert!(app.armed.is_none());
+    assert!(app.armed.is_empty());
+}
+
+/// Space toggles the hovered stream's membership in the pending
+/// selection, independent of `armed` -- selecting doesn't arm anything by
+/// itself.
+#[test]
+fn space_toggles_port_selection() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+
+    app.toggle_port_selection();
+    assert_eq!(app.selected, BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 0 }]));
+    assert!(app.armed.is_empty(), "selecting shouldn't arm anything");
+
+    app.row_idx = 1;
+    app.toggle_port_selection();
+    assert_eq!(
+        app.selected,
+        BTreeSet::from([
+            Endpoint::Stream { node: id, stream_idx: 0 },
+            Endpoint::Stream { node: id, stream_idx: 1 },
+        ])
+    );
+
+    // Toggling the same row again removes it.
+    app.toggle_port_selection();
+    assert_eq!(app.selected, BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 0 }]));
+}
+
+/// Shift+Down/Up extends a contiguous range from wherever it started,
+/// recomputed fresh each press so shrinking the range back correctly
+/// drops rows that fall outside it again.
+#[test]
+fn shift_extends_a_contiguous_port_range() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), three_streams(), Vec::new());
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+
+    app.extend_port_selection(true); // anchor at 0, extend to 1
+    assert_eq!(
+        app.selected,
+        BTreeSet::from([
+            Endpoint::Stream { node: id, stream_idx: 0 },
+            Endpoint::Stream { node: id, stream_idx: 1 },
+        ])
+    );
+
+    app.extend_port_selection(true); // extend to 2
+    assert_eq!(app.selected.len(), 3, "{:?}", app.selected);
+
+    app.extend_port_selection(false); // shrink back to 0..=1
+    assert_eq!(
+        app.selected,
+        BTreeSet::from([
+            Endpoint::Stream { node: id, stream_idx: 0 },
+            Endpoint::Stream { node: id, stream_idx: 1 },
+        ]),
+        "row 2 should drop back out once the range shrinks past it"
+    );
+}
+
+/// Plain (non-Shift) navigation should end an in-progress Shift+range, so
+/// a later Shift+extend starts a fresh anchor from the new row instead of
+/// resuming the old one.
+#[test]
+fn plain_navigation_resets_the_range_anchor() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), three_streams(), Vec::new());
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+
+    app.extend_port_selection(true); // anchor 0, row_idx -> 1
+    assert_eq!(app.row_idx, 1);
+
+    app.cycle_row(true); // plain Down: row_idx -> 2, should reset the anchor
+    assert_eq!(app.row_idx, 2);
+
+    app.extend_port_selection(true); // fresh anchor at 2, extends to... clamped at len-1 (2)
+    // Only row 2 should be selected from this second range (anchor == new
+    // row, since row 2 is already the last stream) -- row 0/1 from the
+    // earlier range must be gone since the anchor restarted.
+    assert_eq!(app.selected, BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 2 }]));
+}
+
+/// Pressing 'c' on an input with a non-empty pending selection should arm
+/// every selected port in one action and clear the selection -- even when
+/// the ports span more than one input node.
+#[test]
+fn arming_a_multi_port_selection_across_nodes() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.toggle_port_selection(); // select a's only stream
+
+    app.focus = Focus::Input(1);
+    app.row_idx = 0;
+    app.toggle_port_selection(); // select b's only stream
+    assert_eq!(app.selected.len(), 2);
+
+    app.toggle_connect(); // 'c' with a pending selection -> arm all of it
+
+    assert!(app.selected.is_empty(), "arming should clear the pending selection");
+    assert_eq!(
+        app.armed,
+        BTreeSet::from([
+            Endpoint::Stream { node: a, stream_idx: 0 },
+            Endpoint::Stream { node: b, stream_idx: 0 },
+        ])
+    );
+}
+
+/// With nothing explicitly selected, 'c' on an input falls back to the
+/// original single-hover toggle-arm behavior.
+#[test]
+fn arming_with_nothing_selected_falls_back_to_single_toggle() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+
+    app.toggle_connect();
+    assert_eq!(app.armed, BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 0 }]));
+
+    app.toggle_connect(); // pressing 'c' again on the same hovered port disarms it
+    assert!(app.armed.is_empty());
+}
+
+/// Connecting a multi-armed set to an output should create one wire per
+/// armed source, all in a single 'c' press.
+#[test]
+fn connecting_multiple_armed_ports_to_an_output_creates_one_wire_each() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.toggle_port_selection();
+    app.row_idx = 1;
+    app.toggle_port_selection();
+    app.toggle_connect(); // arm both
+
+    app.focus = Focus::Output(0);
+    app.toggle_connect(); // connect all armed to the output
+
+    assert!(app.armed.is_empty());
+    let incoming = app.graph.incoming(Target::Output(out));
+    assert_eq!(incoming.len(), 2, "{incoming:?}");
+    let sources: BTreeSet<Endpoint> = incoming.iter().map(|&wi| app.graph.wires[wi].from).collect();
+    assert_eq!(
+        sources,
+        BTreeSet::from([
+            Endpoint::Stream { node: id, stream_idx: 0 },
+            Endpoint::Stream { node: id, stream_idx: 1 },
+        ])
+    );
+}
+
+/// A modifier's input only ever holds one wire -- connecting a multi-armed
+/// set to one should be rejected with a clear message, leaving the armed
+/// set untouched (and no wire created) so the user can fix it up.
+#[test]
+fn connecting_multiple_armed_ports_to_a_modifier_is_rejected() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.toggle_port_selection();
+    app.row_idx = 1;
+    app.toggle_port_selection();
+    app.toggle_connect(); // arm both
+    assert_eq!(app.armed.len(), 2);
+
+    let armed_before = app.armed.clone();
+    app.focus = Focus::Modifier(modifier_idx);
+    app.toggle_connect(); // should reject, not connect
+
+    assert_eq!(app.armed, armed_before, "armed set should be untouched after a rejected connect");
+    assert!(app.graph.incoming(Target::ModifierIn(modifier)).is_empty());
+    assert!(app.log.last().unwrap().contains("only accepts one"), "{:?}", app.log.last());
+}
+
+/// Deleting an input node should clean up any of its ports from both
+/// `selected` and `armed`, not just `armed`.
+#[test]
+fn deleting_an_input_cleans_up_selected_and_armed() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    app.selected.insert(Endpoint::Stream { node: a, stream_idx: 0 });
+    app.armed.insert(Endpoint::Stream { node: b, stream_idx: 0 });
+
+    app.focus = Focus::Input(0); // "a"
+    app.delete_focused_node();
+
+    assert!(app.selected.is_empty(), "{:?}", app.selected);
+    assert!(!app.armed.is_empty(), "b's armed port shouldn't be touched by deleting a");
 }
 
 /// 'd' on an input port disconnects it from everything downstream (bulk);
@@ -787,6 +1016,115 @@ fn disconnect_is_bulk_on_input_and_precise_elsewhere() {
     app.row_idx = 0;
     app.disconnect_focused();
     assert!(app.graph.wires.is_empty());
+}
+
+/// 'd' on an input with a pending multi-port selection should disconnect
+/// every selected port from everything downstream in one action, the
+/// mirror image of how 'c' arms them all at once -- and clear the
+/// selection afterward.
+#[test]
+fn disconnecting_a_multi_port_selection_removes_wires_from_every_selected_port() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::Output(out));
+    assert_eq!(app.graph.wires.len(), 2);
+
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.toggle_port_selection();
+    app.row_idx = 1;
+    app.toggle_port_selection();
+    assert_eq!(app.selected.len(), 2);
+
+    app.disconnect_focused();
+
+    assert!(app.graph.wires.is_empty(), "{:?}", app.graph.wires);
+    assert!(app.selected.is_empty(), "the selection should be consumed by the bulk disconnect");
+}
+
+/// A bulk disconnect via a pending selection should work regardless of
+/// which input node happens to be focused when 'd' is pressed, spanning
+/// ports from several different inputs at once -- same as bulk arming.
+#[test]
+fn disconnecting_a_multi_port_selection_spans_different_input_nodes() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::Output(out));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::Output(out));
+
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.toggle_port_selection(); // select a's stream
+
+    app.focus = Focus::Input(1);
+    app.row_idx = 0;
+    app.toggle_port_selection(); // select b's stream
+
+    // Focused on b when 'd' is pressed, but both should still be removed.
+    app.disconnect_focused();
+
+    assert!(app.graph.wires.is_empty(), "{:?}", app.graph.wires);
+}
+
+/// With nothing explicitly selected, 'd' on an input falls back to the
+/// original single-hover disconnect behavior.
+#[test]
+fn disconnecting_with_nothing_selected_falls_back_to_single_hover() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::Output(out));
+
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.disconnect_focused();
+
+    assert_eq!(app.graph.wires.len(), 1, "only the hovered row's wire should be removed");
+    assert_eq!(app.graph.wires[0].from, Endpoint::Stream { node: id, stream_idx: 1 });
+}
+
+/// A bulk disconnect that clears a `ChapterEdit` node's only connected
+/// chapter source should trigger the same auto-import cleanup a
+/// single-port disconnect already does.
+#[test]
+fn bulk_disconnect_triggers_chapter_edit_import_cleanup() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let modifier = app
+        .graph
+        .add_modifier(ModifierKind::ChapterEdit { chapters: vec![Chapter::new(0.0, 1.0, "Manual".to_string())] });
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 2.0, "Imported".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    app.armed = BTreeSet::from([Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }]);
+    app.focus = Focus::Modifier(app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap());
+    app.toggle_connect(); // connect + auto-import
+    assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap().len(), 2);
+
+    let chapters_idx = app.graph.inputs.iter().position(|n| n.id == chapters_id).unwrap();
+    app.focus = Focus::Input(chapters_idx);
+    app.row_idx = chapter_idx;
+    app.toggle_port_selection();
+    app.disconnect_focused();
+
+    let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
+    assert_eq!(chapters.len(), 1, "{chapters:?}");
+    assert_eq!(chapters[0].title, "Manual");
 }
 
 /// 'a' should open a picker; confirming "convert" should add a Convert
@@ -1950,7 +2288,7 @@ fn connecting_a_chapter_source_auto_imports_and_merges_with_manual_chapters() {
 
     // Wrong kind: connecting a video stream shouldn't import anything.
     let video_id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
-    app.armed = Some(Endpoint::Stream { node: video_id, stream_idx: 0 });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: video_id, stream_idx: 0 }]);
     focus_modifier(&mut app, modifier);
     app.toggle_connect();
     let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
@@ -1965,7 +2303,7 @@ fn connecting_a_chapter_source_auto_imports_and_merges_with_manual_chapters() {
         vec![Chapter::new(0.0, 2.0, "Imported".to_string())],
     );
     let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
-    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }]);
     app.focus = Focus::Modifier(app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap());
     app.toggle_connect();
 
@@ -1994,7 +2332,7 @@ fn disconnecting_the_source_removes_only_auto_imported_chapters() {
         vec![Chapter::new(0.0, 2.0, "Imported".to_string())],
     );
     let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
-    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }]);
     app.focus = Focus::Modifier(app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap());
     app.toggle_connect();
     assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap().len(), 1);
@@ -2033,7 +2371,7 @@ fn reconnecting_to_a_different_source_replaces_the_auto_imported_set() {
     let a_idx = app.graph.input(a_id).unwrap().streams.len() - 1;
     let modifier_focus_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
 
-    app.armed = Some(Endpoint::Stream { node: a_id, stream_idx: a_idx });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: a_id, stream_idx: a_idx }]);
     app.focus = Focus::Modifier(modifier_focus_idx);
     app.toggle_connect();
     let chapters = chapter_edit_chapters(&app.graph, modifier).unwrap();
@@ -2042,7 +2380,7 @@ fn reconnecting_to_a_different_source_replaces_the_auto_imported_set() {
     let b_id =
         app.graph.add_input("b.ffmeta".to_string(), Vec::new(), vec![Chapter::new(0.0, 1.0, "FromB".to_string())]);
     let b_idx = app.graph.input(b_id).unwrap().streams.len() - 1;
-    app.armed = Some(Endpoint::Stream { node: b_id, stream_idx: b_idx });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: b_id, stream_idx: b_idx }]);
     app.focus = Focus::Modifier(modifier_focus_idx);
     app.toggle_connect();
 
@@ -2068,7 +2406,7 @@ fn deleting_the_source_input_node_also_removes_its_imported_chapters() {
         vec![Chapter::new(0.0, 2.0, "Imported".to_string())],
     );
     let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
-    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }]);
     app.focus = Focus::Modifier(app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap());
     app.toggle_connect();
     assert_eq!(chapter_edit_chapters(&app.graph, modifier).unwrap().len(), 2);
@@ -2094,7 +2432,7 @@ fn toggle_connect_routes_by_endpoint_kind() {
     let out = app.graph.outputs[0].id;
 
     let video_id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
-    app.armed = Some(Endpoint::Stream { node: video_id, stream_idx: 0 });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: video_id, stream_idx: 0 }]);
     app.focus = Focus::Output(0);
     app.toggle_connect();
     assert_eq!(app.graph.incoming(Target::Output(out)).len(), 1);
@@ -2106,7 +2444,7 @@ fn toggle_connect_routes_by_endpoint_kind() {
         vec![Chapter::new(0.0, 1.0, "A".to_string())],
     );
     let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
-    app.armed = Some(Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx });
+    app.armed = BTreeSet::from([Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }]);
     app.toggle_connect();
     assert_eq!(app.graph.incoming(Target::OutputChapters(out)).len(), 1);
     assert_eq!(app.graph.incoming(Target::Output(out)).len(), 1, "the earlier video connection should be untouched");
@@ -2387,6 +2725,42 @@ fn ui_renders_modifier_node_and_codec_badge_on_its_outgoing_wire() {
     assert!(screen.contains("→ OUTPUT 1"), "expected the modifier's outgoing row naming the output:\n{screen}");
     assert!(screen.contains("x265"), "expected the codec badge on the wire leaving the convert node:\n{screen}");
     assert!(screen.contains("[x265]"), "expected the output's mapped line to show the resolved codec tag:\n{screen}");
+}
+
+/// A stream port's marker should distinguish all three states: idle "○",
+/// selected-but-not-armed "●", and armed "◎" -- each stream in this test
+/// is put into a different one of the three so they can all be checked in
+/// the same render.
+#[test]
+fn ui_renders_distinct_markers_for_idle_selected_and_armed_ports() {
+    use crate::app::{App, Focus};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), three_streams(), Vec::new());
+    app.focus = Focus::Input(0);
+    app.row_idx = 1;
+    app.toggle_port_selection(); // select stream 1, leave 0 idle and 2 untouched
+    app.armed.insert(Endpoint::Stream { node: id, stream_idx: 2 }); // arm stream 2 directly
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let screen: String = (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let idle_line = screen.lines().find(|l| l.contains("v:0 h264")).expect("idle row present");
+    assert!(idle_line.contains('○'), "idle port should show the empty marker:\n{idle_line}");
+
+    let selected_line = screen.lines().find(|l| l.contains("a:1 aac")).expect("selected row present");
+    assert!(selected_line.contains('●'), "selected-but-unarmed port should show the filled marker:\n{selected_line}");
+
+    let armed_line = screen.lines().find(|l| l.contains("s:2 srt")).expect("armed row present");
+    assert!(armed_line.contains('◎'), "armed port should show the armed marker:\n{armed_line}");
 }
 
 /// Regression test for a bug where the edge-drawing code used a dummy x=0

@@ -524,7 +524,9 @@ pub struct ModifierNode {
 
 /// The source side of a connection: either a specific stream on an input
 /// file, or the (single, always-transformed) output of a modifier node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Ordered so a set of these (see `App::armed`/`App::selected`) has a
+/// stable iteration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Endpoint {
     Stream { node: NodeId, stream_idx: usize },
     ModifierOut(NodeId),

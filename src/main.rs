@@ -150,8 +150,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('q') => app.should_quit = true,
             KeyCode::Tab => app.cycle_focus(true),
             KeyCode::BackTab => app.cycle_focus(false),
+            // Shift+Up/Down extends a port-selection range; checked ahead of
+            // the plain Up/Down arms below since match picks the first hit.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.extend_port_selection(false),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.extend_port_selection(true),
             KeyCode::Up => app.cycle_row(false),
             KeyCode::Down => app.cycle_row(true),
+            KeyCode::Char(' ') => app.toggle_port_selection(),
             KeyCode::Char('h') => app.move_focused_node(-1.0, 0.0),
             KeyCode::Char('l') => app.move_focused_node(1.0, 0.0),
             KeyCode::Char('k') => app.move_focused_node(0.0, -1.0),
@@ -165,7 +170,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('x') => app.delete_focused_node(),
             KeyCode::Char('r') => app.start_render(),
             KeyCode::Char('p') => app.start_preview(),
-            KeyCode::Esc => app.armed = None,
+            KeyCode::Esc => {
+                app.armed.clear();
+                app.selected.clear();
+            }
             _ => {}
         },
     }

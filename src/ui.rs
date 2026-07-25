@@ -98,7 +98,8 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         )),
         Mode::Normal => {
-            if let Some(ep) = app.armed {
+            if app.armed.len() == 1 {
+                let ep = *app.armed.iter().next().expect("checked len == 1");
                 match describe_endpoint(&app.graph, ep) {
                     Some(desc) => TextLine::from(Span::styled(
                         format!("armed {desc} — focus a modifier or output, press 'c' to connect (Esc to cancel)"),
@@ -106,6 +107,22 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                     )),
                     None => TextLine::from(""),
                 }
+            } else if app.armed.len() > 1 {
+                TextLine::from(Span::styled(
+                    format!(
+                        "armed {} ports — focus a modifier or output, press 'c' to connect (Esc to cancel)",
+                        app.armed.len()
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ))
+            } else if !app.selected.is_empty() {
+                TextLine::from(Span::styled(
+                    format!(
+                        "{} port(s) selected — Space/Shift+↑↓ to adjust, 'c' to arm them (Esc to clear)",
+                        app.selected.len()
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ))
             } else if app.running {
                 TextLine::from(Span::styled(
                     app.status.clone(),
@@ -199,8 +216,7 @@ fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
     draw_edges(frame, app, inner);
 
     for (i, input) in app.graph.inputs.iter().enumerate() {
-        let focused = matches!(app.focus, Focus::Input(fi) if fi == i);
-        draw_input_node(frame, inner, &app.graph, input, focused, app.row_idx, app.armed);
+        draw_input_node(frame, inner, app, i, input);
     }
     for (i, modifier) in app.graph.modifiers.iter().enumerate() {
         draw_modifier_node(frame, inner, app, i, modifier);
@@ -435,15 +451,9 @@ fn node_rect(canvas_area: Rect, pos: (f64, f64), width: u16, rows: u16) -> Optio
     }
 }
 
-fn draw_input_node(
-    frame: &mut Frame,
-    canvas_area: Rect,
-    graph: &Graph,
-    node: &InputNode,
-    focused: bool,
-    row_idx: usize,
-    armed: Option<Endpoint>,
-) {
+fn draw_input_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &InputNode) {
+    let focused = matches!(app.focus, Focus::Input(fi) if fi == index);
+    let row_idx = app.row_idx;
     let rows = node_rows(node.streams.len(), extra_args_field_rows(&node.extra_args));
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
@@ -465,10 +475,13 @@ fn draw_input_node(
     for (i, stream) in node.streams.iter().enumerate() {
         let is_row_focused = focused && i == row_idx;
         let ep = Endpoint::Stream { node: node.id, stream_idx: i };
-        let is_armed = armed == Some(ep);
-        let marker = if is_armed { "◎" } else { "○" };
+        let is_armed = app.armed.contains(&ep);
+        let is_selected = app.selected.contains(&ep);
+        let marker = if is_armed { "◎" } else if is_selected { "●" } else { "○" };
         let color = if is_armed {
             Color::Yellow
+        } else if is_selected {
+            Color::Cyan
         } else {
             kind_color(stream.kind)
         };
@@ -479,7 +492,7 @@ fn draw_input_node(
         // A stream can fan out to more than one downstream node; the wire
         // itself shows where a single connection goes, so only call out
         // the count when there's more than one to disambiguate.
-        let count = graph.outgoing(ep).len();
+        let count = app.graph.outgoing(ep).len();
         let suffix = if count > 1 { format!(" → {count} connections") } else { String::new() };
         lines.push(TextLine::styled(format!("{marker} {}{suffix}", stream.label()), style));
     }
