@@ -124,9 +124,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Enter => app.confirm_text_input(),
             KeyCode::Esc => app.cancel_text_input(),
             KeyCode::Backspace => app.text_input_backspace(),
+            KeyCode::Delete => app.text_input_delete(),
             KeyCode::Tab => app.text_input_accept_suggestion(),
             KeyCode::Up => app.text_input_move_suggestion(-1),
             KeyCode::Down => app.text_input_move_suggestion(1),
+            KeyCode::Left => app.text_input_move_cursor(-1),
+            KeyCode::Right => app.text_input_move_cursor(1),
             KeyCode::Char(c) => app.text_input_char(c),
             _ => {}
         },

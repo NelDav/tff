@@ -53,7 +53,7 @@ fn describe_endpoint(graph: &Graph, ep: Endpoint) -> Option<String> {
 
 fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.mode {
-        Mode::TextInput { target, buffer, .. } => {
+        Mode::TextInput { target, buffer, cursor, .. } => {
             let prompt = match target {
                 crate::app::TextTarget::NewInputPath => "add input file path: ".to_string(),
                 crate::app::TextTarget::OutputPath(_) => "output file path: ".to_string(),
@@ -68,11 +68,28 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                 },
                 crate::app::TextTarget::ChapterTitle { .. } => "chapter title: ".to_string(),
             };
-            TextLine::from(vec![
+            // A reversed-video block over whatever's at the cursor (or a
+            // blank block past the last character) shows the insertion
+            // point in place, since it's no longer always the end of the
+            // buffer -- a trailing blinking underscore would be
+            // misleading once the cursor can sit mid-string.
+            let byte_off = crate::app::char_byte_offset(buffer, *cursor);
+            let before = &buffer[..byte_off];
+            let mut after_chars = buffer[byte_off..].chars();
+            let mut spans = vec![
                 Span::styled(prompt, Style::default().fg(Color::Yellow)),
-                Span::raw(buffer.clone()),
-                Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-            ])
+                Span::raw(before.to_string()),
+            ];
+            match after_chars.next() {
+                Some(c) => {
+                    spans.push(Span::styled(c.to_string(), Style::default().add_modifier(Modifier::REVERSED)));
+                    spans.push(Span::raw(after_chars.as_str().to_string()));
+                }
+                None => {
+                    spans.push(Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)));
+                }
+            }
+            TextLine::from(spans)
         }
         Mode::Picker { .. } => TextLine::from(Span::styled(
             "↑↓/jk move · / search · Enter select · Esc cancel",

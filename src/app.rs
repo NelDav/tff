@@ -165,6 +165,13 @@ pub enum Mode {
         /// apply.
         suggestions: Vec<String>,
         selected: usize,
+        /// Position within `buffer`, in `char`s (not bytes -- a buffer can
+        /// hold multi-byte UTF-8, e.g. a chapter title), where the next
+        /// typed character is inserted or Backspace removes from. Always
+        /// starts at the end of whatever the field is prefilled with (see
+        /// `text_input_mode`), matching how a real text field positions
+        /// the cursor when you tab into it with existing content.
+        cursor: usize,
     },
     Picker {
         kind: PickerKind,
@@ -342,12 +349,7 @@ impl App {
     pub fn start_add_input(&mut self) {
         let buffer = String::new();
         let suggestions = path_suggestions(&buffer);
-        self.mode = Mode::TextInput {
-            target: TextTarget::NewInputPath,
-            buffer,
-            suggestions,
-            selected: 0,
-        };
+        self.mode = text_input_mode(TextTarget::NewInputPath, buffer, suggestions);
     }
 
     /// Reached via the 'a' node picker's "output" entry -- adds a new
@@ -441,12 +443,7 @@ impl App {
         };
         let buffer = output.path.clone();
         let suggestions = path_suggestions(&buffer);
-        self.mode = Mode::TextInput {
-            target: TextTarget::OutputPath(output.id),
-            buffer,
-            suggestions,
-            selected: 0,
-        };
+        self.mode = text_input_mode(TextTarget::OutputPath(output.id), buffer, suggestions);
     }
 
     /// 'e': edit the focused node's primary setting, whatever kind of node
@@ -740,12 +737,7 @@ impl App {
                         | ModifierKind::ChapterEdit { .. } => None,
                     })
                     .unwrap_or_default();
-                self.mode = Mode::TextInput {
-                    target: TextTarget::ModifierMetadataValue { modifier, key },
-                    buffer: current,
-                    suggestions: Vec::new(),
-                    selected: 0,
-                };
+                self.mode = text_input_mode(TextTarget::ModifierMetadataValue { modifier, key }, current, Vec::new());
             }
             TextTarget::ModifierFilterValue { modifier, key } => {
                 let value = buffer.trim().to_string();
@@ -780,12 +772,7 @@ impl App {
                 }
                 let current =
                     extra_args_of(&self.graph, target).and_then(|f| f.get(&key).cloned()).unwrap_or_default();
-                self.mode = Mode::TextInput {
-                    target: TextTarget::ExtraArgValue { target, key },
-                    buffer: current,
-                    suggestions: Vec::new(),
-                    selected: 0,
-                };
+                self.mode = text_input_mode(TextTarget::ExtraArgValue { target, key }, current, Vec::new());
             }
             TextTarget::ChapterTime { modifier, index, field } => {
                 match crate::graph::parse_time(&buffer) {
@@ -823,15 +810,20 @@ impl App {
         }
     }
 
+    /// Inserts at the cursor position (not necessarily the end of the
+    /// buffer -- see `Mode::TextInput::cursor`'s doc comment), then
+    /// advances the cursor past what was just typed.
     pub fn text_input_char(&mut self, c: char) {
         if let Mode::TextInput {
             target,
             buffer,
             suggestions,
             selected,
+            cursor,
         } = &mut self.mode
         {
-            buffer.push(c);
+            buffer.insert(char_byte_offset(buffer, *cursor), c);
+            *cursor += 1;
             if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
                 *suggestions = path_suggestions(buffer);
                 *selected = 0;
@@ -839,19 +831,63 @@ impl App {
         }
     }
 
+    /// Removes the character immediately before the cursor (not
+    /// necessarily the buffer's last character), same as a normal text
+    /// field.
     pub fn text_input_backspace(&mut self) {
         if let Mode::TextInput {
             target,
             buffer,
             suggestions,
             selected,
+            cursor,
         } = &mut self.mode
         {
-            buffer.pop();
+            if *cursor == 0 {
+                return;
+            }
+            buffer.remove(char_byte_offset(buffer, *cursor - 1));
+            *cursor -= 1;
             if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
                 *suggestions = path_suggestions(buffer);
                 *selected = 0;
             }
+        }
+    }
+
+    /// The Delete key: removes the character right at the cursor (the one
+    /// that would be typed over next), leaving the cursor itself in place
+    /// -- the mirror image of Backspace, for trimming what's ahead of the
+    /// insertion point instead of behind it. A no-op at the end of the
+    /// buffer, where there's nothing there to remove.
+    pub fn text_input_delete(&mut self) {
+        if let Mode::TextInput {
+            target,
+            buffer,
+            suggestions,
+            selected,
+            cursor,
+        } = &mut self.mode
+        {
+            let byte_off = char_byte_offset(buffer, *cursor);
+            if byte_off >= buffer.len() {
+                return;
+            }
+            buffer.remove(byte_off);
+            if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
+                *suggestions = path_suggestions(buffer);
+                *selected = 0;
+            }
+        }
+    }
+
+    /// Left/Right while typing: move the insertion point within the
+    /// buffer, clamped to its bounds -- lets an existing value be edited
+    /// in place instead of only appended to or erased from the end.
+    pub fn text_input_move_cursor(&mut self, delta: isize) {
+        if let Mode::TextInput { buffer, cursor, .. } = &mut self.mode {
+            let len = buffer.chars().count() as isize;
+            *cursor = (*cursor as isize + delta).clamp(0, len) as usize;
         }
     }
 
@@ -879,11 +915,13 @@ impl App {
             buffer,
             suggestions,
             selected,
+            cursor,
             ..
         } = &mut self.mode
             && let Some(chosen) = suggestions.get(*selected).cloned()
         {
             *buffer = chosen;
+            *cursor = buffer.chars().count();
             *suggestions = path_suggestions(buffer);
             *selected = 0;
         }
@@ -1326,21 +1364,11 @@ impl App {
                             | ModifierKind::ChapterEdit { .. } => None,
                         })
                         .unwrap_or_default();
-                    self.mode = Mode::TextInput {
-                        target: TextTarget::ModifierMetadataValue { modifier, key },
-                        buffer: current,
-                        suggestions: Vec::new(),
-                        selected: 0,
-                    };
+                    self.mode = text_input_mode(TextTarget::ModifierMetadataValue { modifier, key }, current, Vec::new());
                 }
                 None => {
                     // "custom key..." -- first ask for the key name itself.
-                    self.mode = Mode::TextInput {
-                        target: TextTarget::ModifierCustomKey(modifier),
-                        buffer: String::new(),
-                        suggestions: Vec::new(),
-                        selected: 0,
-                    };
+                    self.mode = text_input_mode(TextTarget::ModifierCustomKey(modifier), String::new(), Vec::new());
                 }
             },
             PickerKind::DispositionFlags { .. } => {
@@ -1376,12 +1404,7 @@ impl App {
                     return;
                 }
 
-                self.mode = Mode::TextInput {
-                    target: TextTarget::ModifierFilterValue { modifier, key },
-                    buffer: current.unwrap_or_default(),
-                    suggestions: Vec::new(),
-                    selected: 0,
-                };
+                self.mode = text_input_mode(TextTarget::ModifierFilterValue { modifier, key }, current.unwrap_or_default(), Vec::new());
             }
             PickerKind::FilterFieldValue { modifier, key } => {
                 if let Some(m) = self.graph.modifier_mut(modifier)
@@ -1404,21 +1427,11 @@ impl App {
                     entry.value.as_ref().and_then(|key| extra_args_of(&self.graph, target).and_then(|f| f.get(key).cloned()));
                 match entry.value {
                     Some(key) => {
-                        self.mode = Mode::TextInput {
-                            target: TextTarget::ExtraArgValue { target, key },
-                            buffer: current.unwrap_or_default(),
-                            suggestions: Vec::new(),
-                            selected: 0,
-                        };
+                        self.mode = text_input_mode(TextTarget::ExtraArgValue { target, key }, current.unwrap_or_default(), Vec::new());
                     }
                     None => {
                         // "custom key..." -- first ask for the key name itself.
-                        self.mode = Mode::TextInput {
-                            target: TextTarget::ExtraArgCustomKey(target),
-                            buffer: String::new(),
-                            suggestions: Vec::new(),
-                            selected: 0,
-                        };
+                        self.mode = text_input_mode(TextTarget::ExtraArgCustomKey(target), String::new(), Vec::new());
                     }
                 }
             }
@@ -1456,23 +1469,13 @@ impl App {
                         ChapterTimeField::Start => chapter.start_secs,
                         ChapterTimeField::End => chapter.end_secs,
                     };
-                    self.mode = Mode::TextInput {
-                        target: TextTarget::ChapterTime { modifier, index, field },
-                        buffer: crate::graph::format_time(current),
-                        suggestions: Vec::new(),
-                        selected: 0,
-                    };
+                    self.mode = text_input_mode(TextTarget::ChapterTime { modifier, index, field }, crate::graph::format_time(current), Vec::new());
                 }
                 Some("title") => {
                     let current = chapter_edit_chapters(&self.graph, modifier)
                         .and_then(|cs| cs.get(index))
                         .map(|c| c.title.clone());
-                    self.mode = Mode::TextInput {
-                        target: TextTarget::ChapterTitle { modifier, index },
-                        buffer: current.unwrap_or_default(),
-                        suggestions: Vec::new(),
-                        selected: 0,
-                    };
+                    self.mode = text_input_mode(TextTarget::ChapterTitle { modifier, index }, current.unwrap_or_default(), Vec::new());
                 }
                 Some("delete") => {
                     if let Some(chapters) = chapter_edit_chapters_mut(&mut self.graph, modifier)
@@ -1711,6 +1714,24 @@ fn expand_tilde(s: &str) -> String {
         return home;
     }
     s.to_string()
+}
+
+/// Builds a `Mode::TextInput` with the cursor placed at the end of
+/// `buffer` -- the natural starting position whether the field opens empty
+/// or prefilled with an existing value (e.g. re-editing a metadata field).
+fn text_input_mode(target: TextTarget, buffer: String, suggestions: Vec<String>) -> Mode {
+    let cursor = buffer.chars().count();
+    Mode::TextInput { target, buffer, suggestions, selected: 0, cursor }
+}
+
+/// The byte offset in `s` where its `char_idx`-th character starts --
+/// `String::insert`/`String::remove` need a byte offset, but
+/// `Mode::TextInput::cursor` is a char index (safe for multi-byte UTF-8).
+/// `char_idx == s.chars().count()` (one past the last character, the
+/// end-of-buffer position) falls through to `s.len()`, since there's no
+/// char at that index to report a start byte for.
+pub(crate) fn char_byte_offset(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 /// Files/directories matching what's typed after the last '/' in `buffer`,

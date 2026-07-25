@@ -3396,8 +3396,9 @@ fn text_input_char_and_backspace_refresh_suggestions() {
     let dir = make_suggestion_fixture();
     let mut app = App::new();
     app.start_add_input();
-    let Mode::TextInput { buffer, .. } = &mut app.mode else { panic!("expected text input mode") };
+    let Mode::TextInput { buffer, cursor, .. } = &mut app.mode else { panic!("expected text input mode") };
     *buffer = format!("{}/", dir.display());
+    *cursor = buffer.chars().count(); // keep the cursor in sync with the buffer, same as a real edit would
 
     for c in "al".chars() {
         app.text_input_char(c);
@@ -3420,6 +3421,191 @@ fn text_input_char_and_backspace_refresh_suggestions() {
     assert_eq!(suggestions.len(), 4, "an empty prefix should widen the match to all four entries: {suggestions:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A freshly-opened text field's cursor should start at the end of
+/// whatever it's prefilled with -- typing should append, same as before
+/// cursor movement existed, unless the user explicitly moves it.
+#[test]
+fn text_input_mode_starts_with_cursor_at_the_end_of_the_buffer() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.graph.outputs[0].path = "out.mkv".to_string();
+    app.start_edit_output();
+    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!("expected text input mode") };
+    assert_eq!(buffer, "out.mkv");
+    assert_eq!(*cursor, 7);
+}
+
+/// Left/Right should move the cursor within the buffer, clamped to its
+/// bounds -- moving past either end should just stop there, not wrap or
+/// panic.
+#[test]
+fn text_input_move_cursor_clamps_to_buffer_bounds() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "abc".chars() {
+        app.text_input_char(c);
+    }
+    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(*cursor, 3);
+
+    app.text_input_move_cursor(-1);
+    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(*cursor, 2);
+
+    app.text_input_move_cursor(-10);
+    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(*cursor, 0, "moving past the start should clamp, not go negative");
+
+    app.text_input_move_cursor(10);
+    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(*cursor, 3, "moving past the end should clamp to the buffer's length");
+}
+
+/// Typing with the cursor positioned mid-buffer should insert right there
+/// -- editing a string shouldn't require erasing everything after the
+/// insertion point first.
+#[test]
+fn text_input_char_inserts_at_the_cursor_not_always_at_the_end() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "ac".chars() {
+        app.text_input_char(c);
+    }
+    app.text_input_move_cursor(-1); // between 'a' and 'c'
+    app.text_input_char('b');
+
+    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "abc");
+    assert_eq!(*cursor, 2, "cursor should land right after the inserted character");
+}
+
+/// Backspace with the cursor mid-buffer should remove the character just
+/// before it, not the buffer's last character.
+#[test]
+fn text_input_backspace_removes_the_character_before_the_cursor() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "abc".chars() {
+        app.text_input_char(c);
+    }
+    app.text_input_move_cursor(-1); // between 'b' and 'c'
+    app.text_input_backspace();
+
+    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "ac");
+    assert_eq!(*cursor, 1);
+}
+
+/// Backspace at the very start of the buffer (cursor at 0) should be a
+/// no-op rather than panicking or removing from the end.
+#[test]
+fn text_input_backspace_at_start_of_buffer_is_a_no_op() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "ab".chars() {
+        app.text_input_char(c);
+    }
+    app.text_input_move_cursor(-10); // clamp to 0
+    app.text_input_backspace();
+
+    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "ab", "nothing before the cursor to remove");
+    assert_eq!(*cursor, 0);
+}
+
+/// The Delete key removes the character right at the cursor (the mirror
+/// image of Backspace), leaving the cursor itself in place.
+#[test]
+fn text_input_delete_removes_the_character_at_the_cursor() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "abc".chars() {
+        app.text_input_char(c);
+    }
+    app.text_input_move_cursor(-2); // between 'a' and 'b'
+    app.text_input_delete(); // removes 'b'
+
+    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "ac");
+    assert_eq!(*cursor, 1, "the cursor shouldn't move -- only what's ahead of it is removed");
+}
+
+/// Delete at the very end of the buffer (nothing to its right) should be
+/// a no-op rather than panicking or removing from the start.
+#[test]
+fn text_input_delete_at_end_of_buffer_is_a_no_op() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "ab".chars() {
+        app.text_input_char(c);
+    }
+    // Cursor is already at the end after typing.
+    app.text_input_delete();
+
+    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "ab", "nothing after the cursor to remove");
+    assert_eq!(*cursor, 2);
+}
+
+/// Delete should handle a multi-byte UTF-8 character right at the cursor
+/// without panicking or corrupting the buffer, same concern as Backspace.
+#[test]
+fn text_input_delete_handles_multi_byte_utf8() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "café".chars() {
+        app.text_input_char(c);
+    }
+    app.text_input_move_cursor(-1); // right before 'é'
+    app.text_input_delete();
+
+    let Mode::TextInput { buffer, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "caf");
+}
+
+/// Multi-byte UTF-8 characters (e.g. in a chapter title) shouldn't panic
+/// or corrupt the buffer when inserting/deleting at a mid-string cursor
+/// position -- `cursor` is a char index, but `String::insert`/`remove`
+/// need a byte offset, so this exercises that conversion directly.
+#[test]
+fn text_input_char_and_backspace_handle_multi_byte_utf8() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "café".chars() {
+        app.text_input_char(c);
+    }
+    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "café");
+    assert_eq!(*cursor, 4, "cursor counts chars, not bytes, even though é is multi-byte");
+
+    app.text_input_move_cursor(-1); // between 'f' and 'é'
+    app.text_input_char('!');
+    let Mode::TextInput { buffer, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "caf!é");
+
+    app.text_input_backspace(); // removes the '!' just inserted
+    app.text_input_backspace(); // removes 'f'
+    let Mode::TextInput { buffer, .. } = &app.mode else { panic!() };
+    assert_eq!(buffer, "caé");
 }
 
 /// The metadata key picker should actually render its curated fields (with
