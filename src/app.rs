@@ -366,6 +366,19 @@ impl App {
         }
     }
 
+    /// Ctrl+A: select every port on the focused input node in one action,
+    /// adding to whatever's already selected elsewhere (e.g. on a
+    /// different input node picked before Tab-ing here) rather than
+    /// replacing it -- same additive spirit as `toggle_port_selection`.
+    pub fn select_all_ports(&mut self) {
+        let Focus::Input(i) = self.focus else { return };
+        let Some(node) = self.graph.inputs.get(i) else { return };
+        self.selection_anchor = None; // an explicit select-all isn't part of a range
+        for idx in 0..node.streams.len() {
+            self.selected.insert(Endpoint::Stream { node: node.id, stream_idx: idx });
+        }
+    }
+
     /// Shift+Up/Down: extend the pending selection as a contiguous range
     /// from wherever it started to the row now under the cursor -- the
     /// same anchor-then-extend model a text editor uses for shift-click

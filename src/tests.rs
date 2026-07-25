@@ -795,6 +795,53 @@ fn space_toggles_port_selection() {
     assert_eq!(app.selected, BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 0 }]));
 }
 
+/// Ctrl+A selects every port on the focused input node in one action, and
+/// is additive with a selection already staged on a different node rather
+/// than replacing it.
+#[test]
+fn ctrl_a_selects_every_port_on_the_focused_node() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let other = app.graph.add_input("other.mp4".to_string(), video_stream(), Vec::new());
+    let id = app.graph.add_input("in.mp4".to_string(), three_streams(), Vec::new());
+
+    // Pre-existing selection on a different input node.
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.toggle_port_selection();
+
+    app.focus = Focus::Input(1);
+    app.row_idx = 1;
+    app.select_all_ports();
+
+    assert_eq!(
+        app.selected,
+        BTreeSet::from([
+            Endpoint::Stream { node: other, stream_idx: 0 },
+            Endpoint::Stream { node: id, stream_idx: 0 },
+            Endpoint::Stream { node: id, stream_idx: 1 },
+            Endpoint::Stream { node: id, stream_idx: 2 },
+        ])
+    );
+    assert!(app.armed.is_empty(), "selecting shouldn't arm anything");
+}
+
+/// Ctrl+A is a no-op outside `Focus::Input` -- there's no "all ports" of
+/// a modifier's single output or an output node.
+#[test]
+fn ctrl_a_is_a_no_op_off_an_input_node() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    app.graph.add_input("in.mp4".to_string(), three_streams(), Vec::new());
+    app.focus = Focus::Output(0);
+
+    app.select_all_ports();
+
+    assert!(app.selected.is_empty());
+}
+
 /// Shift+Down/Up extends a contiguous range from wherever it started,
 /// recomputed fresh each press so shrinking the range back correctly
 /// drops rows that fall outside it again.

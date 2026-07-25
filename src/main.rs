@@ -157,6 +157,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Up => app.cycle_row(false),
             KeyCode::Down => app.cycle_row(true),
             KeyCode::Char(' ') => app.toggle_port_selection(),
+            // Ctrl+A selects every port on the focused node; checked ahead
+            // of the plain 'a' arm below (add-node picker) since match
+            // picks the first hit.
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => app.select_all_ports(),
             KeyCode::Char('h') => app.move_focused_node(-1.0, 0.0),
             KeyCode::Char('l') => app.move_focused_node(1.0, 0.0),
             KeyCode::Char('k') => app.move_focused_node(0.0, -1.0),
