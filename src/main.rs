@@ -123,15 +123,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::TextInput { .. } => match key.code {
             KeyCode::Enter => app.confirm_text_input(),
             KeyCode::Esc => app.cancel_text_input(),
-            KeyCode::Backspace => app.text_input_backspace(),
-            KeyCode::Delete => app.text_input_delete(),
             KeyCode::Tab => app.text_input_accept_suggestion(),
             KeyCode::Up => app.text_input_move_suggestion(-1),
             KeyCode::Down => app.text_input_move_suggestion(1),
-            KeyCode::Left => app.text_input_move_cursor(-1),
-            KeyCode::Right => app.text_input_move_cursor(1),
-            KeyCode::Char(c) => app.text_input_char(c),
-            _ => {}
+            // Everything else (typing, Backspace/Delete, Left/Right,
+            // Home/End, ...) goes straight to tui-input's own key
+            // handling -- see `App::text_input_handle_key`.
+            _ => app.text_input_handle_key(key),
         },
         Mode::Picker { searching: true, .. } => match key.code {
             KeyCode::Enter => app.picker_confirm_search(),

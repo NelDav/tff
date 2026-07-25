@@ -2,8 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::sync::mpsc;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 use crate::ffmpeg;
 use crate::graph::{Chapter, Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, StreamInfo, StreamKind, Target};
+
+/// A no-modifiers key press -- what `App::text_input_handle_key` expects,
+/// same as a real terminal reports for a plain keystroke. Drives the
+/// simulated typing/editing throughout this file's text-input tests.
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
 
 fn video_stream() -> Vec<StreamInfo> {
     vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }]
@@ -1046,14 +1055,15 @@ fn filter_field_picker_confirm_opens_value_input_and_stores_it() {
     app.picker_move(idx as isize);
     app.picker_confirm();
 
-    let Mode::TextInput { target, buffer, .. } = &app.mode else {
+    let Mode::TextInput { target, input, .. } = &app.mode else {
         panic!("expected text input mode");
     };
+    let buffer = input.value();
     assert!(matches!(target, TextTarget::ModifierFilterValue { key, .. } if key == "width"));
     assert_eq!(buffer, "");
 
     for c in "1280".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
 
@@ -1151,9 +1161,10 @@ fn metadata_key_picker_confirm_opens_prefilled_value_input() {
     }
     app.picker_confirm();
 
-    let Mode::TextInput { target, buffer, .. } = &app.mode else {
+    let Mode::TextInput { target, input, .. } = &app.mode else {
         panic!("expected text input mode");
     };
+    let buffer = input.value();
     assert!(matches!(target, TextTarget::ModifierMetadataValue { modifier: m, key } if *m == modifier && key == "language"));
     assert_eq!(buffer, "eng", "should pre-fill the current value");
 }
@@ -1178,8 +1189,10 @@ fn metadata_key_picker_confirm_on_unset_field_opens_empty_input() {
     }
     app.picker_confirm();
 
-    let Mode::TextInput { buffer, .. } = &app.mode else { panic!("expected text input mode") };
-    assert!(buffer.is_empty());
+    let Mode::TextInput { input, .. } = &app.mode else {
+        panic!("expected text input mode");
+    };
+    assert!(input.value().is_empty());
 }
 
 /// Choosing "custom key..." should first prompt for the key name, then
@@ -1207,18 +1220,19 @@ fn metadata_custom_key_flow_prompts_for_key_then_value() {
     assert!(matches!(&app.mode, Mode::TextInput { target: TextTarget::ModifierCustomKey(m), .. } if *m == modifier));
 
     for c in "rotate".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
 
-    let Mode::TextInput { target, buffer, .. } = &app.mode else {
+    let Mode::TextInput { target, input, .. } = &app.mode else {
         panic!("expected the value prompt to open next");
     };
+    let buffer = input.value();
     assert!(matches!(target, TextTarget::ModifierMetadataValue { modifier: m, key } if *m == modifier && key == "rotate"));
     assert!(buffer.is_empty());
 
     for c in "90".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
 
@@ -1251,7 +1265,7 @@ fn confirm_text_input_sets_and_clears_a_chosen_metadata_field() {
 
     pick(&mut app, "language");
     for c in "fra".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
     let ModifierKind::Metadata { fields } = &app.graph.modifier_mut(modifier).unwrap().kind else { unreachable!() };
@@ -1259,7 +1273,7 @@ fn confirm_text_input_sets_and_clears_a_chosen_metadata_field() {
 
     pick(&mut app, "title");
     for c in "Behind the Scenes".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
     let ModifierKind::Metadata { fields } = &app.graph.modifier_mut(modifier).unwrap().kind else { unreachable!() };
@@ -1270,7 +1284,7 @@ fn confirm_text_input_sets_and_clears_a_chosen_metadata_field() {
     // then confirm -- the key should be removed from the map entirely.
     pick(&mut app, "language");
     for _ in 0.."fra".len() {
-        app.text_input_backspace();
+        app.text_input_handle_key(key(KeyCode::Backspace));
     }
     app.confirm_text_input();
     let ModifierKind::Metadata { fields } = &app.graph.modifier_mut(modifier).unwrap().kind else { unreachable!() };
@@ -1633,12 +1647,14 @@ fn extra_args_picker_value_field_opens_text_input_and_stores() {
     app.picker_move(row as isize);
     app.picker_confirm();
 
-    let Mode::TextInput { target, buffer, .. } = &app.mode else { panic!("expected text input mode") };
+    let Mode::TextInput { target, input, .. } = &app.mode else {
+        panic!("expected text input mode");
+    };
     assert!(matches!(target, TextTarget::ExtraArgValue { key, .. } if key == "itsoffset"));
-    assert_eq!(buffer, "");
+    assert_eq!(input.value(), "");
 
     for c in "1.5".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
 
@@ -1664,16 +1680,17 @@ fn extra_args_picker_custom_key_flow_prompts_for_key_then_value() {
     assert!(matches!(target, TextTarget::ExtraArgCustomKey(_)));
 
     for c in "fflags".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
 
-    let Mode::TextInput { target, buffer, .. } = &app.mode else { panic!("expected value prompt to open") };
+    let Mode::TextInput { target, input, .. } = &app.mode else { panic!("expected value prompt to open") };
+    let buffer = input.value();
     assert!(matches!(target, TextTarget::ExtraArgValue { key, .. } if key == "fflags"));
     assert_eq!(buffer, "");
 
     for c in "+genpts".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
 
@@ -1719,13 +1736,14 @@ fn open_chapter_field(app: &mut crate::app::App, modifier: NodeId, index: usize)
 /// Metadata's), so replacing it means clearing what's there first --
 /// otherwise the new text is appended onto the old, not substituted.
 fn retype(app: &mut crate::app::App, text: &str) {
-    let crate::app::Mode::TextInput { buffer, .. } = &app.mode else { panic!("expected text input mode") };
+    let crate::app::Mode::TextInput { input, .. } = &app.mode else { panic!("expected text input mode") };
+    let buffer = input.value();
     let len = buffer.chars().count();
     for _ in 0..len {
-        app.text_input_backspace();
+        app.text_input_handle_key(key(KeyCode::Backspace));
     }
     for c in text.chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
 }
 
@@ -1785,7 +1803,9 @@ fn adding_a_chapter_prefills_start_from_previous_chapters_end() {
     let end_row = options.iter().position(|o| o.value.as_deref() == Some("end")).unwrap();
     app.picker_move(end_row as isize);
     app.picker_confirm();
-    let Mode::TextInput { target, .. } = &app.mode else { panic!("expected time text input") };
+    let Mode::TextInput { target, .. } = &app.mode else {
+        panic!("expected time text input");
+    };
     assert!(matches!(target, TextTarget::ChapterTime { field: ChapterTimeField::End, .. }));
     retype(&mut app, "1:30");
     app.confirm_text_input();
@@ -1882,7 +1902,7 @@ fn chapter_title_field_round_trips() {
     app.picker_move(title_row as isize);
     app.picker_confirm();
     for c in "The Beginning".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     app.confirm_text_input();
 
@@ -2466,11 +2486,11 @@ fn ui_renders_suggestions_popup_and_hides_outside_text_input() {
     let dir = make_suggestion_fixture();
     let mut app = App::new();
     app.start_add_input();
-    let Mode::TextInput { buffer, suggestions, selected, .. } = &mut app.mode else {
+    let Mode::TextInput { input, suggestions, selected, .. } = &mut app.mode else {
         panic!("expected text input mode");
     };
-    *buffer = format!("{}/a", dir.display());
-    *suggestions = crate::app::path_suggestions(buffer);
+    *input = tui_input::Input::new(format!("{}/a", dir.display()));
+    *suggestions = crate::app::path_suggestions(input.value());
     *selected = 1;
 
     let backend = TestBackend::new(140, 40);
@@ -3344,19 +3364,19 @@ fn text_input_accept_suggestion_drills_into_directories() {
     let dir = make_suggestion_fixture();
     let mut app = App::new();
     app.start_add_input();
-    let Mode::TextInput { buffer, suggestions, selected, .. } = &mut app.mode else {
+    let Mode::TextInput { input, suggestions, selected, .. } = &mut app.mode else {
         panic!("expected text input mode");
     };
-    *buffer = format!("{}/", dir.display());
-    *suggestions = crate::app::path_suggestions(buffer);
+    *input = tui_input::Input::new(format!("{}/", dir.display()));
+    *suggestions = crate::app::path_suggestions(input.value());
     *selected = suggestions.iter().position(|s| s.ends_with("subdir/")).expect("subdir should be offered");
 
     app.text_input_accept_suggestion();
 
-    let Mode::TextInput { buffer, suggestions, selected, .. } = &app.mode else {
+    let Mode::TextInput { input, suggestions, selected, .. } = &app.mode else {
         panic!("expected text input mode");
     };
-    assert_eq!(*buffer, format!("{}/subdir/", dir.display()));
+    assert_eq!(input.value(), format!("{}/subdir/", dir.display()));
     assert_eq!(*selected, 0, "selection should reset after accepting");
     assert!(suggestions.is_empty(), "the fixture's subdir is empty");
 
@@ -3370,11 +3390,11 @@ fn text_input_move_suggestion_wraps() {
     let dir = make_suggestion_fixture();
     let mut app = App::new();
     app.start_add_input();
-    let Mode::TextInput { buffer, suggestions, .. } = &mut app.mode else {
+    let Mode::TextInput { input, suggestions, .. } = &mut app.mode else {
         panic!("expected text input mode");
     };
-    *buffer = format!("{}/", dir.display());
-    *suggestions = crate::app::path_suggestions(buffer);
+    *input = tui_input::Input::new(format!("{}/", dir.display()));
+    *suggestions = crate::app::path_suggestions(input.value());
     let count = suggestions.len();
     assert!(count >= 2, "fixture should offer several entries");
 
@@ -3396,27 +3416,26 @@ fn text_input_char_and_backspace_refresh_suggestions() {
     let dir = make_suggestion_fixture();
     let mut app = App::new();
     app.start_add_input();
-    let Mode::TextInput { buffer, cursor, .. } = &mut app.mode else { panic!("expected text input mode") };
-    *buffer = format!("{}/", dir.display());
-    *cursor = buffer.chars().count(); // keep the cursor in sync with the buffer, same as a real edit would
+    let Mode::TextInput { input, .. } = &mut app.mode else { panic!("expected text input mode") };
+    *input = tui_input::Input::new(format!("{}/", dir.display())); // Input::new already puts the cursor at the end
 
     for c in "al".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    let Mode::TextInput { buffer, suggestions, selected, .. } = &app.mode else {
+    let Mode::TextInput { input, suggestions, selected, .. } = &app.mode else {
         panic!("expected text input mode");
     };
-    assert_eq!(buffer, &format!("{}/al", dir.display()));
+    assert_eq!(input.value(), format!("{}/al", dir.display()));
     assert_eq!(suggestions.len(), 2, "should narrow to the two 'al*' entries: {suggestions:?}");
     assert_eq!(*selected, 0);
 
     // One backspace narrows "al" to "a" -- still just the two "al*" entries.
-    app.text_input_backspace();
+    app.text_input_handle_key(key(KeyCode::Backspace));
     let Mode::TextInput { suggestions, .. } = &app.mode else { panic!("expected text input mode") };
     assert_eq!(suggestions.len(), 2, "'a' should still match only the two 'al*' entries: {suggestions:?}");
 
     // A second backspace clears the prefix entirely, widening to everything.
-    app.text_input_backspace();
+    app.text_input_handle_key(key(KeyCode::Backspace));
     let Mode::TextInput { suggestions, .. } = &app.mode else { panic!("expected text input mode") };
     assert_eq!(suggestions.len(), 4, "an empty prefix should widen the match to all four entries: {suggestions:?}");
 
@@ -3433,9 +3452,11 @@ fn text_input_mode_starts_with_cursor_at_the_end_of_the_buffer() {
     let mut app = App::new();
     app.graph.outputs[0].path = "out.mkv".to_string();
     app.start_edit_output();
-    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!("expected text input mode") };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!("expected text input mode") };
+    let buffer = input.value();
+    let cursor = input.cursor();
     assert_eq!(buffer, "out.mkv");
-    assert_eq!(*cursor, 7);
+    assert_eq!(cursor, 7);
 }
 
 /// Left/Right should move the cursor within the buffer, clamped to its
@@ -3448,22 +3469,61 @@ fn text_input_move_cursor_clamps_to_buffer_bounds() {
     let mut app = App::new();
     app.start_add_input();
     for c in "abc".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
-    assert_eq!(*cursor, 3);
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let cursor = input.cursor();
+    assert_eq!(cursor, 3);
 
-    app.text_input_move_cursor(-1);
-    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
-    assert_eq!(*cursor, 2);
+    app.text_input_handle_key(key(KeyCode::Left));
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let cursor = input.cursor();
+    assert_eq!(cursor, 2);
 
-    app.text_input_move_cursor(-10);
-    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
-    assert_eq!(*cursor, 0, "moving past the start should clamp, not go negative");
+    for _ in 0..10 {
+        app.text_input_handle_key(key(KeyCode::Left));
+    }
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let cursor = input.cursor();
+    assert_eq!(cursor, 0, "moving past the start should clamp, not go negative");
 
-    app.text_input_move_cursor(10);
-    let Mode::TextInput { cursor, .. } = &app.mode else { panic!() };
-    assert_eq!(*cursor, 3, "moving past the end should clamp to the buffer's length");
+    for _ in 0..10 {
+        app.text_input_handle_key(key(KeyCode::Right));
+    }
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let cursor = input.cursor();
+    assert_eq!(cursor, 3, "moving past the end should clamp to the buffer's length");
+}
+
+/// Home/End should jump the cursor straight to the start/end of the
+/// buffer, same as a normal text field -- backed by `tui_input`'s
+/// `GoToStart`/`GoToEnd` requests.
+#[test]
+fn text_input_home_and_end_jump_to_the_buffer_bounds() {
+    use crate::app::{App, Mode};
+
+    let mut app = App::new();
+    app.start_add_input();
+    for c in "hello".chars() {
+        app.text_input_handle_key(key(KeyCode::Char(c)));
+    }
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    assert_eq!(input.cursor(), 5, "cursor should already be at the end after typing");
+
+    app.text_input_handle_key(key(KeyCode::Home));
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    assert_eq!(input.cursor(), 0);
+
+    app.text_input_handle_key(key(KeyCode::End));
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    assert_eq!(input.cursor(), 5);
+
+    // Home then typing should insert at the very start, not append.
+    app.text_input_handle_key(key(KeyCode::Home));
+    app.text_input_handle_key(key(KeyCode::Char('!')));
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    assert_eq!(input.value(), "!hello");
+    assert_eq!(input.cursor(), 1);
 }
 
 /// Typing with the cursor positioned mid-buffer should insert right there
@@ -3476,14 +3536,16 @@ fn text_input_char_inserts_at_the_cursor_not_always_at_the_end() {
     let mut app = App::new();
     app.start_add_input();
     for c in "ac".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    app.text_input_move_cursor(-1); // between 'a' and 'c'
-    app.text_input_char('b');
+    app.text_input_handle_key(key(KeyCode::Left)); // between 'a' and 'c'
+    app.text_input_handle_key(key(KeyCode::Char('b')));
 
-    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
+    let cursor = input.cursor();
     assert_eq!(buffer, "abc");
-    assert_eq!(*cursor, 2, "cursor should land right after the inserted character");
+    assert_eq!(cursor, 2, "cursor should land right after the inserted character");
 }
 
 /// Backspace with the cursor mid-buffer should remove the character just
@@ -3495,14 +3557,16 @@ fn text_input_backspace_removes_the_character_before_the_cursor() {
     let mut app = App::new();
     app.start_add_input();
     for c in "abc".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    app.text_input_move_cursor(-1); // between 'b' and 'c'
-    app.text_input_backspace();
+    app.text_input_handle_key(key(KeyCode::Left)); // between 'b' and 'c'
+    app.text_input_handle_key(key(KeyCode::Backspace));
 
-    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
+    let cursor = input.cursor();
     assert_eq!(buffer, "ac");
-    assert_eq!(*cursor, 1);
+    assert_eq!(cursor, 1);
 }
 
 /// Backspace at the very start of the buffer (cursor at 0) should be a
@@ -3514,14 +3578,18 @@ fn text_input_backspace_at_start_of_buffer_is_a_no_op() {
     let mut app = App::new();
     app.start_add_input();
     for c in "ab".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    app.text_input_move_cursor(-10); // clamp to 0
-    app.text_input_backspace();
+    for _ in 0..10 { // clamp to 0
+        app.text_input_handle_key(key(KeyCode::Left));
+    }
+    app.text_input_handle_key(key(KeyCode::Backspace));
 
-    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
+    let cursor = input.cursor();
     assert_eq!(buffer, "ab", "nothing before the cursor to remove");
-    assert_eq!(*cursor, 0);
+    assert_eq!(cursor, 0);
 }
 
 /// The Delete key removes the character right at the cursor (the mirror
@@ -3533,14 +3601,18 @@ fn text_input_delete_removes_the_character_at_the_cursor() {
     let mut app = App::new();
     app.start_add_input();
     for c in "abc".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    app.text_input_move_cursor(-2); // between 'a' and 'b'
-    app.text_input_delete(); // removes 'b'
+    for _ in 0..2 { // between 'a' and 'b'
+        app.text_input_handle_key(key(KeyCode::Left));
+    }
+    app.text_input_handle_key(key(KeyCode::Delete)); // removes 'b'
 
-    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
+    let cursor = input.cursor();
     assert_eq!(buffer, "ac");
-    assert_eq!(*cursor, 1, "the cursor shouldn't move -- only what's ahead of it is removed");
+    assert_eq!(cursor, 1, "the cursor shouldn't move -- only what's ahead of it is removed");
 }
 
 /// Delete at the very end of the buffer (nothing to its right) should be
@@ -3552,14 +3624,16 @@ fn text_input_delete_at_end_of_buffer_is_a_no_op() {
     let mut app = App::new();
     app.start_add_input();
     for c in "ab".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
     // Cursor is already at the end after typing.
-    app.text_input_delete();
+    app.text_input_handle_key(key(KeyCode::Delete));
 
-    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
+    let cursor = input.cursor();
     assert_eq!(buffer, "ab", "nothing after the cursor to remove");
-    assert_eq!(*cursor, 2);
+    assert_eq!(cursor, 2);
 }
 
 /// Delete should handle a multi-byte UTF-8 character right at the cursor
@@ -3571,12 +3645,13 @@ fn text_input_delete_handles_multi_byte_utf8() {
     let mut app = App::new();
     app.start_add_input();
     for c in "café".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    app.text_input_move_cursor(-1); // right before 'é'
-    app.text_input_delete();
+    app.text_input_handle_key(key(KeyCode::Left)); // right before 'é'
+    app.text_input_handle_key(key(KeyCode::Delete));
 
-    let Mode::TextInput { buffer, .. } = &app.mode else { panic!() };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
     assert_eq!(buffer, "caf");
 }
 
@@ -3591,20 +3666,24 @@ fn text_input_char_and_backspace_handle_multi_byte_utf8() {
     let mut app = App::new();
     app.start_add_input();
     for c in "café".chars() {
-        app.text_input_char(c);
+        app.text_input_handle_key(key(KeyCode::Char(c)));
     }
-    let Mode::TextInput { buffer, cursor, .. } = &app.mode else { panic!() };
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
+    let cursor = input.cursor();
     assert_eq!(buffer, "café");
-    assert_eq!(*cursor, 4, "cursor counts chars, not bytes, even though é is multi-byte");
+    assert_eq!(cursor, 4, "cursor counts chars, not bytes, even though é is multi-byte");
 
-    app.text_input_move_cursor(-1); // between 'f' and 'é'
-    app.text_input_char('!');
-    let Mode::TextInput { buffer, .. } = &app.mode else { panic!() };
+    app.text_input_handle_key(key(KeyCode::Left)); // between 'f' and 'é'
+    app.text_input_handle_key(key(KeyCode::Char('!')));
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
     assert_eq!(buffer, "caf!é");
 
-    app.text_input_backspace(); // removes the '!' just inserted
-    app.text_input_backspace(); // removes 'f'
-    let Mode::TextInput { buffer, .. } = &app.mode else { panic!() };
+    app.text_input_handle_key(key(KeyCode::Backspace)); // removes the '!' just inserted
+    app.text_input_handle_key(key(KeyCode::Backspace)); // removes 'f'
+    let Mode::TextInput { input, .. } = &app.mode else { panic!() };
+    let buffer = input.value();
     assert_eq!(buffer, "caé");
 }
 

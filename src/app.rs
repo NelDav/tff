@@ -2,6 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use crossterm::event::{Event as CrosstermEvent, KeyEvent};
+use tui_input::backend::crossterm::EventHandler;
+use tui_input::Input;
+
 use crate::ffmpeg;
 use crate::graph::{Chapter, Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, StreamKind, Target};
 
@@ -157,7 +161,7 @@ pub enum Mode {
     Normal,
     TextInput {
         target: TextTarget,
-        buffer: String,
+        input: Input,
         /// Files/directories in the buffer's current directory whose name
         /// starts with what's typed after the last '/' -- recomputed on
         /// every keystroke. See `path_suggestions`. Left empty for
@@ -165,13 +169,6 @@ pub enum Mode {
         /// apply.
         suggestions: Vec<String>,
         selected: usize,
-        /// Position within `buffer`, in `char`s (not bytes -- a buffer can
-        /// hold multi-byte UTF-8, e.g. a chapter title), where the next
-        /// typed character is inserted or Backspace removes from. Always
-        /// starts at the end of whatever the field is prefilled with (see
-        /// `text_input_mode`), matching how a real text field positions
-        /// the cursor when you tab into it with existing content.
-        cursor: usize,
     },
     Picker {
         kind: PickerKind,
@@ -671,11 +668,12 @@ impl App {
     }
 
     pub fn confirm_text_input(&mut self) {
-        let Mode::TextInput { target, buffer, .. } =
+        let Mode::TextInput { target, input, .. } =
             std::mem::replace(&mut self.mode, Mode::Normal)
         else {
             return;
         };
+        let buffer = input.value().to_string();
         match target {
             TextTarget::NewInputPath => {
                 let path = clean_path_input(&buffer);
@@ -810,84 +808,21 @@ impl App {
         }
     }
 
-    /// Inserts at the cursor position (not necessarily the end of the
-    /// buffer -- see `Mode::TextInput::cursor`'s doc comment), then
-    /// advances the cursor past what was just typed.
-    pub fn text_input_char(&mut self, c: char) {
-        if let Mode::TextInput {
-            target,
-            buffer,
-            suggestions,
-            selected,
-            cursor,
-        } = &mut self.mode
-        {
-            buffer.insert(char_byte_offset(buffer, *cursor), c);
-            *cursor += 1;
+    /// Forwards a key event straight to `tui_input`'s own key handling --
+    /// covers typing, Backspace/Delete, Left/Right, Home/End, and (if ever
+    /// bound in `main.rs`) word-jump/kill-line, all via its
+    /// `to_input_request` mapping -- then refreshes path suggestions if
+    /// this field is one that offers them. `main.rs` routes every
+    /// `TextInput`-mode key here except Enter/Esc/Tab/Up/Down, which
+    /// `to_input_request` leaves unmapped anyway (they're mode transitions
+    /// and suggestion-list navigation, not text edits).
+    pub fn text_input_handle_key(&mut self, key: KeyEvent) {
+        if let Mode::TextInput { target, input, suggestions, selected } = &mut self.mode {
+            input.handle_event(&CrosstermEvent::Key(key));
             if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
-                *suggestions = path_suggestions(buffer);
+                *suggestions = path_suggestions(input.value());
                 *selected = 0;
             }
-        }
-    }
-
-    /// Removes the character immediately before the cursor (not
-    /// necessarily the buffer's last character), same as a normal text
-    /// field.
-    pub fn text_input_backspace(&mut self) {
-        if let Mode::TextInput {
-            target,
-            buffer,
-            suggestions,
-            selected,
-            cursor,
-        } = &mut self.mode
-        {
-            if *cursor == 0 {
-                return;
-            }
-            buffer.remove(char_byte_offset(buffer, *cursor - 1));
-            *cursor -= 1;
-            if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
-                *suggestions = path_suggestions(buffer);
-                *selected = 0;
-            }
-        }
-    }
-
-    /// The Delete key: removes the character right at the cursor (the one
-    /// that would be typed over next), leaving the cursor itself in place
-    /// -- the mirror image of Backspace, for trimming what's ahead of the
-    /// insertion point instead of behind it. A no-op at the end of the
-    /// buffer, where there's nothing there to remove.
-    pub fn text_input_delete(&mut self) {
-        if let Mode::TextInput {
-            target,
-            buffer,
-            suggestions,
-            selected,
-            cursor,
-        } = &mut self.mode
-        {
-            let byte_off = char_byte_offset(buffer, *cursor);
-            if byte_off >= buffer.len() {
-                return;
-            }
-            buffer.remove(byte_off);
-            if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
-                *suggestions = path_suggestions(buffer);
-                *selected = 0;
-            }
-        }
-    }
-
-    /// Left/Right while typing: move the insertion point within the
-    /// buffer, clamped to its bounds -- lets an existing value be edited
-    /// in place instead of only appended to or erased from the end.
-    pub fn text_input_move_cursor(&mut self, delta: isize) {
-        if let Mode::TextInput { buffer, cursor, .. } = &mut self.mode {
-            let len = buffer.chars().count() as isize;
-            *cursor = (*cursor as isize + delta).clamp(0, len) as usize;
         }
     }
 
@@ -912,17 +847,15 @@ impl App {
     /// the new, longer buffer so drilling into a directory keeps working.
     pub fn text_input_accept_suggestion(&mut self) {
         if let Mode::TextInput {
-            buffer,
+            input,
             suggestions,
             selected,
-            cursor,
             ..
         } = &mut self.mode
             && let Some(chosen) = suggestions.get(*selected).cloned()
         {
-            *buffer = chosen;
-            *cursor = buffer.chars().count();
-            *suggestions = path_suggestions(buffer);
+            *input = Input::new(chosen);
+            *suggestions = path_suggestions(input.value());
             *selected = 0;
         }
     }
@@ -1720,16 +1653,16 @@ fn expand_tilde(s: &str) -> String {
 /// `buffer` -- the natural starting position whether the field opens empty
 /// or prefilled with an existing value (e.g. re-editing a metadata field).
 fn text_input_mode(target: TextTarget, buffer: String, suggestions: Vec<String>) -> Mode {
-    let cursor = buffer.chars().count();
-    Mode::TextInput { target, buffer, suggestions, selected: 0, cursor }
+    Mode::TextInput { target, input: Input::new(buffer), suggestions, selected: 0 }
 }
 
 /// The byte offset in `s` where its `char_idx`-th character starts --
-/// `String::insert`/`String::remove` need a byte offset, but
-/// `Mode::TextInput::cursor` is a char index (safe for multi-byte UTF-8).
-/// `char_idx == s.chars().count()` (one past the last character, the
-/// end-of-buffer position) falls through to `s.len()`, since there's no
-/// char at that index to report a start byte for.
+/// `tui_input::Input::cursor()` returns a char index (safe for multi-byte
+/// UTF-8), but rendering the cursor (see `ui::draw_status_line`) needs a
+/// byte offset to split the string around it. `char_idx ==
+/// s.chars().count()` (one past the last character, the end-of-buffer
+/// position) falls through to `s.len()`, since there's no char at that
+/// index to report a start byte for.
 pub(crate) fn char_byte_offset(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
 }

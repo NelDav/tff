@@ -53,7 +53,9 @@ fn describe_endpoint(graph: &Graph, ep: Endpoint) -> Option<String> {
 
 fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.mode {
-        Mode::TextInput { target, buffer, cursor, .. } => {
+        Mode::TextInput { target, input, .. } => {
+            let buffer = input.value();
+            let cursor = input.cursor();
             let prompt = match target {
                 crate::app::TextTarget::NewInputPath => "add input file path: ".to_string(),
                 crate::app::TextTarget::OutputPath(_) => "output file path: ".to_string(),
@@ -73,7 +75,7 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
             // point in place, since it's no longer always the end of the
             // buffer -- a trailing blinking underscore would be
             // misleading once the cursor can sit mid-string.
-            let byte_off = crate::app::char_byte_offset(buffer, *cursor);
+            let byte_off = crate::app::char_byte_offset(buffer, cursor);
             let before = &buffer[..byte_off];
             let mut after_chars = buffer[byte_off..].chars();
             let mut spans = vec![
