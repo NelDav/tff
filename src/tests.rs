@@ -842,6 +842,131 @@ fn ctrl_a_is_a_no_op_off_an_input_node() {
     assert!(app.selected.is_empty());
 }
 
+/// Ctrl+Down moves the hovered mapped-stream row past its neighbor --
+/// output stream order tracks wire order (see `Graph::incoming`), so this
+/// reorders which stream lands where in the muxed container without
+/// touching either wire's own endpoints.
+#[test]
+fn ctrl_down_swaps_the_hovered_output_row_with_the_next() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), three_streams(), Vec::new());
+    let out = app.graph.outputs[0].id;
+    let video = Endpoint::Stream { node: id, stream_idx: 0 };
+    let audio = Endpoint::Stream { node: id, stream_idx: 1 };
+    let subtitle = Endpoint::Stream { node: id, stream_idx: 2 };
+    app.graph.connect(video, Target::Output(out));
+    app.graph.connect(audio, Target::Output(out));
+    app.graph.connect(subtitle, Target::Output(out));
+
+    app.focus = Focus::Output(0);
+    app.row_idx = 0;
+    app.move_output_row(true);
+
+    let order: Vec<Endpoint> = app
+        .graph
+        .incoming(Target::Output(out))
+        .into_iter()
+        .map(|wi| app.graph.wires[wi].from)
+        .collect();
+    assert_eq!(order, vec![audio, video, subtitle], "video should have moved past audio");
+    assert_eq!(app.row_idx, 1, "the hovered row should follow the moved wire");
+
+    // Move it back up again -- should restore the original order.
+    app.move_output_row(false);
+    let order: Vec<Endpoint> = app
+        .graph
+        .incoming(Target::Output(out))
+        .into_iter()
+        .map(|wi| app.graph.wires[wi].from)
+        .collect();
+    assert_eq!(order, vec![video, audio, subtitle]);
+    assert_eq!(app.row_idx, 0);
+}
+
+/// Reordering is a no-op at either edge of the mapped-stream list and on
+/// the chapters row (there's only ever one, nothing to swap it with).
+#[test]
+fn move_output_row_is_a_no_op_at_edges_and_on_the_chapters_row() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), three_streams(), Vec::new());
+    let chapters_id = app.graph.add_input(
+        "chaps.mp4".to_string(),
+        video_stream(),
+        vec![Chapter::new(0.0, 1.0, "one".to_string())],
+    );
+    let out = app.graph.outputs[0].id;
+    let video = Endpoint::Stream { node: id, stream_idx: 0 };
+    let audio = Endpoint::Stream { node: id, stream_idx: 1 };
+    app.graph.connect(video, Target::Output(out));
+    app.graph.connect(audio, Target::Output(out));
+    app.graph.connect(
+        Endpoint::Stream { node: chapters_id, stream_idx: 1 },
+        Target::OutputChapters(out),
+    );
+
+    app.focus = Focus::Output(0);
+
+    // Already at the top -- moving up further is a no-op.
+    app.row_idx = 0;
+    app.move_output_row(false);
+    assert_eq!(app.row_idx, 0);
+    let order: Vec<Endpoint> = app
+        .graph
+        .incoming(Target::Output(out))
+        .into_iter()
+        .map(|wi| app.graph.wires[wi].from)
+        .collect();
+    assert_eq!(order, vec![video, audio]);
+
+    // Already at the bottom of the mapped-stream rows -- moving down
+    // further is a no-op too.
+    app.row_idx = 1;
+    app.move_output_row(true);
+    assert_eq!(app.row_idx, 1);
+    let order: Vec<Endpoint> = app
+        .graph
+        .incoming(Target::Output(out))
+        .into_iter()
+        .map(|wi| app.graph.wires[wi].from)
+        .collect();
+    assert_eq!(order, vec![video, audio]);
+
+    // The chapters row (index 2, one past the two mapped-stream rows) has
+    // nothing to reorder against.
+    app.row_idx = 2;
+    app.move_output_row(true);
+    app.move_output_row(false);
+    assert!(!app.graph.incoming(Target::OutputChapters(out)).is_empty(), "chapters wire untouched");
+}
+
+/// Ctrl+Up/Down is a no-op off an output node.
+#[test]
+fn move_output_row_is_a_no_op_off_an_output_node() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let out = app.graph.outputs[0].id;
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::Output(out));
+
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.move_output_row(true);
+
+    let order: Vec<Endpoint> = app
+        .graph
+        .incoming(Target::Output(out))
+        .into_iter()
+        .map(|wi| app.graph.wires[wi].from)
+        .collect();
+    assert_eq!(order[0], Endpoint::Stream { node: id, stream_idx: 0 }, "unrelated focus shouldn't reorder anything");
+}
+
 /// Shift+Down/Up extends a contiguous range from wherever it started,
 /// recomputed fresh each press so shrinking the range back correctly
 /// drops rows that fall outside it again.

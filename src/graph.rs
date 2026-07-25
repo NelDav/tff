@@ -765,6 +765,16 @@ impl Graph {
         }
     }
 
+    /// Swaps two wires' positions in `self.wires`. `incoming`/`outgoing`
+    /// report wires in `self.wires` order, and for an output's
+    /// mapped-stream slot that order is what ffmpeg's `-map` sequence (and
+    /// so the stream order in the muxed container) follows -- so this is
+    /// how a caller reorders an output's streams without touching any
+    /// wire's own `from`/`to`.
+    pub fn swap_wires(&mut self, a: usize, b: usize) {
+        self.wires.swap(a, b);
+    }
+
     /// Walk backward from `from` to its ultimate source stream, threading
     /// through however many modifiers sit in between and accumulating the
     /// codec/metadata each one sets (first one encountered walking

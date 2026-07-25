@@ -1124,6 +1124,31 @@ impl App {
         }
     }
 
+    /// Ctrl+Up/Down while an output node is focused: moves the hovered
+    /// mapped-stream row past its neighbor, which reorders the streams in
+    /// the muxed container (see `Graph::swap_wires`). A no-op on the
+    /// chapters row (there's only ever one, nothing to reorder it against)
+    /// or at either edge of the list.
+    pub fn move_output_row(&mut self, forward: bool) {
+        let Focus::Output(i) = self.focus else { return };
+        let Some(output_id) = self.graph.outputs.get(i).map(|o| o.id) else {
+            return;
+        };
+        let incoming = self.graph.incoming(Target::Output(output_id));
+        if self.row_idx >= incoming.len() {
+            return;
+        }
+        let Some(new_row) = (if forward { self.row_idx.checked_add(1) } else { self.row_idx.checked_sub(1) })
+        else {
+            return;
+        };
+        if new_row >= incoming.len() {
+            return;
+        }
+        self.graph.swap_wires(incoming[self.row_idx], incoming[new_row]);
+        self.row_idx = new_row;
+    }
+
     /// 'f': open a picker listing ffmpeg's available output containers for
     /// the focused output node.
     pub fn open_container_picker(&mut self) {
