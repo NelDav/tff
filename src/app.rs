@@ -81,6 +81,33 @@ pub enum ChapterTimeField {
     End,
 }
 
+/// Which column of the chapter table (see `Mode::ChapterTable`) is
+/// selected on the current row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChapterColumn {
+    Start,
+    End,
+    Title,
+}
+
+impl ChapterColumn {
+    fn next(self) -> Self {
+        match self {
+            ChapterColumn::Start => ChapterColumn::End,
+            ChapterColumn::End => ChapterColumn::Title,
+            ChapterColumn::Title => ChapterColumn::Start,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            ChapterColumn::Start => ChapterColumn::Title,
+            ChapterColumn::End => ChapterColumn::Start,
+            ChapterColumn::Title => ChapterColumn::End,
+        }
+    }
+}
+
 /// Which node's `extra_args` map a picker/text-input session is editing --
 /// input and output nodes share the exact same editing flow (curated-keys
 /// picker with a custom-key escape hatch, see `graph::input_extra_arg_keys`
@@ -136,17 +163,6 @@ pub enum PickerKind {
     ExtraArgField {
         target: ExtraArgsTarget,
     },
-    /// Choosing which chapter to edit on a `ChapterEdit` modifier, or to
-    /// add a new one / import from whatever's connected to its input.
-    /// Reached via 'e' on a focused `ChapterEdit` node.
-    ChapterList {
-        modifier: NodeId,
-    },
-    /// Editing one chapter's start/end/title, or deleting it.
-    ChapterField {
-        modifier: NodeId,
-        index: usize,
-    },
 }
 
 pub struct PickerEntry {
@@ -181,6 +197,18 @@ pub enum Mode {
         /// Whether `/` is currently accepting query text, vs. plain list
         /// navigation with a filter already applied (or none).
         searching: bool,
+    },
+    /// A `ChapterEdit` modifier's chapter list, shown as a table (one row
+    /// per chapter, columns for start/end/title) navigated directly rather
+    /// than through a picker -- Enter on a cell edits it in place, and
+    /// Enter on the trailing "add chapter" row (`row == chapters.len()`)
+    /// just appends one, so adding a chapter is a single keystroke instead
+    /// of a chain of nested menus. Reached via 'e' on a focused
+    /// `ChapterEdit` node.
+    ChapterTable {
+        modifier: NodeId,
+        row: usize,
+        col: ChapterColumn,
     },
 }
 
@@ -555,47 +583,139 @@ impl App {
         };
     }
 
-    /// Opens the chapter list for a `ChapterEdit` modifier: one row per
-    /// existing chapter, plus "add chapter..." and, if something's wired
-    /// into this node's input, "import from connected input...".
-    fn open_chapter_list_picker(&mut self, modifier: NodeId) {
-        self.mode = Mode::Picker {
-            kind: PickerKind::ChapterList { modifier },
-            title: "chapters".to_string(),
-            options: chapter_list_picker_options(&self.graph, modifier),
-            selected: 0,
-            query: String::new(),
-            searching: false,
-        };
+    /// 'e' on a focused `ChapterEdit` modifier: opens its chapter table
+    /// directly, landing on the first chapter's start column -- or, if the
+    /// list is empty, straight on the trailing "add chapter" row, so
+    /// adding the very first chapter is just 'e' then Enter.
+    fn open_chapter_table(&mut self, modifier: NodeId) {
+        self.mode = Mode::ChapterTable { modifier, row: 0, col: ChapterColumn::Start };
     }
 
-    /// Opens the field editor (start/end/title/delete) for one chapter.
-    /// No-op if `index` is out of range (e.g. the chapter was just
-    /// deleted).
-    fn open_chapter_field_picker(&mut self, modifier: NodeId, index: usize) {
-        let Some(chapter) = chapter_edit_chapters(&self.graph, modifier).and_then(|cs| cs.get(index)) else {
+    /// Up/Down while the chapter table is open: moves between chapter
+    /// rows, including the trailing "add chapter" row one past the last
+    /// real chapter (see `Mode::ChapterTable`).
+    pub fn chapter_table_move_row(&mut self, forward: bool) {
+        let Mode::ChapterTable { modifier, row, .. } = &mut self.mode else { return };
+        let len = chapter_edit_chapters(&self.graph, *modifier).map_or(0, |cs| cs.len());
+        if forward {
+            if *row < len {
+                *row += 1;
+            }
+        } else if *row > 0 {
+            *row -= 1;
+        }
+    }
+
+    /// Left/Right while the chapter table is open: cycles which column is
+    /// selected on the current row. Meaningless on the trailing "add
+    /// chapter" row, but harmless to move anyway -- Enter there always
+    /// just adds, regardless of column.
+    pub fn chapter_table_move_col(&mut self, forward: bool) {
+        let Mode::ChapterTable { col, .. } = &mut self.mode else { return };
+        *col = if forward { col.next() } else { col.prev() };
+    }
+
+    /// Tab/Shift+Tab while the chapter table is open: moves through cells
+    /// in reading order rather than staying within a row like Left/Right
+    /// do -- past the last column of a row, it wraps to the first column
+    /// of the next one (and symmetrically backward), landing on the
+    /// trailing "add chapter" row same as any other row. Clamped at the
+    /// very first and very last cell.
+    pub fn chapter_table_tab(&mut self, forward: bool) {
+        let Mode::ChapterTable { modifier, row, col } = &mut self.mode else { return };
+        let len = chapter_edit_chapters(&self.graph, *modifier).map_or(0, |cs| cs.len());
+        if forward {
+            if *row >= len {
+                return; // already on the add row -- nothing further to tab into
+            }
+            if *col == ChapterColumn::Title {
+                *row += 1;
+                *col = ChapterColumn::Start;
+            } else {
+                *col = col.next();
+            }
+        } else if *col == ChapterColumn::Start {
+            if *row == 0 {
+                return; // already at the very first cell
+            }
+            *row -= 1;
+            *col = ChapterColumn::Title;
+        } else {
+            *col = col.prev();
+        }
+    }
+
+    /// Enter while the chapter table is open. On the trailing "add
+    /// chapter" row, appends a new chapter right away -- prefilled with
+    /// the previous chapter's end time as its own start, so a run of
+    /// additions chains without retyping -- and lands the cursor on it,
+    /// with no further menu needed to actually have a chapter in the
+    /// list. On an existing chapter's row, opens the text input for
+    /// whichever column is selected, same as before, just reached
+    /// directly instead of through a second picker.
+    pub fn chapter_table_confirm(&mut self) {
+        let Mode::ChapterTable { modifier, row, col } = &self.mode else { return };
+        let (modifier, row, col) = (*modifier, *row, *col);
+        let len = chapter_edit_chapters(&self.graph, modifier).map_or(0, |cs| cs.len());
+
+        if row >= len {
+            let start = chapter_edit_chapters(&self.graph, modifier).and_then(|cs| cs.last()).map_or(0.0, |c| c.end_secs);
+            if let Some(chapters) = chapter_edit_chapters_mut(&mut self.graph, modifier) {
+                chapters.push(Chapter::new(start, start, String::new()));
+            }
+            self.log.push("added chapter".to_string());
+            self.mode = Mode::ChapterTable { modifier, row: len, col: ChapterColumn::Start };
+            return;
+        }
+
+        let Some(chapter) = chapter_edit_chapters(&self.graph, modifier).and_then(|cs| cs.get(row)) else {
             return;
         };
-        let options = vec![
-            PickerEntry {
-                display: format!("start: {}", crate::graph::format_time(chapter.start_secs)),
-                value: Some("start".to_string()),
-            },
-            PickerEntry {
-                display: format!("end: {}", crate::graph::format_time(chapter.end_secs)),
-                value: Some("end".to_string()),
-            },
-            PickerEntry { display: format!("title: {}", chapter.title), value: Some("title".to_string()) },
-            PickerEntry { display: "delete this chapter".to_string(), value: Some("delete".to_string()) },
-        ];
-        self.mode = Mode::Picker {
-            kind: PickerKind::ChapterField { modifier, index },
-            title: "edit chapter".to_string(),
-            options,
-            selected: 0,
-            query: String::new(),
-            searching: false,
-        };
+        match col {
+            ChapterColumn::Start | ChapterColumn::End => {
+                let field = match col {
+                    ChapterColumn::Start => ChapterTimeField::Start,
+                    _ => ChapterTimeField::End,
+                };
+                let current = match field {
+                    ChapterTimeField::Start => chapter.start_secs,
+                    ChapterTimeField::End => chapter.end_secs,
+                };
+                self.mode = text_input_mode(
+                    TextTarget::ChapterTime { modifier, index: row, field },
+                    crate::graph::format_time(current),
+                    Vec::new(),
+                );
+            }
+            ChapterColumn::Title => {
+                let current = chapter.title.clone();
+                self.mode = text_input_mode(TextTarget::ChapterTitle { modifier, index: row }, current, Vec::new());
+            }
+        }
+    }
+
+    /// 'd' while the chapter table is open: removes the chapter at the
+    /// current row. A no-op on the trailing "add chapter" row -- there's
+    /// nothing there to delete.
+    pub fn chapter_table_delete(&mut self) {
+        let Mode::ChapterTable { modifier, row, .. } = &self.mode else { return };
+        let (modifier, row) = (*modifier, *row);
+        let Some(chapters) = chapter_edit_chapters_mut(&mut self.graph, modifier) else { return };
+        if row >= chapters.len() {
+            return;
+        }
+        chapters.remove(row);
+        self.log.push("chapter deleted".to_string());
+        let new_len = chapter_edit_chapters(&self.graph, modifier).map_or(0, |cs| cs.len());
+        if let Mode::ChapterTable { row, .. } = &mut self.mode {
+            *row = (*row).min(new_len);
+        }
+    }
+
+    /// Esc while the chapter table is open: just closes it back to
+    /// Normal, same as every other overlay in this app.
+    pub fn chapter_table_close(&mut self) {
+        self.mode = Mode::Normal;
     }
 
 
@@ -736,13 +856,36 @@ impl App {
                 };
             }
             ModifierKind::ChapterEdit { .. } => {
-                self.open_chapter_list_picker(mid);
+                self.open_chapter_table(mid);
             }
         }
     }
 
+    /// Esc while typing: discards the buffer and, for every other text
+    /// target, drops straight back to Normal. A chapter's start/end/title
+    /// is the one exception -- it was reached by drilling into the
+    /// chapter table (see `Mode::ChapterTable`), not straight from Normal,
+    /// so cancelling just the text edit should land back in that table at
+    /// the same cell rather than throwing away the whole chapter-editing
+    /// session.
     pub fn cancel_text_input(&mut self) {
-        self.mode = Mode::Normal;
+        let Mode::TextInput { target, .. } = &self.mode else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = match target {
+            TextTarget::ChapterTime { modifier, index, field } => {
+                let col = match field {
+                    ChapterTimeField::Start => ChapterColumn::Start,
+                    ChapterTimeField::End => ChapterColumn::End,
+                };
+                Mode::ChapterTable { modifier: *modifier, row: *index, col }
+            }
+            TextTarget::ChapterTitle { modifier, index } => {
+                Mode::ChapterTable { modifier: *modifier, row: *index, col: ChapterColumn::Title }
+            }
+            _ => Mode::Normal,
+        };
     }
 
     pub fn confirm_text_input(&mut self) {
@@ -870,9 +1013,13 @@ impl App {
                         ));
                     }
                 }
-                // Return to the field editor either way, so a mistyped
-                // time doesn't lose the user's place in the chapter.
-                self.open_chapter_field_picker(modifier, index);
+                // Return to the table at the same cell either way, so a
+                // mistyped time doesn't lose the user's place.
+                let col = match field {
+                    ChapterTimeField::Start => ChapterColumn::Start,
+                    ChapterTimeField::End => ChapterColumn::End,
+                };
+                self.mode = Mode::ChapterTable { modifier, row: index, col };
             }
             TextTarget::ChapterTitle { modifier, index } => {
                 if let Some(chapter) =
@@ -881,7 +1028,7 @@ impl App {
                     chapter.title = buffer.trim().to_string();
                 }
                 self.log.push("chapter title set".to_string());
-                self.open_chapter_field_picker(modifier, index);
+                self.mode = Mode::ChapterTable { modifier, row: index, col: ChapterColumn::Title };
             }
         }
     }
@@ -1509,59 +1656,6 @@ impl App {
                     }
                 }
             }
-            PickerKind::ChapterList { modifier } => match entry.value.as_deref() {
-                Some("add") => {
-                    let index = chapter_edit_chapters(&self.graph, modifier).map_or(0, |cs| cs.len());
-                    let start = chapter_edit_chapters(&self.graph, modifier)
-                        .and_then(|cs| cs.last())
-                        .map_or(0.0, |c| c.end_secs);
-                    if let Some(chapters) = chapter_edit_chapters_mut(&mut self.graph, modifier) {
-                        chapters.push(Chapter::new(start, start, String::new()));
-                    }
-                    self.log.push("added chapter".to_string());
-                    self.open_chapter_field_picker(modifier, index);
-                }
-                Some(idx_str) => {
-                    if let Ok(index) = idx_str.parse::<usize>() {
-                        self.open_chapter_field_picker(modifier, index);
-                    }
-                }
-                None => {}
-            },
-            PickerKind::ChapterField { modifier, index } => match entry.value.as_deref() {
-                Some("start") | Some("end") => {
-                    let Some(chapter) = chapter_edit_chapters(&self.graph, modifier).and_then(|cs| cs.get(index))
-                    else {
-                        return;
-                    };
-                    let field = if entry.value.as_deref() == Some("start") {
-                        ChapterTimeField::Start
-                    } else {
-                        ChapterTimeField::End
-                    };
-                    let current = match field {
-                        ChapterTimeField::Start => chapter.start_secs,
-                        ChapterTimeField::End => chapter.end_secs,
-                    };
-                    self.mode = text_input_mode(TextTarget::ChapterTime { modifier, index, field }, crate::graph::format_time(current), Vec::new());
-                }
-                Some("title") => {
-                    let current = chapter_edit_chapters(&self.graph, modifier)
-                        .and_then(|cs| cs.get(index))
-                        .map(|c| c.title.clone());
-                    self.mode = text_input_mode(TextTarget::ChapterTitle { modifier, index }, current.unwrap_or_default(), Vec::new());
-                }
-                Some("delete") => {
-                    if let Some(chapters) = chapter_edit_chapters_mut(&mut self.graph, modifier)
-                        && index < chapters.len()
-                    {
-                        chapters.remove(index);
-                        self.log.push("chapter deleted".to_string());
-                    }
-                    self.open_chapter_list_picker(modifier);
-                }
-                _ => {}
-            },
         }
     }
 
@@ -2071,26 +2165,3 @@ fn chapter_edit_modifiers_fed_by(graph: &Graph, predicate: impl Fn(&crate::graph
         .collect()
 }
 
-/// The chapter-list picker's option list: one row per existing chapter
-/// (tagged with its index, as a string, so `picker_confirm` can parse it
-/// back out) formatted as "start–end  title", plus "add chapter..." and,
-/// only if this node's input is actually fed by a chapter-kind source,
-/// "import from connected input...". Neither collides with a real index,
-/// since indices are always plain digit strings.
-fn chapter_list_picker_options(graph: &Graph, modifier: NodeId) -> Vec<PickerEntry> {
-    let mut options = Vec::new();
-    if let Some(chapters) = chapter_edit_chapters(graph, modifier) {
-        for (i, c) in chapters.iter().enumerate() {
-            let label = if c.title.is_empty() { "(untitled)" } else { &c.title };
-            let imported_tag = if c.imported { " [imported]" } else { "" };
-            let display = format!(
-                "{}–{}  {label}{imported_tag}",
-                crate::graph::format_time(c.start_secs),
-                crate::graph::format_time(c.end_secs)
-            );
-            options.push(PickerEntry { display, value: Some(i.to_string()) });
-        }
-    }
-    options.push(PickerEntry { display: "add chapter…".to_string(), value: Some("add".to_string()) });
-    options
-}

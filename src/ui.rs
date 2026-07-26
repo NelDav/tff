@@ -2,10 +2,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::app::{App, Focus, Mode};
+use crate::app::{App, ChapterColumn, Focus, Mode};
 use crate::graph::{
     Codec, Endpoint, Graph, InputNode, ModifierKind, ModifierNode, NodeId, OutputNode, StreamKind, Target,
 };
@@ -26,6 +26,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status_line(frame, app, root[2]);
     draw_log(frame, app, root[3]);
     draw_picker_popup(frame, app);
+    draw_chapter_table_popup(frame, app);
     draw_suggestions_popup(frame, app, root[2]);
 }
 
@@ -95,6 +96,10 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Picker { .. } => TextLine::from(Span::styled(
             "↑↓/jk move · / search · Enter select · Esc cancel",
+            Style::default().fg(Color::Yellow),
+        )),
+        Mode::ChapterTable { .. } => TextLine::from(Span::styled(
+            "↑↓/jk row · ←→/hl/Tab column · Enter edit/add · d delete · Esc close",
             Style::default().fg(Color::Yellow),
         )),
         Mode::Normal => {
@@ -932,6 +937,74 @@ fn draw_picker_popup(frame: &mut Frame, app: &App) {
         .collect();
 
     frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// Renders a `ChapterEdit` modifier's chapter list as a real table --
+/// start/end/title columns, one row per chapter -- with the currently
+/// selected cell highlighted, plus a trailing "add chapter" row
+/// highlighted as a whole when it's the one selected. Replaces the old
+/// two-level picker (a list of chapters, then a list of that chapter's
+/// fields) with direct row/column navigation, so editing a field is one
+/// Enter press away instead of two.
+fn draw_chapter_table_popup(frame: &mut Frame, app: &App) {
+    let Mode::ChapterTable { modifier, row, col } = &app.mode else {
+        return;
+    };
+    let Some(ModifierKind::ChapterEdit { chapters }) = app.graph.modifier(*modifier).map(|m| &m.kind) else {
+        return;
+    };
+
+    let area = frame.area();
+    let popup_width = area.width.saturating_sub(4).clamp(30, 70);
+    let popup_height = (chapters.len() as u16 + 4).clamp(5, 20).min(area.height.saturating_sub(2));
+    let popup = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " chapters ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " ↑↓/jk row · ←→/hl/Tab column · Enter edit/add · d delete · Esc close ",
+            Style::default().fg(Color::DarkGray),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let selected_style = Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let cell_style = |r: usize, c: ChapterColumn| if r == *row && c == *col { selected_style } else { Style::default() };
+
+    let header = Row::new(["start", "end", "title"]).style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let mut rows: Vec<Row> = chapters
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let title = if c.title.is_empty() { "(untitled)".to_string() } else { c.title.clone() };
+            let title = if c.imported { format!("{title} [imported]") } else { title };
+            Row::new([
+                Cell::from(crate::graph::format_time(c.start_secs)).style(cell_style(i, ChapterColumn::Start)),
+                Cell::from(crate::graph::format_time(c.end_secs)).style(cell_style(i, ChapterColumn::End)),
+                Cell::from(title).style(cell_style(i, ChapterColumn::Title)),
+            ])
+        })
+        .collect();
+
+    // The label goes in the wide title column, not the fixed-width start
+    // column, so it isn't truncated to 10 characters.
+    let add_style = if *row == chapters.len() { selected_style } else { Style::default().fg(Color::Green) };
+    rows.push(Row::new([
+        Cell::from("").style(add_style),
+        Cell::from("").style(add_style),
+        Cell::from("+ add chapter…").style(add_style),
+    ]));
+
+    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(10), Constraint::Min(10)]).header(header);
+    frame.render_widget(table, inner);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

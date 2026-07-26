@@ -146,6 +146,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc => app.picker_escape(),
             _ => {}
         },
+        Mode::ChapterTable { .. } => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.chapter_table_move_row(false),
+            KeyCode::Down | KeyCode::Char('j') => app.chapter_table_move_row(true),
+            KeyCode::Left | KeyCode::Char('h') => app.chapter_table_move_col(false),
+            KeyCode::Right | KeyCode::Char('l') => app.chapter_table_move_col(true),
+            KeyCode::Tab => app.chapter_table_tab(true),
+            KeyCode::BackTab => app.chapter_table_tab(false),
+            KeyCode::Enter => app.chapter_table_confirm(),
+            KeyCode::Char('d') => app.chapter_table_delete(),
+            KeyCode::Esc => app.chapter_table_close(),
+            _ => {}
+        },
         Mode::Normal => match key.code {
             KeyCode::Char('q') => app.should_quit = true,
             KeyCode::Tab => app.cycle_focus(true),
