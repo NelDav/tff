@@ -5,12 +5,18 @@ use crate::graph::{Endpoint, StreamKind, Target};
 impl App {
     /// 'c': on an input, arm the whole pending selection at once if
     /// there's one (see `toggle_port_selection`/`extend_port_selection`),
-    /// else just toggle the single hovered stream in or out of `armed`
-    /// (the original, low-friction one-at-a-time behavior). On a
-    /// modifier, arm/disarm its own single output, or -- if something
-    /// else is armed -- wire it in (rejecting more than one, since a
-    /// modifier's input only ever holds one wire). On an output, connect
-    /// every currently-armed source in one action.
+    /// else just arm the single hovered stream (the original, low-friction
+    /// one-at-a-time behavior) -- either way *replacing* whatever was
+    /// armed before, not adding to it, so pressing 'c' again after
+    /// selecting or hovering something else doesn't keep piling more ports
+    /// onto an earlier armed set. The one exception is pressing 'c' again
+    /// on a single hovered port that's already the sole armed one, which
+    /// disarms it instead -- otherwise there'd be no way to un-arm a
+    /// mistaken single press short of Esc (which also drops any pending
+    /// selection). On a modifier, arm/disarm its own single output, or --
+    /// if something else is armed -- wire it in (rejecting more than one,
+    /// since a modifier's input only ever holds one wire). On an output,
+    /// connect every currently-armed source in one action.
     pub fn toggle_connect(&mut self) {
         match self.focus {
             Focus::Input(i) => {
@@ -19,7 +25,7 @@ impl App {
                 };
                 if !self.selected.is_empty() {
                     let n = self.selected.len();
-                    self.armed.append(&mut self.selected);
+                    self.armed = std::mem::take(&mut self.selected);
                     self.log.push(format!(
                         "armed {n} port(s) — focus a modifier or output, press 'c' to connect"
                     ));
@@ -32,9 +38,11 @@ impl App {
                     node: node.id,
                     stream_idx: self.row_idx,
                 };
-                if !self.armed.insert(ep) {
-                    self.armed.remove(&ep); // was already armed -- toggle off
+                if self.armed.len() == 1 && self.armed.contains(&ep) {
+                    self.armed.clear(); // re-pressing 'c' on the only armed port disarms it
                 } else {
+                    self.armed.clear();
+                    self.armed.insert(ep);
                     self.log.push(format!(
                         "armed {} from {} — focus a modifier or output, press 'c' to connect",
                         stream.label(),

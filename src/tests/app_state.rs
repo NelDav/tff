@@ -358,6 +358,36 @@ fn arming_a_multi_port_selection_across_nodes() {
     );
 }
 
+/// Arming a selection replaces whatever was already armed rather than
+/// adding to it -- pressing 'c' on one selection, then selecting
+/// something else entirely and pressing 'c' again, should leave only the
+/// second selection armed, not both combined.
+#[test]
+fn arming_a_new_selection_replaces_rather_than_accumulates() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+
+    app.focus = Focus::Input(0);
+    app.row_idx = 0;
+    app.toggle_port_selection(); // select a's only stream
+    app.toggle_connect(); // arm it
+    assert_eq!(app.armed, BTreeSet::from([Endpoint::Stream { node: a, stream_idx: 0 }]));
+
+    app.focus = Focus::Input(1);
+    app.row_idx = 0;
+    app.toggle_port_selection(); // select b's only stream instead
+    app.toggle_connect(); // arm it -- should replace a's armed port, not join it
+
+    assert_eq!(
+        app.armed,
+        BTreeSet::from([Endpoint::Stream { node: b, stream_idx: 0 }]),
+        "arming a new selection should replace the previously armed set"
+    );
+}
+
 /// With nothing explicitly selected, 'c' on an input falls back to the
 /// original single-hover toggle-arm behavior.
 #[test]
@@ -374,6 +404,32 @@ fn arming_with_nothing_selected_falls_back_to_single_toggle() {
 
     app.toggle_connect(); // pressing 'c' again on the same hovered port disarms it
     assert!(app.armed.is_empty());
+}
+
+/// The same replace-not-accumulate rule applies when arming one port at a
+/// time by hovering, with nothing ever explicitly Space-selected: hovering
+/// a different row and pressing 'c' again should leave only that row
+/// armed, not both.
+#[test]
+fn arming_by_hovering_different_rows_replaces_rather_than_accumulates() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    app.focus = Focus::Input(0);
+
+    app.row_idx = 0;
+    app.toggle_connect(); // arm the video stream by hovering it
+    assert_eq!(app.armed, BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 0 }]));
+
+    app.row_idx = 1;
+    app.toggle_connect(); // hover the audio stream and arm it instead
+
+    assert_eq!(
+        app.armed,
+        BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 1 }]),
+        "arming a different hovered port should replace the previously armed one"
+    );
 }
 
 /// Connecting a multi-armed set to an output should create one wire per
