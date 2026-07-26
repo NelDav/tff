@@ -14,6 +14,17 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+/// Any glyph `draw_wire` (see `src/ui.rs`) can render for a wire segment or
+/// corner -- straight runs, a lone wire's own turn (rounded), or a real
+/// junction between two different wires' cells (sharp). Row-offset
+/// regression tests use this to check a wire actually attaches at a given
+/// row without pinning down exactly which of these shapes it takes, since
+/// that depends on the corner's direction (down-then-right vs. up-then-left,
+/// etc.), not on what the test cares about.
+fn is_wire_glyph(c: char) -> bool {
+    "─│╭╮╰╯┌┐└┘┬┴├┤┼".contains(c)
+}
+
 fn video_stream() -> Vec<StreamInfo> {
     vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }]
 }
@@ -2734,15 +2745,69 @@ fn input_and_output_wires_attach_below_their_extra_args_section() {
         .join("\n");
 
     let src_line = screen.lines().find(|l| l.contains("○ v:0 h264")).expect("stream row present");
+    let content_end = src_line.find("h264").unwrap() + "h264".len();
+    let border_pos = content_end + src_line[content_end..].find('│').expect("the node's right border follows the stream row");
+    let after_border = src_line[border_pos + '│'.len_utf8()..].chars().next();
     assert!(
-        src_line.contains("─│"),
+        after_border.is_some_and(is_wire_glyph),
         "wire from the input should leave from the stream row itself, not drift onto another row:\n{src_line}"
     );
 
     let dst_line = screen.lines().find(|l| l.contains("v:0 h264") && l.contains("<-")).expect("mapped row present");
+    let content_start = dst_line.find("v:0 h264").unwrap();
+    let border_pos = dst_line[..content_start].rfind('│').expect("the node's left border precedes the mapped row");
+    let before_border = dst_line[..border_pos].chars().next_back();
     assert!(
-        dst_line.contains("│─"),
+        before_border.is_some_and(is_wire_glyph),
         "wire into the output should land on the mapped row itself, not drift onto another row:\n{dst_line}"
+    );
+}
+
+/// In a dense layout, one wire's straight run can pass directly through
+/// the cell where a different wire turns a corner. Positions two inputs
+/// and an output precisely enough that this actually happens, and checks
+/// the shared cell renders as a real junction glyph (both lines visibly
+/// meet there) rather than one wire's glyph silently overwriting the
+/// other's -- see `draw_wire`'s box-drawing merge logic in `src/ui.rs`.
+#[test]
+fn crossing_wires_render_as_a_real_junction_not_a_silent_overwrite() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+
+    // A's wire runs straight across row 1 (its stream row); B sits further
+    // right but one row lower, so B's wire bends -- and its corner lands
+    // in the middle of A's straight run, at the same buffer cell.
+    app.graph.input_mut(a).unwrap().pos = (0.0, 0.0);
+    app.graph.input_mut(a).unwrap().width = 16;
+    app.graph.input_mut(b).unwrap().pos = (24.0, 0.0);
+    app.graph.input_mut(b).unwrap().width = 16;
+    app.graph.outputs[0].pos = (70.0, 0.0);
+    app.graph.outputs[0].width = 20;
+
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::Output(out)); // row 0 -- straight, row 1
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::Output(out)); // row 1 -- bends through row 1
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let lines: Vec<&str> = screen.lines().collect();
+    let a_title = lines.iter().position(|l| l.contains("[0] a.mp4")).expect("input a's title row present");
+    let a_row = lines[a_title + 1];
+    assert!(
+        a_row.contains(['┬', '┴', '├', '┤', '┼']),
+        "the cell where b's wire crosses a's straight run should show a real junction, not overwrite it:\n{a_row}"
     );
 }
 
@@ -4365,15 +4430,23 @@ fn metadata_node_wires_attach_below_its_field_section_not_at_a_fixed_row() {
 
     let incoming_line =
         screen.lines().find(|l| l.contains("← v:0 h264")).expect("incoming connection row present");
+    let content_start = incoming_line.find("← v:0 h264").unwrap();
+    let border_pos =
+        incoming_line[..content_start].rfind('│').expect("the modifier's left border precedes the incoming row");
+    let before_border = incoming_line[..border_pos].chars().next_back();
     assert!(
-        incoming_line.contains("───│← v:0 h264"),
+        before_border.is_some_and(is_wire_glyph),
         "wire from the input should terminate on the incoming row itself, not drift onto a field row:\n{incoming_line}"
     );
 
     let outgoing_line =
         screen.lines().find(|l| l.contains("→ OUTPUT 1")).expect("outgoing connection row present");
+    let content_start = outgoing_line.find("→ OUTPUT 1").unwrap();
+    let border_pos = content_start
+        + outgoing_line[content_start..].find('│').expect("the modifier's right border follows the outgoing row");
+    let after_border = outgoing_line[border_pos + '│'.len_utf8()..].chars().next();
     assert!(
-        outgoing_line.contains("──│"),
+        after_border.is_some_and(is_wire_glyph),
         "wire to the output should leave from the outgoing row itself, not drift onto another row:\n{outgoing_line}"
     );
 }

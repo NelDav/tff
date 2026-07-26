@@ -341,6 +341,72 @@ fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+// --- Box-drawing junction merging ---------------------------------------
+//
+// In a dense layout, more than one wire can legitimately pass through the
+// same buffer cell (e.g. one wire's vertical lane crossing another's
+// horizontal run). Drawing each wire independently and just overwriting
+// whatever was there left those spots ambiguous -- a lone "─" or "│" with
+// no visual sign that something else also touches that cell, so "does
+// this line actually connect here or does it just happen to end next to
+// another one" wasn't answerable at a glance. Instead each of the four
+// directions a glyph touches is a bit, cells are re-rendered from the OR
+// of every wire that's passed through them so far, and the resulting bit
+// set picks the matching box-drawing glyph -- so a real crossing renders
+// as "┼", a corner grazed by a straight run becomes a "┬"/"┴"/"├"/"┤", and
+// so on. Only a plain, untouched corner (exactly two bits) gets the
+// rounded variant -- there's no rounded T-junction or cross in Unicode
+// box drawing, so those fall back to the sharp glyph.
+const LINE_UP: u8 = 0b0001;
+const LINE_RIGHT: u8 = 0b0010;
+const LINE_DOWN: u8 = 0b0100;
+const LINE_LEFT: u8 = 0b1000;
+
+/// Which directions a box-drawing glyph touches, as a bitset of the
+/// constants above. Recognizes both the sharp corners this file's own
+/// `match` arms name and the rounded ones `glyph_for_bits` renders, so
+/// re-reading an already-merged cell keeps merging correctly instead of
+/// losing track of what's there. Anything else (blank space, a node's own
+/// border) isn't a wire segment, so it contributes no bits -- an isolated
+/// wire still renders exactly as before.
+fn line_bits(glyph: &str) -> u8 {
+    match glyph {
+        "─" => LINE_LEFT | LINE_RIGHT,
+        "│" => LINE_UP | LINE_DOWN,
+        "╭" | "┌" => LINE_RIGHT | LINE_DOWN,
+        "╮" | "┐" => LINE_LEFT | LINE_DOWN,
+        "╰" | "└" => LINE_UP | LINE_RIGHT,
+        "╯" | "┘" => LINE_UP | LINE_LEFT,
+        "┬" => LINE_LEFT | LINE_RIGHT | LINE_DOWN,
+        "┴" => LINE_LEFT | LINE_RIGHT | LINE_UP,
+        "├" => LINE_UP | LINE_DOWN | LINE_RIGHT,
+        "┤" => LINE_UP | LINE_DOWN | LINE_LEFT,
+        "┼" => LINE_UP | LINE_DOWN | LINE_LEFT | LINE_RIGHT,
+        _ => 0,
+    }
+}
+
+/// The box-drawing glyph for a set of touched directions. Every reachable
+/// input has exactly 2, 3, or 4 bits set: `line_bits` always yields >= 2
+/// bits, and OR-ing two such values can only ever add bits, never remove
+/// them, so 0- or 1-bit results (and thus the fallback arm) never actually
+/// occur -- it's there only so this stays total.
+fn glyph_for_bits(bits: u8) -> &'static str {
+    match bits {
+        b if b == LINE_LEFT | LINE_RIGHT => "─",
+        b if b == LINE_UP | LINE_DOWN => "│",
+        b if b == LINE_RIGHT | LINE_DOWN => "╭",
+        b if b == LINE_LEFT | LINE_DOWN => "╮",
+        b if b == LINE_UP | LINE_RIGHT => "╰",
+        b if b == LINE_UP | LINE_LEFT => "╯",
+        b if b == LINE_LEFT | LINE_RIGHT | LINE_DOWN => "┬",
+        b if b == LINE_LEFT | LINE_RIGHT | LINE_UP => "┴",
+        b if b == LINE_UP | LINE_DOWN | LINE_RIGHT => "├",
+        b if b == LINE_UP | LINE_DOWN | LINE_LEFT => "┤",
+        _ => "┼",
+    }
+}
+
 /// Draws one wire, then -- if `badge` is set -- overlays a small colored
 /// label on the segment leading into the destination, acting as a
 /// "converter" sitting on the wire itself. Skipped if the segment isn't
@@ -357,9 +423,24 @@ fn draw_wire(
     let (sx, sy) = (src.x, src.y);
     let (dx, dy) = (dst.x, dst.y);
     let style = Style::default().fg(color);
-    let mut put = |x: u16, y: u16, s: &str| {
-        if x >= bounds.x && x < bounds.right() && y >= bounds.y && y < bounds.bottom() {
-            buf.set_string(x, y, s, style);
+
+    // Plot this wire's own path into a scratch buffer first, deduping by
+    // cell (last write wins, same as the plain overwrite this used to do
+    // straight into the screen buffer) -- a corner deliberately gets drawn
+    // on top of the straight run it grows out of, and merging that
+    // self-overwrite into the shared buffer's junction logic would
+    // misread it as a second wire crossing itself, turning a clean corner
+    // into a spurious T. Only once this wire's own path is fully decided
+    // does each of its cells get merged into the screen buffer, where a
+    // genuine overlap with a different wire still combines correctly.
+    let mut path: Vec<(u16, u16, &'static str)> = Vec::new();
+    let mut put = |x: u16, y: u16, s: &'static str| {
+        if x < bounds.x || x >= bounds.right() || y < bounds.y || y >= bounds.bottom() {
+            return;
+        }
+        match path.iter_mut().find(|(px, py, _)| *px == x && *py == y) {
+            Some(cell) => cell.2 = s,
+            None => path.push((x, y, s)),
         }
     };
 
@@ -383,43 +464,52 @@ fn draw_wire(
 
         let going_right = dx >= sx;
         let going_down = dy > sy;
+        let top_corner = match (going_right, going_down) {
+            (true, true) => "┐",
+            (true, false) => "┘",
+            (false, true) => "┌",
+            (false, false) => "└",
+        };
+        let bottom_corner = match (going_right, going_down) {
+            (true, true) => "└",
+            (true, false) => "┌",
+            (false, true) => "┘",
+            (false, false) => "┐",
+        };
 
-        let (a, b) = if sx <= mid { (sx, mid) } else { (mid, sx) };
-        for x in a..=b {
-            put(x, sy, "─");
+        // Each of the three legs stops short of the corner cell it leads
+        // into, so nothing later overwrites a corner glyph back into a
+        // plain "─"/"│" -- every cell on the path is touched exactly once.
+        let (a, b) = if sx <= mid { (sx, mid.saturating_sub(1)) } else { (mid + 1, sx) };
+        if a <= b {
+            for x in a..=b {
+                put(x, sy, "─");
+            }
         }
-        put(
-            mid,
-            sy,
-            match (going_right, going_down) {
-                (true, true) => "┐",
-                (true, false) => "┘",
-                (false, true) => "┌",
-                (false, false) => "└",
-            },
-        );
+        put(mid, sy, top_corner);
 
         let (top, bottom) = if sy <= dy { (sy, dy) } else { (dy, sy) };
-        for y in top..=bottom {
-            put(mid, y, "│");
+        if bottom > top + 1 {
+            for y in (top + 1)..bottom {
+                put(mid, y, "│");
+            }
         }
-        put(
-            mid,
-            dy,
-            match (going_right, going_down) {
-                (true, true) => "└",
-                (true, false) => "┌",
-                (false, true) => "┘",
-                (false, false) => "┐",
-            },
-        );
+        put(mid, dy, bottom_corner);
 
-        let (c, d) = if mid <= dx { (mid, dx) } else { (dx, mid) };
-        for x in c..=d {
-            put(x, dy, "─");
+        let (c, d) = if mid <= dx { (mid + 1, dx) } else { (dx, mid.saturating_sub(1)) };
+        if c <= d {
+            for x in c..=d {
+                put(x, dy, "─");
+            }
         }
-        (dy, c, d)
+        (dy, c.min(mid), d.max(mid))
     };
+
+    for (x, y, s) in path {
+        let existing = buf.cell(Position::new(x, y)).map(|c| line_bits(c.symbol())).unwrap_or(0);
+        let glyph = glyph_for_bits(existing | line_bits(s));
+        buf.set_string(x, y, glyph, style);
+    }
 
     let Some(text) = badge else { return };
     let (row, from, to) = final_run;
