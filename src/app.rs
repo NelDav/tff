@@ -253,6 +253,13 @@ pub struct App {
     /// was set on; reset by anything that isn't itself a Shift+Up/Down
     /// press (see `extend_port_selection`'s doc comment).
     selection_anchor: Option<usize>,
+    /// How many characters the focused node's title and body text are
+    /// scrolled left by, for reading text a fixed-width box would
+    /// otherwise truncate (see `scroll_node_text`). A view concern only --
+    /// nothing here affects the ffmpeg command built from the graph --
+    /// so it lives on `App`, not on the node itself, and resets whenever
+    /// focus moves to a different node (see `set_focus_index`).
+    pub text_scroll: u16,
     pub log: Vec<String>,
     pub status: String,
     pub running: bool,
@@ -294,6 +301,7 @@ impl App {
             armed: BTreeSet::new(),
             selected: BTreeSet::new(),
             selection_anchor: None,
+            text_scroll: 0,
             log,
             status: String::new(),
             running: false,
@@ -332,6 +340,7 @@ impl App {
         };
         self.row_idx = 0;
         self.selection_anchor = None; // a fresh Shift+range on the new node should start from here, not carry over
+        self.text_scroll = 0; // scrolling belongs to whichever node was focused, not the one we're leaving
     }
 
     pub fn cycle_focus(&mut self, forward: bool) {
@@ -444,6 +453,77 @@ impl App {
         if let Some(pos) = pos {
             pos.0 = (pos.0 + dx * step).max(0.0);
             pos.1 = (pos.1 + dy * step).max(0.0);
+        }
+    }
+
+    /// Left/Right on the focused node: scrolls its title and body text
+    /// horizontally, for reading a path or label wider than the box draws
+    /// it -- see `App::text_scroll` and `ui::scroll_text`. Can't scroll
+    /// past the point where the node's longest line is fully revealed
+    /// (see `focused_node_max_scroll`); Left simply can't go past the
+    /// unscrolled start.
+    pub fn scroll_node_text(&mut self, forward: bool) {
+        const STEP: u16 = 4;
+        let max_scroll = self.focused_node_max_scroll();
+        self.text_scroll = if forward {
+            self.text_scroll.saturating_add(STEP).min(max_scroll)
+        } else {
+            self.text_scroll.saturating_sub(STEP)
+        };
+    }
+
+    /// How far the focused node's text can scroll before nothing further
+    /// would become visible -- the longest of its title and body lines,
+    /// minus the box's own width (so once that line's last character sits
+    /// flush with the right edge, scrolling stops). 0 if nothing's
+    /// focused or the node vanished out from under the focus index.
+    fn focused_node_max_scroll(&self) -> u16 {
+        let (title, lines, width) = match self.focus {
+            Focus::Input(i) => {
+                let Some(n) = self.graph.inputs.get(i) else { return 0 };
+                let (title, lines) = crate::ui::input_node_text_extent(self, n);
+                (title, lines, n.width)
+            }
+            Focus::Modifier(i) => {
+                let Some(n) = self.graph.modifiers.get(i) else { return 0 };
+                let (title, lines) = crate::ui::modifier_node_text_extent(self, n);
+                (title, lines, n.width)
+            }
+            Focus::Output(i) => {
+                let Some(n) = self.graph.outputs.get(i) else { return 0 };
+                let (title, lines) = crate::ui::output_node_text_extent(self, i, n);
+                (title, lines, n.width)
+            }
+        };
+        let max_len = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(title.chars().count());
+        (max_len as u16).saturating_sub(width.saturating_sub(2))
+    }
+
+    /// Shift+Right/Left on the focused node: grows or shrinks its box by
+    /// widening or narrowing its right edge (the left edge -- `pos.0` --
+    /// never moves), between a floor just wide enough to still show a
+    /// title and a generous ceiling against runaway growth from holding
+    /// the key down.
+    pub fn resize_focused_node(&mut self, grow: bool) {
+        const STEP: u16 = 2;
+        const MIN_WIDTH: u16 = 14;
+        const MAX_WIDTH: u16 = 200;
+        let width = match self.focus {
+            Focus::Input(i) => self.graph.inputs.get_mut(i).map(|n| &mut n.width),
+            Focus::Modifier(i) => self.graph.modifiers.get_mut(i).map(|n| &mut n.width),
+            Focus::Output(i) => self.graph.outputs.get_mut(i).map(|n| &mut n.width),
+        };
+        if let Some(width) = width {
+            *width = if grow {
+                width.saturating_add(STEP).min(MAX_WIDTH)
+            } else {
+                width.saturating_sub(STEP).max(MIN_WIDTH)
+            };
         }
     }
 

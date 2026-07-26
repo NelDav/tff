@@ -171,6 +171,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.extend_port_selection(true),
             KeyCode::Up => app.cycle_row(false),
             KeyCode::Down => app.cycle_row(true),
+            // Shift+Left/Right resizes the focused node's right edge;
+            // plain Left/Right scrolls its (possibly truncated) text
+            // instead -- the Shift arms are checked first since match
+            // picks the first hit.
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.resize_focused_node(true),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.resize_focused_node(false),
+            KeyCode::Right => app.scroll_node_text(true),
+            KeyCode::Left => app.scroll_node_text(false),
             KeyCode::Char(' ') => app.toggle_port_selection(),
             // Ctrl+A selects every port on the focused node; checked ahead
             // of the plain 'a' arm below (add-node picker) since match
