@@ -27,6 +27,114 @@ fn toggle_connect_wires_armed_stream_into_focused_modifier() {
     assert_eq!(app.graph.wires[incoming[0]].from, Endpoint::Stream { node: id, stream_idx: 0 });
 }
 
+/// Wiring a stream of the wrong kind into a kind-restricted modifier (a
+/// `Filter` that only applies to one kind, or `ChapterEdit`, which only
+/// meaningfully imports from a chapter-kind source) should be rejected up
+/// front rather than silently accepted and only complained about later,
+/// when the node is edited.
+#[test]
+fn toggle_connect_rejects_a_stream_kind_a_filter_modifier_does_not_accept() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Volume, fields: BTreeMap::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    // Volume only applies to audio -- arm the video stream instead.
+    app.armed = BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 0 }]);
+    app.focus = Focus::Modifier(modifier_idx);
+    app.toggle_connect();
+
+    assert!(app.graph.incoming(Target::ModifierIn(modifier)).is_empty(), "the mismatched wire should not be created");
+    assert_eq!(app.armed.len(), 1, "the armed port should be left alone so a different target can be tried");
+    assert!(app.log.last().unwrap().contains("doesn't accept a video stream"), "{:?}", app.log.last());
+}
+
+/// The counterpart to the rejection above: a stream of a kind the filter
+/// *does* accept should still connect normally.
+#[test]
+fn toggle_connect_allows_a_stream_kind_a_filter_modifier_does_accept() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Volume, fields: BTreeMap::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    app.armed = BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 1 }]); // audio
+    app.focus = Focus::Modifier(modifier_idx);
+    app.toggle_connect();
+
+    assert_eq!(app.graph.incoming(Target::ModifierIn(modifier)).len(), 1);
+    assert!(app.armed.is_empty());
+}
+
+/// A `ChapterEdit` modifier's input only meaningfully accepts a
+/// chapter-kind source (see `ModifierKind::accepts_stream_kind`) -- wiring
+/// a regular video/audio stream into it should be rejected the same way.
+#[test]
+fn toggle_connect_rejects_a_non_chapter_stream_into_a_chapter_edit_modifier() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit { chapters: Vec::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    app.armed = BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 0 }]);
+    app.focus = Focus::Modifier(modifier_idx);
+    app.toggle_connect();
+
+    assert!(app.graph.incoming(Target::ModifierIn(modifier)).is_empty());
+    assert_eq!(app.armed.len(), 1);
+    assert!(app.log.last().unwrap().contains("doesn't accept a video stream"), "{:?}", app.log.last());
+}
+
+/// Connecting a chapter-kind source into a `ChapterEdit` modifier's input
+/// should still work normally.
+#[test]
+fn toggle_connect_allows_a_chapter_stream_into_a_chapter_edit_modifier() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let chapters_id = app.graph.add_input(
+        "chapters.ffmeta".to_string(),
+        Vec::new(),
+        vec![Chapter::new(0.0, 1.0, "A".to_string())],
+    );
+    let chapter_idx = app.graph.input(chapters_id).unwrap().streams.len() - 1;
+    let modifier = app.graph.add_modifier(ModifierKind::ChapterEdit { chapters: Vec::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    app.armed = BTreeSet::from([Endpoint::Stream { node: chapters_id, stream_idx: chapter_idx }]);
+    app.focus = Focus::Modifier(modifier_idx);
+    app.toggle_connect();
+
+    assert_eq!(app.graph.incoming(Target::ModifierIn(modifier)).len(), 1);
+    assert!(app.armed.is_empty());
+}
+
+/// Connecting an upstream modifier whose own input isn't wired to
+/// anything yet has no determinable stream kind -- that should still be
+/// allowed optimistically (same as before this rejection existed),
+/// instead of assuming the worst and blocking chain-building order.
+#[test]
+fn toggle_connect_allows_an_unresolved_upstream_modifier_into_a_kind_restricted_one() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let upstream = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy)); // nothing feeds it yet
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: BTreeMap::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    app.armed = BTreeSet::from([Endpoint::ModifierOut(upstream)]);
+    app.focus = Focus::Modifier(modifier_idx);
+    app.toggle_connect();
+
+    assert_eq!(app.graph.incoming(Target::ModifierIn(modifier)).len(), 1, "an unresolved source shouldn't be blocked");
+}
+
 /// Once a modifier's input is fed, focusing it and pressing 'c' with
 /// nothing else armed should arm *its* output, so the chain can continue
 /// to another node.

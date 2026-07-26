@@ -289,6 +289,22 @@ impl ModifierKind {
             ModifierKind::ChapterEdit { .. } => "chapters".to_string(),
         }
     }
+
+    /// Whether a stream of `kind` is something this modifier can
+    /// meaningfully sit downstream of, checked before wiring one in so a
+    /// mismatched connection is rejected up front rather than accepted
+    /// silently and only complained about later, when the node is edited
+    /// (`Filter`) or simply never doing anything useful with it
+    /// (`ChapterEdit`, whose import logic just ignores a non-chapter
+    /// source). `Convert`/`Metadata`/`Disposition` apply to any stream
+    /// kind, so they never reject a connection here.
+    pub fn accepts_stream_kind(&self, kind: StreamKind) -> bool {
+        match self {
+            ModifierKind::Convert(_) | ModifierKind::Metadata { .. } | ModifierKind::Disposition { .. } => true,
+            ModifierKind::Filter { name, .. } => name.applies_to(kind),
+            ModifierKind::ChapterEdit { .. } => kind == StreamKind::Chapter,
+        }
+    }
 }
 
 /// A node that transforms one stream in transit from an input to an

@@ -71,6 +71,22 @@ impl App {
                     ));
                 } else {
                     let source = *self.armed.iter().next().expect("checked non-empty above");
+                    // Only reject when the source's kind is actually known
+                    // and wrong -- an armed endpoint whose own chain isn't
+                    // fully resolved yet (e.g. another modifier with
+                    // nothing wired into *its* input) has no determinable
+                    // kind, and should still be connectable optimistically,
+                    // same as before this check existed.
+                    if let Some(source_kind) = self.endpoint_stream_kind(source)
+                        && !m.kind.accepts_stream_kind(source_kind)
+                    {
+                        self.log.push(format!(
+                            "{} doesn't accept a {} stream",
+                            m.kind.short_label(),
+                            source_kind.noun()
+                        ));
+                        return;
+                    }
                     self.graph.connect(source, Target::ModifierIn(mid));
                     sync_chapter_edit_import(&mut self.graph, mid);
                     self.armed.clear();
