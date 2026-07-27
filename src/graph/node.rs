@@ -65,6 +65,19 @@ pub fn input_extra_arg_keys() -> &'static [(&'static str, bool)] {
 /// `movflags`/`avoid_negative_ts`/`fflags` are common muxing-correctness
 /// knobs; `shortest` (stop encoding once the shortest mapped stream ends)
 /// is the curated valueless switch.
+///
+/// `ss`/`to` are here rather than on the Trim filter node deliberately:
+/// combined with stream copy (the whole point of using them instead of
+/// Trim's `trim`/`atrim` filter) they aren't a per-stream operation at
+/// all -- they cut the whole output's timeline, so every stream mapped
+/// into *this* output gets the same window, verified against a real
+/// ffmpeg run to behave the same way (same resulting duration, still
+/// keyframe-starting) whether placed as input options (before `-i`) or,
+/// as here, output options (after it, alongside every other entry in this
+/// list) -- output-scoped only costs a linear demux through the discarded
+/// prefix instead of an index-based jump, which is the trade made for
+/// actually matching this scope: unlike an input-level seek, it can't leak
+/// into a *different* output that happens to read the same input file.
 pub fn output_extra_arg_keys() -> &'static [(&'static str, bool)] {
     &[
         ("max_interleave_delta", false),
@@ -72,6 +85,8 @@ pub fn output_extra_arg_keys() -> &'static [(&'static str, bool)] {
         ("avoid_negative_ts", false),
         ("fflags", false),
         ("shortest", true),
+        ("ss", false),
+        ("to", false),
     ]
 }
 

@@ -208,6 +208,54 @@ fn unconfigured_trim_modifier_is_a_no_op() {
     assert!(!joined.contains("-filter_complex"), "{joined}");
 }
 
+/// The fast, copy-eligible alternative to Trim's filter-based cut: `ss`/
+/// `to` set as an output's own extra args land after every -map/-c (so
+/// they're output, not input, options -- output-scoped, unlike an
+/// input-level seek, so they can't leak into a *different* output reading
+/// the same input file) and don't force a re-encode the way a
+/// `-filter_complex` entry would.
+#[test]
+fn output_level_ss_to_extra_args_stay_copy_eligible_and_skip_filter_complex() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    graph.outputs[0].extra_args = filter_fields(&[("ss", "1"), ("to", "3")]);
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(!joined.contains("-filter_complex"), "{joined}");
+    assert!(joined.contains("-c:0 copy"), "{joined}");
+    assert!(joined.contains("-ss 1"), "{joined}");
+    assert!(joined.contains("-to 3"), "{joined}");
+
+    // Output options land after -i, unlike an input-level seek.
+    let ss = args.iter().position(|a| a == "-ss").expect("expected an -ss arg");
+    let i = args.iter().position(|a| a == "-i").expect("expected an -i arg");
+    assert!(ss > i, "output-scoped -ss should follow -i, not precede it: {args:?}");
+}
+
+/// Two outputs reading the same input file can each set their own `ss`/
+/// `to` window independently -- unlike an input-level seek, one output's
+/// window has no way to leak into the other's, since each is scoped to its
+/// own output section of the command.
+#[test]
+fn output_level_ss_to_do_not_leak_across_outputs_sharing_an_input() {
+    let mut graph = Graph::new();
+    let out1 = graph.outputs[0].id;
+    let out2 = graph.add_output();
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out1));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out2));
+    graph.outputs[0].extra_args = filter_fields(&[("ss", "1"), ("to", "3")]);
+    graph.outputs[1].path = "second.mkv".to_string();
+    // out2 deliberately left without any ss/to -- it should render untouched.
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let ss_count = args.iter().filter(|a| a.as_str() == "-ss").count();
+    assert_eq!(ss_count, 1, "only the output that actually set ss/to should get one: {args:?}");
+}
+
 /// Chaining a Convert node into a Metadata node should combine both
 /// effects on the same resolved connection.
 #[test]

@@ -307,6 +307,61 @@ fn filter_trim_shortens_duration_and_resets_timestamps_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The fast, copy-eligible alternative to Trim's filter-based cut: `ss`/
+/// `to` set as an output's own extra args. Being output-scoped, they
+/// naturally apply to *every* stream mapped into that output (video and
+/// audio both, here), not just one -- matching what "trim this
+/// deliverable" actually means for most real edits, unlike a Trim filter
+/// wired onto a single stream. Uses a source with a keyframe every 0.5s
+/// (`-g 5` at 10fps) so a `start=1` request lands almost exactly on one,
+/// keeping the duration assertion tight enough to still be meaningful.
+#[test]
+fn output_level_ss_to_trims_every_mapped_stream_and_stays_copy_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-output-trim-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = dir.join("source.mp4");
+    run_ok(Command::new("ffmpeg").args([
+        "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=duration=4:size=160x120:rate=10",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+        "-c:v", "libx264", "-g", "5", "-keyint_min", "5", "-c:a", "aac", "-shortest",
+        source_path.to_str().unwrap(),
+    ]));
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let audio_idx = streams.iter().position(|s| s.kind == StreamKind::Audio).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::Output(out));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: audio_idx }, Target::Output(out));
+    graph.outputs[0].extra_args = filter_fields(&[("ss", "1"), ("to", "3")]);
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(!joined.contains("-filter_complex"), "{joined}");
+    assert!(joined.contains("-c:0 copy"), "{joined}");
+    assert!(joined.contains("-c:1 copy"), "{joined}");
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let duration: f64 =
+        String::from_utf8_lossy(&probe.stdout).trim().strip_prefix("duration=").unwrap().parse().unwrap();
+    assert!(
+        (1.7..2.5).contains(&duration),
+        "expected an output-scoped trim of [1,3] to yield ~2s across both streams, got {duration}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two Filter modifiers chained on one wire (Scale then Crop) should both
 /// apply, in order -- exercised through the real Graph/resolve()/
 /// build_output_section() path, not just by hand-assembling ffmpeg args,
