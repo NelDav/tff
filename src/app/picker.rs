@@ -458,6 +458,7 @@ impl App {
                     Some("crop") => (filter_modifier(FilterName::Crop), "crop"),
                     Some("fade") => (filter_modifier(FilterName::Fade), "fade"),
                     Some("rotate") => (filter_modifier(FilterName::Rotate), "rotate"),
+                    Some("trim") => (filter_modifier(FilterName::Trim), "trim"),
                     _ => (ModifierKind::Convert(Codec::Copy), "convert"),
                 };
                 self.graph.add_modifier(kind);

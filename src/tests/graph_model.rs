@@ -152,6 +152,62 @@ fn unconfigured_filter_modifier_is_a_no_op() {
     assert!(joined.contains("-c:0 copy"), "{joined}");
 }
 
+/// Trim: video routes through `trim=...,setpts=PTS-STARTPTS` (the PTS
+/// reset is required -- see `FilterName::expression`'s doc comment -- or
+/// the kept segment keeps its original, non-zeroed timestamps and the
+/// output ends up with an apparent leading gap); audio uses `atrim`/
+/// `asetpts` instead. A node with neither field set is a no-op, same as
+/// any other unconfigured filter.
+#[test]
+fn filter_trim_builds_kind_specific_expression_with_pts_reset() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "1"), ("end", "3")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(joined.contains("trim=start=1:end=3,setpts=PTS-STARTPTS"), "{joined}");
+}
+
+#[test]
+fn filter_trim_uses_atrim_and_asetpts_for_audio() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None }],
+        Vec::new(),
+    );
+    let modifier = graph
+        .add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: filter_fields(&[("start", "2")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(joined.contains("atrim=start=2,asetpts=PTS-STARTPTS"), "{joined}");
+}
+
+#[test]
+fn unconfigured_trim_modifier_is_a_no_op() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = graph.add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: BTreeMap::new() });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(!joined.contains("-filter_complex"), "{joined}");
+}
+
 /// Chaining a Convert node into a Metadata node should combine both
 /// effects on the same resolved connection.
 #[test]

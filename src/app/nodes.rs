@@ -75,6 +75,10 @@ impl App {
                 display: "rotate (90/180 degrees)".to_string(),
                 value: Some("rotate".to_string()),
             },
+            PickerEntry {
+                display: "trim (cut to a start/end range)".to_string(),
+                value: Some("trim".to_string()),
+            },
         ];
         self.mode = Mode::Picker {
             kind: PickerKind::NewNode,

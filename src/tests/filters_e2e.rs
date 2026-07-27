@@ -259,6 +259,54 @@ fn filter_rotate_swaps_dimensions_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Trim: cutting a 4s source down to the [1, 3] window should yield a ~2s
+/// output, and -- because of the setpts reset `expression()` appends --
+/// that output's own first-frame timestamp should read back near zero, not
+/// still sitting at ~1s as it would without the reset.
+#[test]
+fn filter_trim_shortens_duration_and_resets_timestamps_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-trim-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 4, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
+    let modifier = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "1"), ("end", "3")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let duration: f64 =
+        String::from_utf8_lossy(&probe.stdout).trim().strip_prefix("duration=").unwrap().parse().unwrap();
+    assert!((1.5..2.5).contains(&duration), "expected trimming [1,3] out of a 4s source to yield ~2s, got {duration}");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "frame=pkt_pts_time", "-select_streams", "v", "-read_intervals", "%+#1", "-of", "default=noprint_wrappers=1", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let first_pts: f64 = String::from_utf8_lossy(&probe.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("pkt_pts_time="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    assert!(first_pts < 0.5, "expected the trimmed output's first timestamp to be reset near zero, got {first_pts}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two Filter modifiers chained on one wire (Scale then Crop) should both
 /// apply, in order -- exercised through the real Graph/resolve()/
 /// build_output_section() path, not just by hand-assembling ffmpeg args,

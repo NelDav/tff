@@ -117,6 +117,11 @@ pub enum FilterName {
     /// rather than a container-level `rotate` tag -- see `expression`'s doc
     /// comment for why the tag route was abandoned.
     Rotate,
+    /// Cut the stream down to `[start, end]` (either end optional --
+    /// omitted `start` keeps the beginning, omitted `end` keeps the rest),
+    /// with timestamps reset back to zero afterward. See `expression`'s
+    /// doc comment for why that reset is required.
+    Trim,
 }
 
 impl FilterName {
@@ -128,6 +133,7 @@ impl FilterName {
             FilterName::Crop => "crop",
             FilterName::Fade => "fade",
             FilterName::Rotate => "rotate",
+            FilterName::Trim => "trim",
         }
     }
 
@@ -137,7 +143,9 @@ impl FilterName {
     /// isn't a real ffmpeg operation.
     pub fn applies_to(&self, kind: StreamKind) -> bool {
         match self {
-            FilterName::Shift | FilterName::Fade => matches!(kind, StreamKind::Video | StreamKind::Audio),
+            FilterName::Shift | FilterName::Fade | FilterName::Trim => {
+                matches!(kind, StreamKind::Video | StreamKind::Audio)
+            }
             FilterName::Volume => matches!(kind, StreamKind::Audio),
             FilterName::Scale | FilterName::Crop | FilterName::Rotate => matches!(kind, StreamKind::Video),
         }
@@ -155,6 +163,7 @@ impl FilterName {
             FilterName::Crop => &["width", "height", "x", "y"],
             FilterName::Fade => &["type", "start", "duration"],
             FilterName::Rotate => &["direction"],
+            FilterName::Trim => &["start", "end"],
         }
     }
 
@@ -200,6 +209,15 @@ impl FilterName {
     /// re-encoding. A pixel-level transpose has no such container
     /// dependence. 180 degrees is two 90-degree transposes chained (there's
     /// no single-step "flip" direction), verified to compose correctly.
+    ///
+    /// `Trim` chains a `setpts`/`asetpts` reset after `trim`/`atrim`:
+    /// `trim` keeps the kept segment's *original* timestamps (so a clip
+    /// starting at `start=10` still carries PTS values starting around 10s
+    /// rather than 0), which downstream muxing/sync treats as a 10-second
+    /// gap at the front of the output instead of an actual cut -- verified
+    /// against a real ffmpeg run. Resetting PTS to start at zero is the
+    /// documented fix (ffmpeg's own `trim` filter docs call this out
+    /// explicitly).
     pub fn expression(&self, kind: StreamKind, fields: &BTreeMap<String, String>) -> Option<String> {
         let get = |k: &str| fields.get(k).map(String::as_str);
         match self {
@@ -250,6 +268,23 @@ impl FilterName {
                 "180" => Some("transpose=dir=1,transpose=dir=1".to_string()),
                 _ => None,
             },
+            FilterName::Trim => {
+                if get("start").is_none() && get("end").is_none() {
+                    return None;
+                }
+                let mut parts = Vec::new();
+                if let Some(start) = get("start") {
+                    parts.push(format!("start={start}"));
+                }
+                if let Some(end) = get("end") {
+                    parts.push(format!("end={end}"));
+                }
+                if kind == StreamKind::Audio {
+                    Some(format!("atrim={},asetpts=PTS-STARTPTS", parts.join(":")))
+                } else {
+                    Some(format!("trim={},setpts=PTS-STARTPTS", parts.join(":")))
+                }
+            }
         }
     }
 }
