@@ -66,7 +66,9 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                 crate::app::TextTarget::ModifierMetadataValue { key, .. } => format!("{key}: "),
                 crate::app::TextTarget::ModifierCustomKey(_) => "custom metadata key: ".to_string(),
                 crate::app::TextTarget::ModifierFilterValue { key, .. } => format!("{key}: "),
-                crate::app::TextTarget::ExtraArgValue { key, .. } => format!("{key}: "),
+                crate::app::TextTarget::ExtraArgValue { target, key } => {
+                    format!("{}: ", crate::app::extra_arg_label(*target, key))
+                }
                 crate::app::TextTarget::ExtraArgCustomKey(_) => "custom extra-arg key: ".to_string(),
                 crate::app::TextTarget::ChapterTime { field, .. } => match field {
                     crate::app::ChapterTimeField::Start => "start (HH:MM:SS or seconds): ".to_string(),

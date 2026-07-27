@@ -120,11 +120,23 @@ pub(super) fn disposition_picker_options(flags: &BTreeSet<String>) -> Vec<Picker
         .collect()
 }
 
-fn curated_extra_arg_keys(target: ExtraArgsTarget) -> &'static [(&'static str, bool)] {
+fn curated_extra_arg_keys(target: ExtraArgsTarget) -> &'static [(&'static str, bool, &'static str)] {
     match target {
         ExtraArgsTarget::Input(_) => crate::graph::input_extra_arg_keys(),
         ExtraArgsTarget::Output(_) => crate::graph::output_extra_arg_keys(),
     }
+}
+
+/// The friendly label for a curated extra-arg key (see
+/// `extra_args_picker_options`'s doc comment), or `key` itself if it's not
+/// one of the curated ones -- a custom key the user typed in has no label
+/// beyond its own name. Used by the text-input prompt so it matches
+/// whatever the picker entry it came from was actually showing.
+pub fn extra_arg_label(target: ExtraArgsTarget, key: &str) -> &str {
+    curated_extra_arg_keys(target)
+        .iter()
+        .find(|&&(k, _, _)| k == key)
+        .map_or(key, |&(_, _, label)| label)
 }
 
 pub(super) fn extra_args_of(graph: &Graph, target: ExtraArgsTarget) -> Option<&BTreeMap<String, String>> {
@@ -143,28 +155,32 @@ pub(super) fn extra_args_of_mut(graph: &mut Graph, target: ExtraArgsTarget) -> O
 
 /// The extra-args picker's option list: one entry per curated key --
 /// a `[x]`/`[ ]` checkbox for a valueless switch flag (toggled in place),
-/// or "key: value"/"key: (not set)" for one that takes an operand -- plus
-/// any already-set custom key outside the curated list and the "custom
-/// key..." escape hatch itself, mirroring `field_picker_options`.
+/// or "label: value"/"label: (not set)" for one that takes an operand --
+/// plus any already-set custom key outside the curated list and the
+/// "custom key..." escape hatch itself, mirroring `field_picker_options`.
+/// Displays each curated entry's friendly label (see
+/// `input_extra_arg_keys`'s doc comment), not necessarily the raw `-<key>`
+/// flag name stored under `value` -- picking an entry, and the actual arg
+/// ffmpeg gets, are still keyed by the raw name regardless of label.
 pub(super) fn extra_args_picker_options(graph: &Graph, target: ExtraArgsTarget) -> Vec<PickerEntry> {
     let empty = BTreeMap::new();
     let fields = extra_args_of(graph, target).unwrap_or(&empty);
     let curated = curated_extra_arg_keys(target);
 
-    let mut options: Vec<PickerEntry> = curated.iter().map(|&(key, is_boolean)| {
+    let mut options: Vec<PickerEntry> = curated.iter().map(|&(key, is_boolean, label)| {
         let display = if is_boolean {
             let mark = if fields.contains_key(key) { "x" } else { " " };
-            format!("[{mark}] {key}")
+            format!("[{mark}] {label}")
         } else {
             match fields.get(key) {
-                Some(v) => format!("{key}: {v}"),
-                None => format!("{key}: (not set)"),
+                Some(v) => format!("{label}: {v}"),
+                None => format!("{label}: (not set)"),
             }
         };
         PickerEntry { display, value: Some(key.to_string()) }
     }).collect();
     for (k, v) in fields {
-        if !curated.iter().any(|&(ck, _)| ck == k) {
+        if !curated.iter().any(|&(ck, _, _)| ck == k) {
             options.push(PickerEntry { display: format!("{k}: {v}"), value: Some(k.clone()) });
         }
     }
@@ -366,7 +382,7 @@ impl App {
             let selected_key = real_idx.and_then(|i| options.get(i)).and_then(|e| e.value.clone());
             let is_boolean = selected_key
                 .as_deref()
-                .is_some_and(|k| curated_extra_arg_keys(target).iter().any(|&(ck, b)| ck == k && b));
+                .is_some_and(|k| curated_extra_arg_keys(target).iter().any(|&(ck, b, _)| ck == k && b));
             if is_boolean {
                 let key = selected_key.unwrap();
                 if let Some(fields) = extra_args_of_mut(&mut self.graph, target) {

@@ -55,9 +55,13 @@ pub struct OutputNode {
 /// (`re`, useful for simulating a live source). The `bool` marks a
 /// valueless switch flag (no ffmpeg operand) that's toggled on pick rather
 /// than prompting for a value, same idea as `disposition_flags`' checkboxes.
+/// The trailing `&str` is the label shown in the picker -- distinct from
+/// the actual `-<key>` flag name for entries where the raw ffmpeg name
+/// alone would be cryptic (see `output_extra_arg_keys`'s `ss`/`to`); most
+/// entries just repeat the key since the raw name is already clear enough.
 /// A "custom key..." escape hatch in the picker covers anything else.
-pub fn input_extra_arg_keys() -> &'static [(&'static str, bool)] {
-    &[("itsoffset", false), ("stream_loop", false), ("re", true)]
+pub fn input_extra_arg_keys() -> &'static [(&'static str, bool, &'static str)] {
+    &[("itsoffset", false, "itsoffset"), ("stream_loop", false, "stream_loop"), ("re", true, "re")]
 }
 
 /// Curated global *output* options, same shape as `input_extra_arg_keys`.
@@ -78,15 +82,18 @@ pub fn input_extra_arg_keys() -> &'static [(&'static str, bool)] {
 /// prefix instead of an index-based jump, which is the trade made for
 /// actually matching this scope: unlike an input-level seek, it can't leak
 /// into a *different* output that happens to read the same input file.
-pub fn output_extra_arg_keys() -> &'static [(&'static str, bool)] {
+/// Labeled "trim start (ss)"/"trim end (to)" in the picker rather than the
+/// bare flag names, which read as cryptic on their own; the raw name stays
+/// visible in parentheses for anyone cross-referencing ffmpeg's own docs.
+pub fn output_extra_arg_keys() -> &'static [(&'static str, bool, &'static str)] {
     &[
-        ("max_interleave_delta", false),
-        ("movflags", false),
-        ("avoid_negative_ts", false),
-        ("fflags", false),
-        ("shortest", true),
-        ("ss", false),
-        ("to", false),
+        ("max_interleave_delta", false, "max_interleave_delta"),
+        ("movflags", false, "movflags"),
+        ("avoid_negative_ts", false, "avoid_negative_ts"),
+        ("fflags", false, "fflags"),
+        ("shortest", true, "shortest"),
+        ("ss", false, "trim start (ss)"),
+        ("to", false, "trim end (to)"),
     ]
 }
 

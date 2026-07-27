@@ -7,7 +7,7 @@ mod render;
 mod text_input;
 
 pub use chapters::ChapterColumn;
-pub use picker::filtered_indices;
+pub use picker::{extra_arg_label, filtered_indices};
 pub(crate) use text_input::char_byte_offset;
 // Internal callers reach this through `text_input::path_suggestions`
 // directly; this re-export exists solely so `tests.rs` can call it as

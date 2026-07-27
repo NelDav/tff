@@ -1572,6 +1572,35 @@ fn activate_focused_on_output_opens_extra_args_field_picker_with_current_values(
     assert!(options.iter().any(|o| o.display == "[ ] shortest"));
 }
 
+/// `ss`/`to` are shown under friendlier labels than their bare, cryptic
+/// ffmpeg flag names -- but picking one still edits the value keyed by the
+/// real flag name, and the text-input prompt that opens for it repeats the
+/// same friendly label, not the raw key.
+#[test]
+fn extra_args_picker_shows_friendly_labels_for_ss_and_to() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    app.graph.outputs[0].extra_args = filter_fields(&[("ss", "1")]);
+    app.focus = Focus::Output(0);
+
+    app.activate_focused();
+    let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert!(options.iter().any(|o| o.display == "trim start (ss): 1"), "{displays:?}");
+    assert!(options.iter().any(|o| o.display == "trim end (to): (not set)"), "{displays:?}");
+
+    let row = options.iter().position(|o| o.value.as_deref() == Some("ss")).unwrap();
+    app.picker_move(row as isize);
+    app.picker_confirm();
+
+    let Mode::TextInput { target, .. } = &app.mode else { panic!("expected text-input mode") };
+    let crate::app::TextTarget::ExtraArgValue { target, key } = target else {
+        panic!("expected ExtraArgValue target")
+    };
+    assert_eq!(crate::app::extra_arg_label(*target, key), "trim start (ss)");
+}
+
 /// Picking a curated valueless flag (e.g. "re") should toggle it in place
 /// and keep the picker open -- same idea as disposition flags -- rather
 /// than opening a value prompt for a flag that doesn't take one.
