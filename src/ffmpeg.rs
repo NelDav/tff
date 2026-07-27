@@ -125,9 +125,6 @@ pub fn probe(path: &str) -> Result<ProbeResult> {
 /// can offer the real, complete list instead of a guessed-at curated one.
 /// Parses `ffmpeg -encoders` output, e.g.:
 ///   " V....D a64multi             Multicolor charset for Commodore 64 ..."
-/// The media-type flag (V/A/S) is always the first non-whitespace character
-/// of a real entry, so trimming leading whitespace before taking the fixed
-/// 6-character flag block is safe here (unlike -muxers, see list_muxers).
 pub fn list_encoders() -> Result<Vec<(String, StreamKind)>> {
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
@@ -136,43 +133,44 @@ pub fn list_encoders() -> Result<Vec<(String, StreamKind)>> {
     if !output.status.success() {
         bail!("ffmpeg -encoders exited with an error");
     }
+    Ok(parse_encoders(&String::from_utf8_lossy(&output.stdout)))
+}
 
-    let text = String::from_utf8_lossy(&output.stdout);
+/// Each entry's flags and name are just its first two whitespace-separated
+/// fields, regardless of how many flag letters/columns a given ffmpeg build
+/// prints (that's changed across versions, e.g. the "frame-level
+/// multithreading"/"slice-level multithreading" columns are relatively
+/// recent additions) -- so this only relies on the media-type flag (V/A/S)
+/// being the first character of that first field, never on the flag
+/// block's exact width.
+pub(crate) fn parse_encoders(text: &str) -> Vec<(String, StreamKind)> {
     let mut started = false;
     let mut encoders = Vec::new();
     for line in text.lines() {
-        let trimmed = line.trim_start();
         if !started {
-            if trimmed.starts_with("---") {
+            if line.trim_start().starts_with("---") {
                 started = true;
             }
             continue;
         }
-        if trimmed.len() < 8 {
-            continue;
-        }
-        let kind = match trimmed.as_bytes()[0] {
-            b'V' => StreamKind::Video,
-            b'A' => StreamKind::Audio,
-            b'S' => StreamKind::Subtitle,
+        let mut fields = line.split_whitespace();
+        let Some(flags) = fields.next() else { continue };
+        let kind = match flags.as_bytes().first() {
+            Some(b'V') => StreamKind::Video,
+            Some(b'A') => StreamKind::Audio,
+            Some(b'S') => StreamKind::Subtitle,
             _ => continue,
         };
-        if let Some(name) = trimmed[6..].split_whitespace().next() {
+        if let Some(name) = fields.next() {
             encoders.push((name.to_string(), kind));
         }
     }
-    Ok(encoders)
+    encoders
 }
 
 /// Ask ffmpeg which muxers (container formats) it was actually built with.
 /// Parses `ffmpeg -muxers` output, e.g.:
 ///   "  E  3g2             3GP2 (3GPP2 file format)"
-/// Unlike -encoders, the first flag column (demuxing support) is routinely
-/// blank for mux-only entries, so naively trimming leading whitespace would
-/// silently swallow that blank column and misalign the rest of the line.
-/// The layout is fixed-width instead: 1 indent + 3 flag columns (D, E, d) +
-/// 1 separator, so the muxing flag is always at byte offset 2 and the name
-/// always starts at offset 5, regardless of which flags are blank.
 pub fn list_muxers() -> Result<Vec<String>> {
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-muxers"])
@@ -181,8 +179,17 @@ pub fn list_muxers() -> Result<Vec<String>> {
     if !output.status.success() {
         bail!("ffmpeg -muxers exited with an error");
     }
+    Ok(parse_muxers(&String::from_utf8_lossy(&output.stdout)))
+}
 
-    let text = String::from_utf8_lossy(&output.stdout);
+/// Same field-based approach as `parse_encoders`: the muxing flag and name
+/// are just the first two whitespace-separated fields, whatever the flag
+/// block's width happens to be on this ffmpeg build. Unlike encoders'
+/// media-type flag, an entry's muxing flag ('E') isn't always the first
+/// character of that field -- demux-only entries can share this listing
+/// with a blank 'E' slot -- so this checks the whole field for 'E' rather
+/// than just its first byte.
+pub(crate) fn parse_muxers(text: &str) -> Vec<String> {
     let mut started = false;
     let mut muxers = Vec::new();
     for line in text.lines() {
@@ -192,15 +199,16 @@ pub fn list_muxers() -> Result<Vec<String>> {
             }
             continue;
         }
-        let bytes = line.as_bytes();
-        if bytes.len() < 6 || bytes[2] != b'E' {
+        let mut fields = line.split_whitespace();
+        let Some(flags) = fields.next() else { continue };
+        if !flags.contains('E') {
             continue;
         }
-        if let Some(name) = line[5..].split_whitespace().next() {
+        if let Some(name) = fields.next() {
             muxers.push(name.to_string());
         }
     }
-    Ok(muxers)
+    muxers
 }
 
 /// Launch ffplay on a rendered preview file, in its own window. Runs

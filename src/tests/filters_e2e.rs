@@ -635,3 +635,62 @@ fn discovers_real_encoders_and_muxers_from_ffmpeg() {
     assert!(!muxers.contains(&"=".to_string()), "parser must not pick up legend lines");
 }
 
+/// `parse_encoders`/`parse_muxers` are checked directly against sample text
+/// below, not just the real ffmpeg on this machine -- ffmpeg's flag-column
+/// width (how many flag letters it prints per entry) has changed across
+/// versions, so a parser that only reads correctly at exact byte offsets
+/// can break silently on a different build. This sample is deliberately
+/// narrower than any real build's actual output, to prove parsing isn't
+/// secretly still relying on a specific column width.
+#[test]
+fn parse_encoders_and_muxers_do_not_depend_on_flag_column_width() {
+    let narrow_encoders = "\
+Encoders:
+ V = Video
+ A = Audio
+ ---
+ V  libx264              H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10
+ A  aac                  AAC (Advanced Audio Coding)
+";
+    let encoders = ffmpeg::parse_encoders(narrow_encoders);
+    assert!(encoders.iter().any(|(n, k)| n == "libx264" && *k == StreamKind::Video), "{encoders:?}");
+    assert!(encoders.iter().any(|(n, k)| n == "aac" && *k == StreamKind::Audio), "{encoders:?}");
+
+    let narrow_muxers = "\
+Formats:
+ E = Muxing supported
+ ---
+ E matroska    Matroska
+ E mp4         MP4 (MPEG-4 Part 14)
+ D avi         AVI (Audio Video Interleaved)
+";
+    let muxers = ffmpeg::parse_muxers(narrow_muxers);
+    assert!(muxers.iter().any(|m| m == "matroska"), "{muxers:?}");
+    assert!(muxers.iter().any(|m| m == "mp4"), "{muxers:?}");
+    assert!(!muxers.iter().any(|m| m == "avi"), "demux-only entry should be excluded: {muxers:?}");
+}
+
+/// Header/legend lines above the "---" divider must never be mistaken for
+/// real entries, even one containing a lone "E" (as in "= Muxing
+/// supported") that would otherwise look like a valid flags field on its
+/// own.
+#[test]
+fn parse_muxers_ignores_header_lines_before_the_divider() {
+    let text = "\
+Formats:
+ D. = Demuxing supported
+ .E = Muxing supported
+ ---
+ E matroska    Matroska
+";
+    assert_eq!(ffmpeg::parse_muxers(text), vec!["matroska".to_string()]);
+}
+
+/// Windows line endings shouldn't trip up parsing -- relevant since one of
+/// this project's two CI runners captures ffmpeg's stdout on Windows.
+#[test]
+fn parse_muxers_handles_windows_line_endings() {
+    let text = "Formats:\r\n ---\r\n  E  matroska        Matroska\r\n";
+    assert_eq!(ffmpeg::parse_muxers(text), vec!["matroska".to_string()]);
+}
+
