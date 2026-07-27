@@ -136,6 +136,15 @@ pub fn list_encoders() -> Result<Vec<(String, StreamKind)>> {
     Ok(parse_encoders(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// The "---" divider line between an `-encoders`/`-muxers` listing's legend
+/// and its actual entries. Its width scales with however many flag columns
+/// that particular listing has (verified against a real ffmpeg build where
+/// muxers' 2-column D/E legend gets a 2-dash divider while encoders' 6-column
+/// one gets 6), so this only checks for *a* dash, never a specific count.
+fn is_listing_divider(line: &str) -> bool {
+    line.trim_start().starts_with('-')
+}
+
 /// Each entry's flags and name are just its first two whitespace-separated
 /// fields, regardless of how many flag letters/columns a given ffmpeg build
 /// prints (that's changed across versions, e.g. the "frame-level
@@ -148,7 +157,7 @@ pub(crate) fn parse_encoders(text: &str) -> Vec<(String, StreamKind)> {
     let mut encoders = Vec::new();
     for line in text.lines() {
         if !started {
-            if line.trim_start().starts_with("---") {
+            if is_listing_divider(line) {
                 started = true;
             }
             continue;
@@ -194,7 +203,7 @@ pub(crate) fn parse_muxers(text: &str) -> Vec<String> {
     let mut muxers = Vec::new();
     for line in text.lines() {
         if !started {
-            if line.trim_start().starts_with("---") {
+            if is_listing_divider(line) {
                 started = true;
             }
             continue;

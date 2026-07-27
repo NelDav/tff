@@ -694,3 +694,26 @@ fn parse_muxers_handles_windows_line_endings() {
     assert_eq!(ffmpeg::parse_muxers(text), vec!["matroska".to_string()]);
 }
 
+/// Regression test for a real bug caught in CI: this is a verbatim excerpt
+/// of `ffmpeg -hide_banner -muxers` from Ubuntu 24.04's packaged ffmpeg
+/// (6.1.1-3ubuntu5) -- its divider is just two dashes, not three, since
+/// (unlike the dev machine this was first written against) this build's
+/// muxer legend only has two flag columns (D, E) instead of three (D, E,
+/// d), and the divider's width tracks the legend's. A `starts_with("---")`
+/// check for the divider silently parses zero muxers against output like
+/// this, since it never finds three dashes to begin with.
+#[test]
+fn parse_muxers_handles_a_two_dash_divider() {
+    let text = "\
+File formats:
+ D. = Demuxing supported
+ .E = Muxing supported
+ --
+  E matroska        Matroska
+  E mp4             MP4 (MPEG-4 Part 14)
+";
+    let muxers = ffmpeg::parse_muxers(text);
+    assert!(muxers.iter().any(|m| m == "matroska"), "{muxers:?}");
+    assert!(muxers.iter().any(|m| m == "mp4"), "{muxers:?}");
+}
+
