@@ -223,7 +223,15 @@ pub fn play(path: &str) -> Result<()> {
 /// on. `false` in a bare SSH session with no X forwarding, which is when
 /// `play_in_terminal` (mpv's terminal video output) is used instead.
 pub fn has_display() -> bool {
-    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    has_display_from(std::env::var_os("DISPLAY").is_some(), std::env::var_os("WAYLAND_DISPLAY").is_some())
+}
+
+/// A display counts as available if either X11's or Wayland's env var is
+/// set. Split out from `has_display` as a pure function of both booleans so
+/// it can be tested deterministically, independent of whatever env vars
+/// the machine running the test actually has set.
+pub(crate) fn has_display_from(has_display_var: bool, has_wayland_display_var: bool) -> bool {
+    has_display_var || has_wayland_display_var
 }
 
 /// Play a rendered preview file directly in the terminal via `mpv`'s

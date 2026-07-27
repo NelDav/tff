@@ -592,13 +592,16 @@ fn preview_args_cap_duration_and_write_to_the_given_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Grounded against this dev environment, which is known to have a real
-/// display available (both DISPLAY and WAYLAND_DISPLAY are set) --
-/// confirms has_display isn't, say, checking a typo'd env var name and
-/// always reporting false regardless of the real environment.
+/// A display is available with either env var alone, or both, and with
+/// neither only if neither is set. Checked via `has_display_from` directly
+/// so all four combinations are covered regardless of which (if any) are
+/// actually set on the machine running the test.
 #[test]
-fn has_display_detects_the_real_dev_environment() {
-    assert!(ffmpeg::has_display(), "expected a display to be detected in this dev environment");
+fn has_display_reflects_either_env_var_being_set() {
+    assert!(!ffmpeg::has_display_from(false, false), "expected no display with neither env var set");
+    assert!(ffmpeg::has_display_from(true, false), "expected a display with just DISPLAY set");
+    assert!(ffmpeg::has_display_from(false, true), "expected a display with just WAYLAND_DISPLAY set");
+    assert!(ffmpeg::has_display_from(true, true), "expected a display with both set");
 }
 
 /// mpv exiting non-zero -- whether because it's not installed, its own
