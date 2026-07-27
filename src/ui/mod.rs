@@ -3,6 +3,12 @@ mod popups;
 mod wires;
 
 pub(crate) use canvas::{input_node_text_extent, modifier_node_text_extent, output_node_text_extent};
+// Internal callers reach this through `popups::suggestion_label` directly;
+// this re-export exists solely so tests can call it as
+// `crate::ui::suggestion_label`, which -- being outside `#[cfg(test)]` --
+// a plain `cargo build` can't see using either path.
+#[allow(unused_imports)]
+pub(crate) use popups::suggestion_label;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

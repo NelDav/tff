@@ -450,3 +450,54 @@ fn ui_renders_suggestions_popup_and_hides_outside_text_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A suggestion's display label is just its own trailing name -- the
+/// shared directory prefix every candidate in one listing has in common is
+/// dropped, keeping a directory's own trailing '/' marker.
+#[test]
+fn suggestion_label_strips_the_shared_directory_prefix() {
+    assert_eq!(crate::ui::suggestion_label("/some/long/dir/alpha.mp4"), "alpha.mp4");
+    assert_eq!(crate::ui::suggestion_label("/some/long/dir/subdir/"), "subdir/");
+    assert_eq!(crate::ui::suggestion_label("alpha.mp4"), "alpha.mp4");
+}
+
+/// Regression test for a real bug: the popup used to show each suggestion's
+/// *full* path, which is harmless for a short directory but silently pushes
+/// the actual file name off the edge of the (deliberately capped-width)
+/// popup once the directory itself is long enough -- exactly what happened
+/// on a CI runner whose temp directory is much longer than this dev
+/// machine's `/tmp`. Uses a directory nested deep enough to reproduce that
+/// regardless of platform, rather than relying on whatever temp path this
+/// machine happens to have.
+#[test]
+fn ui_suggestions_popup_shows_the_file_name_even_under_a_long_directory_path() {
+    use crate::app::{App, Mode};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let dir = std::env::temp_dir().join(
+        "tff-test-long-path-so-so-so-so-so-so-so-so-so-so-so-so-so-so-so-so-so-so-so-so-very-deep",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("alpha.mp4"), b"").unwrap();
+
+    let mut app = App::new();
+    app.start_add_input();
+    let Mode::TextInput { input, suggestions, .. } = &mut app.mode else {
+        panic!("expected text input mode");
+    };
+    *input = tui_input::Input::new(format!("{}/a", dir.display()));
+    *suggestions = crate::app::path_suggestions(input.value());
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(screen.contains("alpha.mp4"), "expected the file name to stay visible:\n{screen}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

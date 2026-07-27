@@ -238,9 +238,27 @@ pub(super) fn draw_suggestions_popup(frame: &mut Frame, app: &App, status_area: 
             } else {
                 Style::default()
             };
-            TextLine::styled(format!(" {s}"), style)
+            TextLine::styled(format!(" {}", suggestion_label(s)), style)
         })
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Every suggestion returned for one `path_suggestions` call shares the
+/// same directory prefix (they're all entries from the same `read_dir`
+/// call) -- so within a single popup listing, that prefix never actually
+/// distinguishes one candidate from another, and showing it just pushes
+/// the one part that *does* differ (the file/dir's own name) further right,
+/// off the edge of a long input's popup entirely. This shows only that
+/// trailing name (keeping a directory's own trailing '/' marker), while
+/// `s` itself -- the full path -- stays what actually gets written into
+/// the buffer on accept (see `App::text_input_accept_suggestion`).
+pub(crate) fn suggestion_label(s: &str) -> String {
+    let (body, trailing_slash) = match s.strip_suffix('/') {
+        Some(rest) => (rest, "/"),
+        None => (s, ""),
+    };
+    let name = body.rsplit('/').next().unwrap_or(body);
+    format!("{name}{trailing_slash}")
 }
