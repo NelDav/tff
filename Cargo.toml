@@ -2,6 +2,9 @@
 name = "tff"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A node-based TUI for ffmpeg"
+repository = "https://github.com/NelDav/tff"
 
 [dependencies]
 anyhow = "1.0.104"
