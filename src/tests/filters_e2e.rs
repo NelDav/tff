@@ -604,6 +604,19 @@ fn has_display_reflects_either_env_var_being_set() {
     assert!(ffmpeg::has_display_from(true, true), "expected a display with both set");
 }
 
+/// With no `TFF_FFMPEG_DIR`, the bare binary name is used unchanged (the
+/// existing `PATH`-lookup behavior); with it set, that directory is joined
+/// with the name, using a `.exe` suffix only on Windows.
+#[test]
+fn binary_from_uses_the_bare_name_or_joins_the_configured_directory() {
+    assert_eq!(ffmpeg::binary_from("ffmpeg", None), "ffmpeg");
+
+    let joined = ffmpeg::binary_from("ffmpeg", Some("/opt/ffmpeg-6.1/bin".into()));
+    assert!(joined.starts_with("/opt/ffmpeg-6.1/bin"), "{joined}");
+    let expected_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    assert!(joined.ends_with(expected_name), "{joined}");
+}
+
 /// mpv exiting non-zero -- whether because it's not installed, its own
 /// install is broken, or simply because /dev/null isn't a real media file
 /// -- should surface as an Err from play_in_terminal, not silently report

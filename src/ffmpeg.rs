@@ -7,6 +7,32 @@ use serde::Deserialize;
 
 use crate::graph::{Chapter, StreamInfo, StreamKind};
 
+/// Resolves which `ffmpeg`/`ffprobe`/`ffplay` binary to actually run.
+/// Normally just `name` itself, resolved via `PATH` as always -- but with
+/// `TFF_FFMPEG_DIR` set, joins that directory with `name` instead, so a
+/// specific ffmpeg installation can be picked when several are installed
+/// side by side (e.g. to try a newer/older build without touching `PATH`).
+/// Not persisted anywhere: this only takes effect for as long as the env
+/// var is set, same as any other env var -- by design, for now, per the
+/// user's request to leave persistence as a later decision.
+fn binary(name: &str) -> String {
+    binary_from(name, std::env::var_os("TFF_FFMPEG_DIR"))
+}
+
+/// The actual decision logic behind `binary`, taking the env var's value
+/// directly so a test can exercise both branches deterministically instead
+/// of depending on whatever the machine running the test happens to have
+/// `TFF_FFMPEG_DIR` set to (nothing, ordinarily).
+pub(crate) fn binary_from(name: &str, ffmpeg_dir: Option<std::ffi::OsString>) -> String {
+    match ffmpeg_dir {
+        Some(dir) => {
+            let file_name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+            std::path::Path::new(&dir).join(file_name).to_string_lossy().into_owned()
+        }
+        None => name.to_string(),
+    }
+}
+
 /// What `probe` reports about a file: its real media streams (empty for a
 /// chapters-only FFMETADATA text file added as an input) and its chapters
 /// (empty for a file with none) -- see `probe`'s doc comment.
@@ -62,7 +88,7 @@ struct ProbeChapterTags {
 /// arrays populated, same shape. Only a genuinely unreadable/invalid file
 /// fails outright, which is when this still bails as before.
 pub fn probe(path: &str) -> Result<ProbeResult> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(binary("ffprobe"))
         .args([
             "-v", "error",
             "-show_streams",
@@ -126,7 +152,7 @@ pub fn probe(path: &str) -> Result<ProbeResult> {
 /// Parses `ffmpeg -encoders` output, e.g.:
 ///   " V....D a64multi             Multicolor charset for Commodore 64 ..."
 pub fn list_encoders() -> Result<Vec<(String, StreamKind)>> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(binary("ffmpeg"))
         .args(["-hide_banner", "-encoders"])
         .output()
         .context("failed to run ffmpeg -encoders")?;
@@ -181,7 +207,7 @@ pub(crate) fn parse_encoders(text: &str) -> Vec<(String, StreamKind)> {
 /// Parses `ffmpeg -muxers` output, e.g.:
 ///   "  E  3g2             3GP2 (3GPP2 file format)"
 pub fn list_muxers() -> Result<Vec<String>> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(binary("ffmpeg"))
         .args(["-hide_banner", "-muxers"])
         .output()
         .context("failed to run ffmpeg -muxers")?;
@@ -225,7 +251,7 @@ pub(crate) fn parse_muxers(text: &str) -> Vec<String> {
 /// from the player process, since it's the user who decides when they're
 /// done looking and closes the window themselves.
 pub fn play(path: &str) -> Result<()> {
-    Command::new("ffplay")
+    Command::new(binary("ffplay"))
         .args(["-hide_banner", "-autoexit", "-window_title", "tff preview", path])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -284,7 +310,7 @@ pub fn run_args(args: Vec<String>, tx: Sender<String>) {
 }
 
 fn run_args_inner(args: &[String], tx: &Sender<String>) -> Result<()> {
-    let mut child = Command::new("ffmpeg")
+    let mut child = Command::new(binary("ffmpeg"))
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
