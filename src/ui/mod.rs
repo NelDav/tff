@@ -19,14 +19,20 @@ use ratatui::Frame;
 use crate::app::{App, Mode};
 use crate::graph::{Endpoint, Graph};
 
+/// The log pane's fixed height (including its own border rows) -- shared
+/// between the root layout below, `draw_log`'s scroll-clamping, and
+/// `App::scroll_log`'s, so a future change to one can't silently desync
+/// from the others.
+pub(crate) const LOG_PANE_HEIGHT: u16 = 10;
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // title / hotkeys
-            Constraint::Min(10),    // node canvas
-            Constraint::Length(1),  // status / text-input line
-            Constraint::Length(10), // log pane
+            Constraint::Length(1), // title / hotkeys
+            Constraint::Min(10),   // node canvas
+            Constraint::Length(1), // status / text-input line
+            Constraint::Length(LOG_PANE_HEIGHT), // log pane
         ])
         .split(frame.area());
 
@@ -158,9 +164,14 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
-    let inner_height = area.height.saturating_sub(2) as usize; // minus borders
-    let start = app.log.len().saturating_sub(inner_height);
-    let lines: Vec<TextLine> = app.log[start..].iter().map(|l| TextLine::from(l.as_str())).collect();
-    let block = Block::default().borders(Borders::ALL).title(" log ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let (start, end) = app.visible_log_range();
+    let lines: Vec<TextLine> = app.log[start..end].iter().map(|l| TextLine::from(l.as_str())).collect();
+    let title = match (app.log_scroll.is_some(), app.log_hscroll > 0) {
+        (true, true) => " log (scrolled -- PgDn/Ctrl+Left to catch up) ".to_string(),
+        (true, false) => " log (scrolled -- PgDn to catch up) ".to_string(),
+        (false, true) => " log (scrolled right -- Ctrl+Left to catch up) ".to_string(),
+        (false, false) => " log ".to_string(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((0, app.log_hscroll)), area);
 }

@@ -501,3 +501,79 @@ fn ui_suggestions_popup_shows_the_file_name_even_under_a_long_directory_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Scrolling the log pane up should show older lines instead of the live
+/// tail, and the pane's title should say so -- both revert once scrolled
+/// back down to the bottom.
+#[test]
+fn ui_log_pane_shows_older_lines_and_a_scrolled_hint_when_paged_up() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let inner_height = (crate::ui::LOG_PANE_HEIGHT as usize) - 2;
+    app.log.clear();
+    for i in 0..(inner_height * 3) {
+        app.log.push(format!("logline-{i}"));
+    }
+
+    let render = |app: &App| {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let live_screen = render(&app);
+    assert!(live_screen.contains("logline-23"), "expected the newest line live:\n{live_screen}");
+    assert!(!live_screen.contains("logline-0"), "expected the oldest line off-screen live:\n{live_screen}");
+    assert!(!live_screen.contains("scrolled"), "expected no scrolled hint live:\n{live_screen}");
+
+    app.scroll_log(false);
+    let scrolled_screen = render(&app);
+    assert!(scrolled_screen.contains("scrolled"), "expected a scrolled hint:\n{scrolled_screen}");
+    assert!(
+        !scrolled_screen.contains("logline-23"),
+        "expected the newest line off-screen once scrolled up:\n{scrolled_screen}"
+    );
+}
+
+/// Scrolling the log pane right should reveal the tail of a line too long
+/// for the pane's width to show all at once (e.g. a full `$ ffmpeg ...`
+/// invocation) -- setting `log_hscroll` directly here, since the state
+/// machine that produces a given value is already covered by
+/// `scroll_log_horizontal_steps_floors_and_caps`; this only checks that
+/// rendering actually applies whatever value is there.
+#[test]
+fn ui_log_pane_scrolls_horizontally_to_reveal_a_long_lines_tail() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    app.log.clear();
+    app.log.push(format!("$ ffmpeg {}TAIL-MARKER", "-map 0:0 ".repeat(30)));
+
+    let render = |app: &App| {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let live_screen = render(&app);
+    assert!(!live_screen.contains("TAIL-MARKER"), "expected the tail truncated off-screen:\n{live_screen}");
+    assert!(!live_screen.contains("scrolled"), "expected no hint before any horizontal scroll:\n{live_screen}");
+
+    app.log_hscroll = 200; // comfortably past the prefix, well short of the line's end
+    let scrolled_screen = render(&app);
+    assert!(scrolled_screen.contains("TAIL-MARKER"), "expected the tail visible once scrolled right:\n{scrolled_screen}");
+    assert!(scrolled_screen.contains("scrolled right"), "expected a scrolled-right hint:\n{scrolled_screen}");
+}
+

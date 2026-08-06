@@ -171,10 +171,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.extend_port_selection(true),
             KeyCode::Up => app.cycle_row(false),
             KeyCode::Down => app.cycle_row(true),
-            // Shift+Left/Right resizes the focused node's right edge;
-            // plain Left/Right scrolls its (possibly truncated) text
-            // instead -- the Shift arms are checked first since match
-            // picks the first hit.
+            // Ctrl+Left/Right scrolls the log pane horizontally; Shift+Left/
+            // Right resizes the focused node's right edge; plain Left/Right
+            // scrolls its (possibly truncated) text instead -- the
+            // Ctrl/Shift arms are checked first since match picks the
+            // first hit.
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_log_horizontal(true),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_log_horizontal(false),
             KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.resize_focused_node(true),
             KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.resize_focused_node(false),
             KeyCode::Right => app.scroll_node_text(true),
@@ -197,6 +200,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('x') => app.delete_focused_node(),
             KeyCode::Char('r') => app.start_render(),
             KeyCode::Char('p') => app.start_preview(),
+            KeyCode::PageUp => app.scroll_log(false),
+            KeyCode::PageDown => app.scroll_log(true),
             KeyCode::Esc => {
                 app.armed.clear();
                 app.selected.clear();

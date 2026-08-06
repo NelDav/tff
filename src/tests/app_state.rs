@@ -1698,3 +1698,106 @@ fn extra_args_picker_custom_key_flow_prompts_for_key_then_value() {
     assert_eq!(app.graph.outputs[0].extra_args.get("fflags"), Some(&"+genpts".to_string()));
 }
 
+/// PageUp/PageDown should page through the log by a full screen at a time,
+/// floor at the very start rather than underflowing, and -- reaching the
+/// live bottom again -- snap back to `None` (pinned/live) rather than
+/// getting stuck on a stale `Some(live_start)`.
+#[test]
+fn scroll_log_pages_up_then_back_down_to_live() {
+    use crate::app::App;
+
+    let mut app = App::new();
+    let inner_height = (crate::ui::LOG_PANE_HEIGHT as usize) - 2;
+    app.log.clear();
+    for i in 0..(inner_height * 3) {
+        app.log.push(format!("line {i}"));
+    }
+    assert_eq!(app.log_scroll, None);
+
+    app.scroll_log(false); // PageUp: live_start (16) -> 8
+    assert_eq!(app.log_scroll, Some(inner_height));
+    app.scroll_log(false); // PageUp: 8 -> 0
+    assert_eq!(app.log_scroll, Some(0));
+    app.scroll_log(false); // PageUp at the very top: floors, stays 0
+    assert_eq!(app.log_scroll, Some(0));
+
+    app.scroll_log(true); // PageDown: 0 -> 8
+    assert_eq!(app.log_scroll, Some(inner_height));
+    app.scroll_log(true); // PageDown: 8 -> live_start (16), snaps to pinned/live
+    assert_eq!(app.log_scroll, None);
+    app.scroll_log(true); // PageDown while already pinned/live: stays pinned
+    assert_eq!(app.log_scroll, None);
+}
+
+/// PageUp is a no-op when the whole log already fits on screen -- there's
+/// nothing to scroll to, so it should stay pinned/live rather than
+/// producing a `Some` that shows exactly the same lines anyway.
+#[test]
+fn scroll_log_page_up_is_a_no_op_when_everything_already_fits() {
+    use crate::app::App;
+
+    let mut app = App::new();
+    app.log.clear();
+    app.log.push("only one line".to_string());
+    app.scroll_log(false);
+    assert_eq!(app.log_scroll, None);
+}
+
+/// Ctrl+Right/Left should adjust `log_hscroll` by a fixed step, cap at the
+/// longest currently visible line's own length (here, its only line) once
+/// scrolling further wouldn't reveal anything new, and floor at zero
+/// rather than underflowing -- same shape as `scroll_node_text`'s own
+/// step/floor/cap test.
+#[test]
+fn scroll_log_horizontal_steps_floors_and_caps() {
+    use crate::app::App;
+
+    let mut app = App::new();
+    app.log.clear();
+    app.log.push("x".repeat(50));
+
+    assert_eq!(app.log_hscroll, 0);
+    app.scroll_log_horizontal(true);
+    assert_eq!(app.log_hscroll, 8);
+    app.scroll_log_horizontal(true);
+    assert_eq!(app.log_hscroll, 16);
+
+    for _ in 0..10 {
+        app.scroll_log_horizontal(true);
+    }
+    assert_eq!(app.log_hscroll, 50, "should cap at the line's own length rather than growing unbounded");
+
+    app.scroll_log_horizontal(false);
+    assert_eq!(app.log_hscroll, 42);
+
+    for _ in 0..10 {
+        app.scroll_log_horizontal(false);
+    }
+    assert_eq!(app.log_hscroll, 0, "should floor at zero rather than underflowing");
+}
+
+/// The horizontal-scroll cap only considers the lines actually visible in
+/// the current (vertically scrolled) window -- a much longer line sitting
+/// outside that window, further up the log, shouldn't let horizontal
+/// scroll run past what the visible lines themselves would ever need.
+#[test]
+fn scroll_log_horizontal_cap_only_considers_currently_visible_lines() {
+    use crate::app::App;
+
+    let mut app = App::new();
+    let inner_height = (crate::ui::LOG_PANE_HEIGHT as usize) - 2;
+    app.log.clear();
+    app.log.push("x".repeat(100)); // scrolls out of the live view below
+    for i in 0..inner_height {
+        app.log.push(format!("short-{i}"));
+    }
+
+    for _ in 0..20 {
+        app.scroll_log_horizontal(true);
+    }
+    let (start, end) = app.visible_log_range();
+    let max_visible = app.log[start..end].iter().map(|l| l.chars().count()).max().unwrap() as u16;
+    assert!(max_visible < 100, "sanity check: the long line shouldn't be part of the live view");
+    assert_eq!(app.log_hscroll, max_visible);
+}
+

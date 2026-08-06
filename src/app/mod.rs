@@ -213,6 +213,19 @@ pub struct App {
     /// so it lives on `App`, not on the node itself, and resets whenever
     /// focus moves to a different node (see `set_focus_index`).
     pub text_scroll: u16,
+    /// The log pane's scroll position: `None` means pinned to the live
+    /// bottom (always showing the newest lines, today's default behavior,
+    /// auto-following as more get pushed) -- `Some(start)` freezes the view
+    /// at that absolute line index instead, so reading old output isn't
+    /// disrupted by new lines arriving mid-read. See `scroll_log`.
+    pub log_scroll: Option<usize>,
+    /// How many columns the log pane's lines are scrolled left by, for
+    /// reading a long line (e.g. the full `$ ffmpeg ...` command) a
+    /// terminal-width-limited pane would otherwise truncate. Independent
+    /// of `log_scroll` (which line-range is shown) -- this is which
+    /// horizontal slice of whatever's currently shown. See
+    /// `scroll_log_horizontal`.
+    pub log_hscroll: u16,
     pub log: Vec<String>,
     pub status: String,
     pub running: bool,
@@ -255,6 +268,8 @@ impl App {
             selected: BTreeSet::new(),
             selection_anchor: None,
             text_scroll: 0,
+            log_scroll: None,
+            log_hscroll: 0,
             log,
             status: String::new(),
             running: false,

@@ -1,6 +1,13 @@
 use super::{App, Focus};
 use crate::graph::{Endpoint, Target};
 
+/// The log pane's visible line count -- its fixed height minus its own
+/// border rows. Shared by `App::scroll_log`/`visible_log_range` and
+/// `ui::draw_log`'s rendering, so they can't silently desync.
+fn log_pane_inner_height() -> usize {
+    (crate::ui::LOG_PANE_HEIGHT as usize).saturating_sub(2)
+}
+
 impl App {
     pub fn cycle_focus(&mut self, forward: bool) {
         let n = self.node_count();
@@ -128,6 +135,54 @@ impl App {
             self.text_scroll.saturating_add(STEP).min(max_scroll)
         } else {
             self.text_scroll.saturating_sub(STEP)
+        };
+    }
+
+    /// PageUp/PageDown: scrolls the log pane one page at a time, freezing
+    /// it at an absolute line index while scrolled (see `log_scroll`'s doc
+    /// comment) so lines arriving mid-read don't disrupt what's on screen.
+    /// Reaching the live bottom again (`forward` far enough, or immediately
+    /// if never scrolled) snaps back to "pinned" (`None`), resuming
+    /// auto-follow of new output exactly like before any scrolling.
+    pub fn scroll_log(&mut self, forward: bool) {
+        let inner_height = log_pane_inner_height();
+        let live_start = self.log.len().saturating_sub(inner_height);
+        let current = self.log_scroll.unwrap_or(live_start);
+        let new_start =
+            if forward { (current + inner_height).min(live_start) } else { current.saturating_sub(inner_height) };
+        self.log_scroll = if new_start >= live_start { None } else { Some(new_start) };
+    }
+
+    /// The absolute `[start, end)` line range of `log` currently shown in
+    /// the log pane, given `log_scroll` -- shared by `ui::draw_log` (which
+    /// slices `log` with it) and `scroll_log_horizontal` (which needs to
+    /// know which lines are on screen to cap scrolling at the longest
+    /// one).
+    pub fn visible_log_range(&self) -> (usize, usize) {
+        let inner_height = log_pane_inner_height();
+        let live_start = self.log.len().saturating_sub(inner_height);
+        let start = self.log_scroll.unwrap_or(live_start).min(live_start);
+        let end = (start + inner_height).min(self.log.len());
+        (start, end)
+    }
+
+    /// Ctrl+Left/Right: scrolls the log pane's currently visible lines
+    /// horizontally, for reading a long line (e.g. the full `$ ffmpeg ...`
+    /// command) past whatever the pane's width truncates it to -- same
+    /// idea as `scroll_node_text`, but capped only at the longest visible
+    /// line's own length rather than that minus the pane's rendered width
+    /// (unlike a node's fixed configured width, the log pane just fills
+    /// whatever's left of the terminal, so its exact rendered width isn't
+    /// known here); scrolling a little past what's actually useful is
+    /// harmless, just not as tightly bounded.
+    pub fn scroll_log_horizontal(&mut self, forward: bool) {
+        const STEP: u16 = 8;
+        let (start, end) = self.visible_log_range();
+        let max_len = self.log[start..end].iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+        self.log_hscroll = if forward {
+            self.log_hscroll.saturating_add(STEP).min(max_len)
+        } else {
+            self.log_hscroll.saturating_sub(STEP)
         };
     }
 
