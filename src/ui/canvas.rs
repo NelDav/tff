@@ -63,6 +63,34 @@ pub(crate) fn input_node_text_extent(app: &App, node: &InputNode) -> (String, Ve
     (format!(" [{}] {} ", node.file_index, basename), lines)
 }
 
+/// A `ModifierKind::Concat` node's segment list, in concat order: one
+/// numbered line per connected segment describing what it resolves to, or
+/// a single placeholder line when nothing's connected yet -- shared by the
+/// plain-text extent twin and `draw_modifier_node`'s styled rendering.
+fn concat_segment_lines(app: &App, node_id: NodeId) -> Vec<String> {
+    let segments = app.graph.incoming(Target::ModifierIn(node_id));
+    if segments.is_empty() {
+        return vec!["(no segments — arm a stream, 'c' to add)".to_string()];
+    }
+    segments
+        .iter()
+        .enumerate()
+        .map(|(row, &wi)| {
+            let wire = &app.graph.wires[wi];
+            match app.graph.resolve(wire.from) {
+                Some(r) => {
+                    let (label, source) = app.graph.resolved_label_and_source(&r);
+                    match source {
+                        Some(src) => format!("{}. {label} <- {src}", row + 1),
+                        None => format!("{}. {label}", row + 1),
+                    }
+                }
+                None => format!("{}. (broken chain)", row + 1),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn modifier_node_text_extent(app: &App, node: &ModifierNode) -> (String, Vec<String>) {
     let mut lines = Vec::new();
     match &node.kind {
@@ -87,7 +115,7 @@ pub(crate) fn modifier_node_text_extent(app: &App, node: &ModifierNode) -> (Stri
                 lines.extend(fields.iter().map(|(key, value)| format!("{key}: {value}")));
             }
         }
-        ModifierKind::Convert(_) => {}
+        ModifierKind::Convert(_) | ModifierKind::Concat => {}
         ModifierKind::ChapterEdit { chapters } => {
             if chapters.is_empty() {
                 lines.push("(no chapters set)".to_string());
@@ -104,19 +132,18 @@ pub(crate) fn modifier_node_text_extent(app: &App, node: &ModifierNode) -> (Stri
         }
     }
 
-    let incoming_wire = app.graph.wires.iter().find(|w| w.to == Target::ModifierIn(node.id));
-    lines.push(match incoming_wire {
-        Some(w) => match app.graph.resolve(w.from) {
-            Some(r) => app
-                .graph
-                .input(r.from_node)
-                .and_then(|inp| inp.streams.get(r.from_stream_idx))
-                .map(|s| format!("← {}", s.label()))
-                .unwrap_or_else(|| "← (unknown)".to_string()),
-            None => "← (broken chain)".to_string(),
-        },
-        None => "← (unconnected)".to_string(),
-    });
+    if matches!(node.kind, ModifierKind::Concat) {
+        lines.extend(concat_segment_lines(app, node.id));
+    } else {
+        let incoming_wire = app.graph.wires.iter().find(|w| w.to == Target::ModifierIn(node.id));
+        lines.push(match incoming_wire {
+            Some(w) => match app.graph.resolve(w.from) {
+                Some(r) => format!("← {}", app.graph.resolved_label_and_source(&r).0),
+                None => "← (broken chain)".to_string(),
+            },
+            None => "← (unconnected)".to_string(),
+        });
+    }
 
     let outgoing = app.graph.outgoing(Endpoint::ModifierOut(node.id));
     if outgoing.is_empty() {
@@ -158,23 +185,16 @@ pub(crate) fn output_node_text_extent(app: &App, index: usize, node: &OutputNode
         lines.push(match app.graph.resolve(wire.from) {
             Some(r) => {
                 let mut tags = Vec::new();
-                if r.codec.ffmpeg_name().is_some() {
-                    tags.push(r.codec.label().to_string());
+                if r.codec().ffmpeg_name().is_some() {
+                    tags.push(r.codec().label().to_string());
                 }
-                tags.extend(r.metadata.iter().map(|(key, value)| format!("{key}:{value}")));
+                tags.extend(r.metadata().iter().map(|(key, value)| format!("{key}:{value}")));
                 let tag = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
-                app.graph
-                    .input(r.from_node)
-                    .and_then(|n| n.streams.get(r.from_stream_idx).map(|s| (n, s)))
-                    .map(|(n, s)| {
-                        format!(
-                            "{}{tag} <- [{}] {}",
-                            s.label(),
-                            n.file_index,
-                            n.path.rsplit('/').next().unwrap_or(&n.path)
-                        )
-                    })
-                    .unwrap_or_else(|| format!("(dangling){tag}"))
+                let (label, source) = app.graph.resolved_label_and_source(&r);
+                match source {
+                    Some(src) => format!("{label}{tag} <- {src}"),
+                    None => format!("{label}{tag}"),
+                }
             }
             None => "● (broken chain)".to_string(),
         });
@@ -226,11 +246,13 @@ fn output_body_rows(incoming_count: usize, has_chapters: bool) -> usize {
 
 /// A Metadata modifier's box has an upper section (one row per field it
 /// sets, or a placeholder row) plus a divider, on top of the connections
-/// section every modifier has; a Convert modifier has just the connections
-/// section, since its one "field" already fits in the title bar.
+/// section every modifier has; a Convert or Concat modifier has just the
+/// connections section, since Convert's one "field" already fits in the
+/// title bar and Concat has no fields at all (only its segment list, part
+/// of the connections section -- see `modifier_incoming_rows`).
 fn modifier_field_rows(kind: &ModifierKind) -> u16 {
     match kind {
-        ModifierKind::Convert(_) => 0,
+        ModifierKind::Convert(_) | ModifierKind::Concat => 0,
         ModifierKind::Metadata { fields } => fields.len().max(1) as u16 + 1, // + divider
         ModifierKind::Disposition { flags } => flags.len().max(1) as u16 + 1, // + divider
         ModifierKind::Filter { fields, .. } => fields.len().max(1) as u16 + 1, // + divider
@@ -239,18 +261,31 @@ fn modifier_field_rows(kind: &ModifierKind) -> u16 {
 }
 
 /// Row (0-based from the box's top border) where the incoming-connection
-/// line sits -- right after the field section, if any.
+/// section starts -- right after the field section, if any.
 pub(super) fn modifier_incoming_row(kind: &ModifierKind) -> u16 {
     1 + modifier_field_rows(kind)
 }
 
-/// Row where the outgoing-connection list starts.
-pub(super) fn modifier_outgoing_start_row(kind: &ModifierKind) -> u16 {
-    modifier_incoming_row(kind) + 1
+/// How many rows the incoming-connection section occupies: every other
+/// modifier kind only ever has one wire in (or a single "unconnected"
+/// placeholder line), but a `Concat` node can have any number of segments
+/// -- `segment_count` is `Graph::incoming(Target::ModifierIn(id)).len())`,
+/// the caller's to compute since it needs graph access this function
+/// doesn't have.
+fn modifier_incoming_rows(kind: &ModifierKind, segment_count: usize) -> u16 {
+    match kind {
+        ModifierKind::Concat => segment_count.max(1) as u16,
+        _ => 1,
+    }
 }
 
-fn modifier_rows(kind: &ModifierKind, outgoing_count: usize) -> u16 {
-    modifier_outgoing_start_row(kind) + outgoing_count.max(1) as u16 + 1 // + bottom border
+/// Row where the outgoing-connection list starts.
+pub(super) fn modifier_outgoing_start_row(kind: &ModifierKind, segment_count: usize) -> u16 {
+    modifier_incoming_row(kind) + modifier_incoming_rows(kind, segment_count)
+}
+
+fn modifier_rows(kind: &ModifierKind, segment_count: usize, outgoing_count: usize) -> u16 {
+    modifier_outgoing_start_row(kind, segment_count) + outgoing_count.max(1) as u16 + 1 // + bottom border
 }
 
 /// Renders the node graph: a bordered panel with connection wires drawn
@@ -290,7 +325,8 @@ pub(super) fn compute_rects(app: &App, area: Rect) -> Vec<(NodeId, Rect)> {
         }
     }
     for m in &app.graph.modifiers {
-        let rows = modifier_rows(&m.kind, app.graph.outgoing(Endpoint::ModifierOut(m.id)).len());
+        let segment_count = app.graph.incoming(Target::ModifierIn(m.id)).len();
+        let rows = modifier_rows(&m.kind, segment_count, app.graph.outgoing(Endpoint::ModifierOut(m.id)).len());
         if let Some(r) = node_rect(area, m.pos, m.width, rows) {
             rects.push((m.id, r));
         }
@@ -395,7 +431,8 @@ fn draw_input_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize
 /// per row, the same way an output node lists its incoming ones.
 fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &ModifierNode) {
     let outgoing = app.graph.outgoing(Endpoint::ModifierOut(node.id));
-    let rows = modifier_rows(&node.kind, outgoing.len());
+    let segment_count = app.graph.incoming(Target::ModifierIn(node.id)).len();
+    let rows = modifier_rows(&node.kind, segment_count, outgoing.len());
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
@@ -438,7 +475,7 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
             let divider_width = rect.width.saturating_sub(2) as usize;
             lines.push(TextLine::styled("─".repeat(divider_width), Style::default().fg(Color::DarkGray)));
         }
-        ModifierKind::Convert(_) => {}
+        ModifierKind::Convert(_) | ModifierKind::Concat => {}
         ModifierKind::ChapterEdit { chapters } => {
             if chapters.is_empty() {
                 lines.push(TextLine::styled("(no chapters set)", Style::default().fg(Color::DarkGray)));
@@ -457,20 +494,31 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
         }
     }
 
-    let incoming_wire = app.graph.wires.iter().find(|w| w.to == Target::ModifierIn(node.id));
-    let incoming_text = match incoming_wire {
-        Some(w) => match app.graph.resolve(w.from) {
-            Some(r) => app
-                .graph
-                .input(r.from_node)
-                .and_then(|inp| inp.streams.get(r.from_stream_idx))
-                .map(|s| format!("← {}", s.label()))
-                .unwrap_or_else(|| "← (unknown)".to_string()),
-            None => "← (broken chain)".to_string(),
-        },
-        None => "← (unconnected)".to_string(),
+    // A Concat node's row list is its segments (below) followed by its
+    // outgoing wires; the offset shifts the outgoing loop's highlighting
+    // to match `cycle_row`'s combined indexing. Every other kind has no
+    // segments section, so its outgoing rows start at row_idx 0, as before.
+    let row_offset = if matches!(node.kind, ModifierKind::Concat) {
+        for (row, text) in concat_segment_lines(app, node.id).into_iter().enumerate() {
+            let mut style = Style::default().fg(Color::DarkGray);
+            if focused && row == app.row_idx {
+                style = Style::default().add_modifier(Modifier::REVERSED);
+            }
+            lines.push(TextLine::styled(text, style));
+        }
+        segment_count
+    } else {
+        let incoming_wire = app.graph.wires.iter().find(|w| w.to == Target::ModifierIn(node.id));
+        let incoming_text = match incoming_wire {
+            Some(w) => match app.graph.resolve(w.from) {
+                Some(r) => format!("← {}", app.graph.resolved_label_and_source(&r).0),
+                None => "← (broken chain)".to_string(),
+            },
+            None => "← (unconnected)".to_string(),
+        };
+        lines.push(TextLine::styled(incoming_text, Style::default().fg(Color::DarkGray)));
+        0
     };
-    lines.push(TextLine::styled(incoming_text, Style::default().fg(Color::DarkGray)));
 
     if outgoing.is_empty() {
         lines.push(TextLine::styled(
@@ -496,7 +544,7 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
             },
         };
         let mut style = Style::default();
-        if focused && row == app.row_idx {
+        if focused && row + row_offset == app.row_idx {
             style = style.add_modifier(Modifier::REVERSED);
         }
         lines.push(TextLine::styled(target_label, style));
@@ -545,28 +593,21 @@ fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usiz
         let label = match app.graph.resolve(wire.from) {
             Some(r) => {
                 let mut tags = Vec::new();
-                if r.codec.ffmpeg_name().is_some() {
-                    tags.push(r.codec.label().to_string());
+                if r.codec().ffmpeg_name().is_some() {
+                    tags.push(r.codec().label().to_string());
                 }
-                for (key, value) in &r.metadata {
+                for (key, value) in r.metadata() {
                     tags.push(format!("{key}:{value}"));
                 }
                 // The tag goes right after the stream label -- before the
                 // "<- source file" part -- so it survives the box's width
                 // truncation instead of being the first thing clipped off.
                 let tag = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
-                app.graph
-                    .input(r.from_node)
-                    .and_then(|n| n.streams.get(r.from_stream_idx).map(|s| (n, s)))
-                    .map(|(n, s)| {
-                        format!(
-                            "{}{tag} <- [{}] {}",
-                            s.label(),
-                            n.file_index,
-                            n.path.rsplit('/').next().unwrap_or(&n.path)
-                        )
-                    })
-                    .unwrap_or_else(|| format!("(dangling){tag}"))
+                let (label, source) = app.graph.resolved_label_and_source(&r);
+                match source {
+                    Some(src) => format!("{label}{tag} <- {src}"),
+                    None => format!("{label}{tag}"),
+                }
             }
             None => "● (broken chain)".to_string(),
         };

@@ -269,7 +269,7 @@ fn ctrl_down_swaps_the_hovered_output_row_with_the_next() {
 
     app.focus = Focus::Output(0);
     app.row_idx = 0;
-    app.move_output_row(true);
+    app.move_focused_row(true);
 
     let order: Vec<Endpoint> = app
         .graph
@@ -281,7 +281,7 @@ fn ctrl_down_swaps_the_hovered_output_row_with_the_next() {
     assert_eq!(app.row_idx, 1, "the hovered row should follow the moved wire");
 
     // Move it back up again -- should restore the original order.
-    app.move_output_row(false);
+    app.move_focused_row(false);
     let order: Vec<Endpoint> = app
         .graph
         .incoming(Target::Output(out))
@@ -319,7 +319,7 @@ fn move_output_row_is_a_no_op_at_edges_and_on_the_chapters_row() {
 
     // Already at the top -- moving up further is a no-op.
     app.row_idx = 0;
-    app.move_output_row(false);
+    app.move_focused_row(false);
     assert_eq!(app.row_idx, 0);
     let order: Vec<Endpoint> = app
         .graph
@@ -332,7 +332,7 @@ fn move_output_row_is_a_no_op_at_edges_and_on_the_chapters_row() {
     // Already at the bottom of the mapped-stream rows -- moving down
     // further is a no-op too.
     app.row_idx = 1;
-    app.move_output_row(true);
+    app.move_focused_row(true);
     assert_eq!(app.row_idx, 1);
     let order: Vec<Endpoint> = app
         .graph
@@ -345,8 +345,8 @@ fn move_output_row_is_a_no_op_at_edges_and_on_the_chapters_row() {
     // The chapters row (index 2, one past the two mapped-stream rows) has
     // nothing to reorder against.
     app.row_idx = 2;
-    app.move_output_row(true);
-    app.move_output_row(false);
+    app.move_focused_row(true);
+    app.move_focused_row(false);
     assert!(!app.graph.incoming(Target::OutputChapters(out)).is_empty(), "chapters wire untouched");
 }
 
@@ -363,7 +363,7 @@ fn move_output_row_is_a_no_op_off_an_output_node() {
 
     app.focus = Focus::Input(0);
     app.row_idx = 0;
-    app.move_output_row(true);
+    app.move_focused_row(true);
 
     let order: Vec<Endpoint> = app
         .graph
@@ -1831,5 +1831,158 @@ fn scroll_log_horizontal_cap_only_considers_currently_visible_lines() {
     let max_visible = app.log[start..end].iter().map(|l| l.chars().count()).max().unwrap() as u16;
     assert!(max_visible < 100, "sanity check: the long line shouldn't be part of the live view");
     assert_eq!(app.log_hscroll, max_visible);
+}
+
+/// 'c' on a Concat modifier with several armed sources should append all
+/// of them as segments in one action (like an output's bulk-connect), not
+/// reject the batch the way a single-input modifier would.
+#[test]
+fn toggle_connect_appends_every_armed_source_to_a_concat_modifier() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    let concat_idx = app.graph.modifiers.iter().position(|m| m.id == concat).unwrap();
+
+    app.armed = BTreeSet::from([
+        Endpoint::Stream { node: a, stream_idx: 0 },
+        Endpoint::Stream { node: b, stream_idx: 0 },
+    ]);
+    app.focus = Focus::Modifier(concat_idx);
+    app.toggle_connect();
+
+    assert!(app.armed.is_empty());
+    assert_eq!(app.graph.incoming(Target::ModifierIn(concat)).len(), 2);
+}
+
+/// A source whose kind doesn't match a Concat node's existing segments
+/// should be rejected without disturbing the segments already connected.
+#[test]
+fn toggle_connect_rejects_a_concat_segment_that_mismatches_the_existing_kind() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    let concat_idx = app.graph.modifiers.iter().position(|m| m.id == concat).unwrap();
+
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(concat)); // video
+
+    app.armed = BTreeSet::from([Endpoint::Stream { node: id, stream_idx: 1 }]); // audio
+    app.focus = Focus::Modifier(concat_idx);
+    app.toggle_connect();
+
+    assert_eq!(app.graph.incoming(Target::ModifierIn(concat)).len(), 1, "the mismatched segment must not be added");
+    assert!(
+        app.log.iter().any(|l| l.contains("can't mix in a audio one")),
+        "{:?}",
+        app.log
+    );
+}
+
+/// 'd' on a Concat modifier's segment row should remove just that segment,
+/// not every incoming wire -- mirroring an output's per-row disconnect.
+#[test]
+fn disconnect_focused_removes_just_the_hovered_concat_segment() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    let concat_idx = app.graph.modifiers.iter().position(|m| m.id == concat).unwrap();
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+
+    app.focus = Focus::Modifier(concat_idx);
+    app.row_idx = 0;
+    app.disconnect_focused();
+
+    let incoming = app.graph.incoming(Target::ModifierIn(concat));
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(app.graph.wires[incoming[0]].from, Endpoint::Stream { node: b, stream_idx: 0 });
+}
+
+/// 'd' on a Concat modifier's *outgoing* row (past the segment rows)
+/// should disconnect that downstream wire, not a segment -- row_idx spans
+/// segments then outgoing wires, same combined indexing `cycle_row` uses.
+#[test]
+fn disconnect_focused_on_a_concat_outgoing_row_leaves_segments_untouched() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    let concat_idx = app.graph.modifiers.iter().position(|m| m.id == concat).unwrap();
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+    let out = app.graph.outputs[0].id;
+    app.graph.connect(Endpoint::ModifierOut(concat), Target::Output(out));
+
+    app.focus = Focus::Modifier(concat_idx);
+    app.row_idx = 2; // past the two segment rows -- the one outgoing row
+    app.disconnect_focused();
+
+    assert_eq!(app.graph.incoming(Target::ModifierIn(concat)).len(), 2, "segments should be untouched");
+    assert!(app.graph.outgoing(Endpoint::ModifierOut(concat)).is_empty());
+}
+
+/// Ctrl+Up/Down while focused on a Concat segment row should reorder that
+/// segment, changing the join order (see `Graph::swap_wires`), same as an
+/// output's mapped-stream reordering.
+#[test]
+fn move_focused_row_reorders_a_concat_segment() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    let concat_idx = app.graph.modifiers.iter().position(|m| m.id == concat).unwrap();
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+
+    app.focus = Focus::Modifier(concat_idx);
+    app.row_idx = 0;
+    app.move_focused_row(true);
+
+    let order: Vec<Endpoint> = app
+        .graph
+        .incoming(Target::ModifierIn(concat))
+        .into_iter()
+        .map(|wi| app.graph.wires[wi].from)
+        .collect();
+    assert_eq!(order, vec![Endpoint::Stream { node: b, stream_idx: 0 }, Endpoint::Stream { node: a, stream_idx: 0 }]);
+    assert_eq!(app.row_idx, 1);
+}
+
+/// `cycle_row` on a Concat modifier should cycle through its segment rows
+/// and then its outgoing rows as one combined list, same combined scheme
+/// as an output's mapped-streams-then-chapters list.
+#[test]
+fn cycle_row_combines_concat_segments_and_outgoing_rows() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    let concat_idx = app.graph.modifiers.iter().position(|m| m.id == concat).unwrap();
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+    let out = app.graph.outputs[0].id;
+    app.graph.connect(Endpoint::ModifierOut(concat), Target::Output(out));
+
+    app.focus = Focus::Modifier(concat_idx);
+    app.row_idx = 0;
+    app.cycle_row(true);
+    assert_eq!(app.row_idx, 1); // second segment
+    app.cycle_row(true);
+    assert_eq!(app.row_idx, 2); // the one outgoing row
+    app.cycle_row(true);
+    assert_eq!(app.row_idx, 0, "should wrap back around to the first segment");
 }
 

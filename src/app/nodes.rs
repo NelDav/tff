@@ -79,6 +79,10 @@ impl App {
                 display: "trim (cut to a start/end range)".to_string(),
                 value: Some("trim".to_string()),
             },
+            PickerEntry {
+                display: "concat (join same-kind streams end to end)".to_string(),
+                value: Some("concat".to_string()),
+            },
         ];
         self.mode = Mode::Picker {
             kind: PickerKind::NewNode,
@@ -155,8 +159,7 @@ impl App {
                 ModifierKind::ChapterEdit { .. } => Some(StreamKind::Chapter),
                 _ => {
                     let resolved = self.graph.resolve(ep)?;
-                    let input = self.graph.input(resolved.from_node)?;
-                    input.streams.get(resolved.from_stream_idx).map(|s| s.kind)
+                    self.graph.resolved_stream_kind(&resolved)
                 }
             },
         }
@@ -266,6 +269,12 @@ impl App {
             }
             ModifierKind::ChapterEdit { .. } => {
                 self.open_chapter_table(mid);
+            }
+            ModifierKind::Concat => {
+                self.log.push(
+                    "nothing to configure -- arm a stream and 'c' to add/reorder segments"
+                        .to_string(),
+                );
             }
         }
     }

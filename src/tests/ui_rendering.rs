@@ -577,3 +577,95 @@ fn ui_log_pane_scrolls_horizontally_to_reveal_a_long_lines_tail() {
     assert!(scrolled_screen.contains("scrolled right"), "expected a scrolled-right hint:\n{scrolled_screen}");
 }
 
+/// A Concat modifier's box should list every connected segment as its own
+/// numbered row (in wire/join order), unlike every other modifier kind's
+/// single "← ..." incoming line.
+#[test]
+fn ui_renders_concat_segment_list_numbered_in_join_order() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.modifiers.iter_mut().find(|m| m.id == concat).unwrap().width = 40;
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(screen.contains("1. v:0 h264 <- [0] a.mp4"), "expected the first segment's numbered row:\n{screen}");
+    assert!(screen.contains("2. v:0 h264 <- [1] b.mp4"), "expected the second segment's numbered row:\n{screen}");
+}
+
+/// A Concat modifier with nothing wired in yet should show a placeholder
+/// row instead of an empty segment list.
+#[test]
+fn ui_renders_a_placeholder_row_for_an_empty_concat_node() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    app.graph.add_modifier(ModifierKind::Concat);
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(screen.contains("(no segments"), "expected a placeholder row for an unconnected concat node:\n{screen}");
+}
+
+/// Each of a Concat node's incoming wires should land on its own segment
+/// row, not stack on top of each other at a fixed row -- the same
+/// per-wire row math an output's mapped-stream wires already get.
+#[test]
+fn ui_concat_segment_wires_attach_at_distinct_rows() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+
+    let backend = TestBackend::new(140, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+
+    let root = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Min(10),
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(10),
+        ])
+        .split(ratatui::layout::Rect::new(0, 0, 140, 40));
+    let inner = ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL).inner(root[1]);
+
+    let wire_rows: Vec<u16> = (inner.y..inner.bottom())
+        .filter(|&y| (inner.x..inner.right()).any(|x| is_wire_glyph(buf[(x, y)].symbol().chars().next().unwrap_or(' '))))
+        .collect();
+    let distinct_rows: std::collections::BTreeSet<u16> = wire_rows.into_iter().collect();
+    assert!(distinct_rows.len() >= 2, "expected the two segment wires to land on distinct rows: {distinct_rows:?}");
+}
+

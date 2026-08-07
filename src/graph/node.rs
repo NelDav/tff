@@ -345,6 +345,14 @@ pub enum ModifierKind {
     /// convenience action in the picker (see `Graph::resolve_chapters`,
     /// which deliberately doesn't look upstream past a node of this kind).
     ChapterEdit { chapters: Vec<Chapter> },
+    /// Joins any number of same-kind (all-video or all-audio) input
+    /// streams, in wire order, into one output stream via ffmpeg's
+    /// `concat` filter. Unlike every other kind, its input slot accepts
+    /// any number of wires, appended rather than replaced (see
+    /// `Graph::connect`) -- there's nothing to configure beyond which
+    /// streams are wired in and in what order, so it carries no fields of
+    /// its own.
+    Concat,
 }
 
 impl ModifierKind {
@@ -357,6 +365,7 @@ impl ModifierKind {
             ModifierKind::Disposition { .. } => "disposition".to_string(),
             ModifierKind::Filter { name, .. } => name.label().to_string(),
             ModifierKind::ChapterEdit { .. } => "chapters".to_string(),
+            ModifierKind::Concat => "concat".to_string(),
         }
     }
 
@@ -367,12 +376,18 @@ impl ModifierKind {
     /// (`Filter`) or simply never doing anything useful with it
     /// (`ChapterEdit`, whose import logic just ignores a non-chapter
     /// source). `Convert`/`Metadata`/`Disposition` apply to any stream
-    /// kind, so they never reject a connection here.
+    /// kind, so they never reject a connection here. `Concat` only ever
+    /// joins video or audio (ffmpeg's `concat` filter also handles
+    /// subtitles, but that's out of scope for now); whether a given stream
+    /// also matches whatever kind its *other* already-connected segments
+    /// share is a separate check made where the segment list is visible
+    /// (`App::toggle_connect`), not here.
     pub fn accepts_stream_kind(&self, kind: StreamKind) -> bool {
         match self {
             ModifierKind::Convert(_) | ModifierKind::Metadata { .. } | ModifierKind::Disposition { .. } => true,
             ModifierKind::Filter { name, .. } => name.applies_to(kind),
             ModifierKind::ChapterEdit { .. } => kind == StreamKind::Chapter,
+            ModifierKind::Concat => matches!(kind, StreamKind::Video | StreamKind::Audio),
         }
     }
 }

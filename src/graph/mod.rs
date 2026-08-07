@@ -173,14 +173,20 @@ impl Graph {
     /// Connect (or, if it already exists, disconnect) `from` -> `to`. A
     /// modifier's input and an output's chapters slot each accept only one
     /// connection at a time, so wiring a new source into an already-fed one
-    /// replaces the old one; an output's regular mapped-stream slot accepts
-    /// any number, matching multi-output fan-in.
+    /// replaces the old one -- except a `ModifierKind::Concat` node's input,
+    /// which (like an output's regular mapped-stream slot) accepts any
+    /// number, appended in the order they're wired.
     pub fn connect(&mut self, from: Endpoint, to: Target) {
         if let Some(i) = self.wires.iter().position(|w| w.from == from && w.to == to) {
             self.wires.remove(i);
             return;
         }
-        if let Target::ModifierIn(_) | Target::OutputChapters(_) = to {
+        let replaces_existing = match to {
+            Target::ModifierIn(mid) => !matches!(self.modifier(mid).map(|m| &m.kind), Some(ModifierKind::Concat)),
+            Target::OutputChapters(_) => true,
+            Target::Output(_) => false,
+        };
+        if replaces_existing {
             self.wires.retain(|w| w.to != to);
         }
         self.wires.push(Wire { from, to });
@@ -202,29 +208,45 @@ impl Graph {
         self.wires.swap(a, b);
     }
 
-    /// Walk backward from `from` to its ultimate source stream, threading
+    /// Walk backward from `from` to its ultimate source(s), threading
     /// through however many modifiers sit in between and accumulating the
     /// codec/metadata each one sets (first one encountered walking
     /// backward -- i.e. closest to the output -- wins per field). Returns
     /// `None` if the chain is broken (a modifier with nothing feeding it),
-    /// forms a cycle (guarded by a bounded number of hops), or passes
-    /// through a `ChapterEdit` node -- that kind never produces a
+    /// forms a cycle (guarded by `resolve_hopped`'s shared hop budget), or
+    /// passes through a `ChapterEdit` node -- that kind never produces a
     /// resolvable media stream; see `resolve_chapters` for its own path.
+    ///
+    /// Hitting a `ModifierKind::Concat` node ends the linear walk: each of
+    /// its incoming wires is resolved independently as its own segment
+    /// (recursing back into this same walk), and all of them must resolve
+    /// to the same `StreamKind` -- a mix, or no segments at all, is a
+    /// broken chain like any other.
     pub fn resolve(&self, from: Endpoint) -> Option<Resolved> {
+        let mut hops = 0usize;
+        self.resolve_hopped(from, &mut hops)
+    }
+
+    /// `hops` is one counter shared across every branch of every `Concat`
+    /// node's segments (not reset per branch/recursive call), so a cycle
+    /// threaded through more than one segment still can't recurse forever.
+    /// The cap is far above anything a real graph would ever need to walk
+    /// -- it exists purely to guarantee termination on a cyclic one.
+    fn resolve_hopped(&self, from: Endpoint, hops: &mut usize) -> Option<Resolved> {
+        const MAX_HOPS: usize = 10_000;
         let mut codec = Codec::Copy;
         let mut metadata = BTreeMap::new();
         let mut disposition: Option<BTreeSet<String>> = None;
         let mut filters: Vec<(FilterName, BTreeMap<String, String>)> = Vec::new();
         let mut current = from;
-        let mut hops = 0usize;
         loop {
-            hops += 1;
-            if hops > self.modifiers.len() + 1 {
+            *hops += 1;
+            if *hops > MAX_HOPS {
                 return None; // cycle guard
             }
             match current {
                 Endpoint::Stream { node, stream_idx } => {
-                    return Some(Resolved {
+                    return Some(Resolved::Stream {
                         from_node: node,
                         from_stream_idx: stream_idx,
                         codec,
@@ -255,10 +277,61 @@ impl Graph {
                             filters.insert(0, (*name, fields.clone()));
                         }
                         ModifierKind::ChapterEdit { .. } => return None,
+                        ModifierKind::Concat => {
+                            let segment_wires = self.incoming(Target::ModifierIn(mid));
+                            if segment_wires.is_empty() {
+                                return None;
+                            }
+                            let segments: Vec<Resolved> = segment_wires
+                                .into_iter()
+                                .map(|wi| self.resolve_hopped(self.wires[wi].from, hops))
+                                .collect::<Option<_>>()?;
+                            let mut kinds = segments.iter().map(|s| self.resolved_stream_kind(s));
+                            let kind = kinds.next().flatten()?;
+                            if !kinds.all(|k| k == Some(kind)) {
+                                return None;
+                            }
+                            return Some(Resolved::Concat { kind, segments, codec, metadata, disposition, filters });
+                        }
                     }
                     let incoming = self.wires.iter().find(|w| w.to == Target::ModifierIn(mid))?;
                     current = incoming.from;
                 }
+            }
+        }
+    }
+
+    /// The stream kind a resolved chain ultimately carries -- looked up
+    /// from the real input stream for `Resolved::Stream`, or the shared
+    /// kind recorded when a `Concat` node's segments were validated to
+    /// match (see `resolve`) for `Resolved::Concat`.
+    pub fn resolved_stream_kind(&self, r: &Resolved) -> Option<StreamKind> {
+        match r {
+            Resolved::Stream { from_node, from_stream_idx, .. } => {
+                self.input(*from_node)?.streams.get(*from_stream_idx).map(|s| s.kind)
+            }
+            Resolved::Concat { kind, .. } => Some(*kind),
+        }
+    }
+
+    /// A resolved chain's own descriptive label, and -- for a real stream
+    /// -- the "[file_index] path" it came from (`None` for a `Concat`,
+    /// which has no single source file). Split apart rather than returned
+    /// as one combined string so a caller can splice a codec/metadata tag
+    /// in between the two, the way the output-node display does.
+    pub fn resolved_label_and_source(&self, r: &Resolved) -> (String, Option<String>) {
+        match r {
+            Resolved::Stream { from_node, from_stream_idx, .. } => {
+                match self.input(*from_node).and_then(|n| n.streams.get(*from_stream_idx).map(|s| (n, s))) {
+                    Some((n, s)) => (
+                        s.label(),
+                        Some(format!("[{}] {}", n.file_index, n.path.rsplit('/').next().unwrap_or(&n.path))),
+                    ),
+                    None => ("(dangling)".to_string(), None),
+                }
+            }
+            Resolved::Concat { kind, segments, .. } => {
+                (format!("concat[{}] of {} segments", kind.noun(), segments.len()), None)
             }
         }
     }
@@ -300,6 +373,69 @@ impl Graph {
         }
     }
 
+    /// Resolves `r` down to a single filtergraph-referenceable label --
+    /// `[file:stream]` for a plain demuxed stream (valid filter_complex
+    /// input syntax with no entry of its own needed), `[fN]` for one that
+    /// needed its own filter_complex entry (a filtered stream, or any
+    /// `Concat`, which always routes through the filtergraph) -- the stream
+    /// kind it carries, and whether it actually needed a filter_complex
+    /// entry at all (a plain demuxed stream whose filters are all
+    /// unconfigured no-ops doesn't; a caller building a top-level `-map`
+    /// needs to know this, since `-map [file:stream]` -- unlike
+    /// `-map file:stream` -- is invalid: `[...]` only means anything to
+    /// `-map` when it's a label some filter_complex entry actually
+    /// declared). Pushes whatever filter_complex entries are needed along
+    /// the way. A `Concat`'s segments are each resolved the same way first,
+    /// then joined by one more `concat=n=N:v=X:a=Y` entry (`v`/`a` always
+    /// `1`/`0` or `0`/`1` for now -- v1 only joins segments that already
+    /// share a single kind, see `resolve`), after which any of the
+    /// `Concat` node's *own* filters (applied by a modifier downstream of
+    /// it) are chained on exactly like a plain stream's -- a `Concat` is
+    /// always reported as needing a filter_complex entry, since ffmpeg's
+    /// `concat` filter has no other way to run. Labels are always unique
+    /// (`build_output_section`'s doc comment explains why).
+    fn resolve_source(&self, r: &Resolved, filter_complex: &mut Vec<String>) -> Option<(String, StreamKind, bool)> {
+        match r {
+            Resolved::Stream { from_node, from_stream_idx, filters, .. } => {
+                let input = self.input(*from_node)?;
+                let stream = input.streams.get(*from_stream_idx)?;
+                let source = format!("{}:{}", input.file_index, stream.index);
+                let expr_parts: Vec<String> =
+                    filters.iter().filter_map(|(name, fields)| name.expression(stream.kind, fields)).collect();
+                if expr_parts.is_empty() {
+                    Some((format!("[{source}]"), stream.kind, false))
+                } else {
+                    let label = format!("f{}", filter_complex.len());
+                    filter_complex.push(format!("[{source}]{}[{label}]", expr_parts.join(",")));
+                    Some((format!("[{label}]"), stream.kind, true))
+                }
+            }
+            Resolved::Concat { kind, segments, filters, .. } => {
+                let (v, a) = match kind {
+                    StreamKind::Video => (1, 0),
+                    StreamKind::Audio => (0, 1),
+                    StreamKind::Subtitle | StreamKind::Chapter | StreamKind::Other => return None,
+                };
+                let mut refs = String::new();
+                for seg in segments {
+                    let (label, ..) = self.resolve_source(seg, filter_complex)?;
+                    refs.push_str(&label);
+                }
+                let concat_label = format!("f{}", filter_complex.len());
+                filter_complex.push(format!("{refs}concat=n={}:v={v}:a={a}[{concat_label}]", segments.len()));
+                let expr_parts: Vec<String> =
+                    filters.iter().filter_map(|(name, fields)| name.expression(*kind, fields)).collect();
+                if expr_parts.is_empty() {
+                    Some((format!("[{concat_label}]"), *kind, true))
+                } else {
+                    let label = format!("f{}", filter_complex.len());
+                    filter_complex.push(format!("[{concat_label}]{}[{label}]", expr_parts.join(",")));
+                    Some((format!("[{label}]"), *kind, true))
+                }
+            }
+        }
+    }
+
     /// Builds the `-map`/`-c`/`-metadata`/`-f`/path argument block for a
     /// single output node, or `None` if it has nothing resolvable to map
     /// (see `build_ffmpeg_args`). `path_override` writes somewhere other
@@ -338,32 +474,28 @@ impl Graph {
         // filtergraph -- affects the default codec below, since a filtered
         // stream can't use stream copy (verified against real ffmpeg:
         // "Filtering and streamcopy cannot be used together", a hard error,
-        // not a warning).
+        // not a warning). A `Resolved::Concat` is always routed through the
+        // filtergraph (ffmpeg's `concat` filter has no stream-copy mode),
+        // so it always takes the `resolve_source` path below, same as a
+        // `Resolved::Stream` with a non-empty filter chain.
         let mut was_filtered = Vec::with_capacity(resolved.len());
         for r in &resolved {
-            let Some(input) = self.input(r.from_node) else {
+            let Some((label, _kind, filtered)) = self.resolve_source(r, filter_complex) else {
                 was_filtered.push(false);
                 continue;
             };
-            let Some(stream) = input.streams.get(r.from_stream_idx) else {
-                was_filtered.push(false);
-                continue;
-            };
-            let source = format!("{}:{}", input.file_index, stream.index);
-
-            let expr_parts: Vec<String> =
-                r.filters.iter().filter_map(|(name, fields)| name.expression(stream.kind, fields)).collect();
-
             args.push("-map".to_string());
-            if expr_parts.is_empty() {
-                args.push(source);
-                was_filtered.push(false);
+            args.push(if filtered {
+                label
             } else {
-                let label = format!("f{}", filter_complex.len());
-                filter_complex.push(format!("[{source}]{}[{label}]", expr_parts.join(",")));
-                args.push(format!("[{label}]"));
-                was_filtered.push(true);
-            }
+                // A trivial passthrough's label is always `[file:stream]`
+                // (see `resolve_source`'s doc comment) -- strip the
+                // brackets back off, since `-map` only accepts that syntax
+                // for a label some filter_complex entry actually declared,
+                // and this one has none.
+                label[1..label.len() - 1].to_string()
+            });
+            was_filtered.push(filtered);
         }
         // Stream specifiers like -c:0/-metadata:s:0 are scoped to the
         // *current* output section, so the index here is local to this
@@ -379,7 +511,7 @@ impl Graph {
         // fine there). The bare numeric form is the one that means
         // "absolute output stream index" for both -c and -disposition.
         for (local_i, (r, &filtered)) in resolved.iter().zip(&was_filtered).enumerate() {
-            match r.codec.ffmpeg_name() {
+            match r.codec().ffmpeg_name() {
                 Some(name) => {
                     args.push(format!("-c:{local_i}"));
                     args.push(name.to_string());
@@ -396,11 +528,11 @@ impl Graph {
                 }
                 None => {}
             }
-            for (key, value) in &r.metadata {
+            for (key, value) in r.metadata() {
                 args.push(format!("-metadata:s:{local_i}"));
                 args.push(format!("{key}={value}"));
             }
-            if let Some(flags) = &r.disposition {
+            if let Some(flags) = r.disposition() {
                 args.push(format!("-disposition:{local_i}"));
                 args.push(if flags.is_empty() {
                     "0".to_string()

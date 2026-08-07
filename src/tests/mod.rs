@@ -15,7 +15,9 @@ use std::sync::mpsc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ffmpeg;
-use crate::graph::{Chapter, Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, StreamInfo, StreamKind, Target};
+use crate::graph::{
+    Chapter, Codec, Endpoint, FilterName, Graph, ModifierKind, NodeId, Resolved, StreamInfo, StreamKind, Target,
+};
 
 /// A no-modifiers key press -- what `App::text_input_handle_key` expects,
 /// same as a real terminal reports for a plain keystroke. Drives the

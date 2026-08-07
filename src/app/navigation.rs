@@ -1,5 +1,5 @@
 use super::{App, Focus};
-use crate::graph::{Endpoint, Target};
+use crate::graph::{Endpoint, ModifierKind, Target};
 
 /// The log pane's visible line count -- its fixed height minus its own
 /// border rows. Shared by `App::scroll_log`/`visible_log_range` and
@@ -21,16 +21,28 @@ impl App {
     }
 
     /// Up/Down while a node is focused: cycles the selected stream (input),
-    /// selected outgoing connection (modifier), or selected incoming
-    /// connection (output) -- an output's row list includes one more row
-    /// than its mapped-stream count when its chapters slot is connected
-    /// (see `disconnect_focused`'s Output branch), same as an unconnected
-    /// chapters slot doesn't get a row at all in the UI.
+    /// selected segment-then-outgoing-connection row (modifier -- see
+    /// below), or selected incoming connection (output) -- an output's row
+    /// list includes one more row than its mapped-stream count when its
+    /// chapters slot is connected (see `disconnect_focused`'s Output
+    /// branch), same as an unconnected chapters slot doesn't get a row at
+    /// all in the UI.
+    ///
+    /// A `ModifierKind::Concat` node's row list is its segments (incoming
+    /// wires, one per row) followed by its outgoing wires -- same
+    /// combining scheme as an output's mapped-streams-then-chapters list;
+    /// every other modifier kind has no segments section, so its row list
+    /// is just its outgoing wires, as before `Concat` existed.
     pub fn cycle_row(&mut self, forward: bool) {
         let len = match self.focus {
             Focus::Input(i) => self.graph.inputs.get(i).map_or(0, |n| n.streams.len()),
             Focus::Modifier(i) => self.graph.modifiers.get(i).map_or(0, |m| {
-                self.graph.outgoing(Endpoint::ModifierOut(m.id)).len()
+                let outgoing = self.graph.outgoing(Endpoint::ModifierOut(m.id)).len();
+                if matches!(m.kind, ModifierKind::Concat) {
+                    self.graph.incoming(Target::ModifierIn(m.id)).len() + outgoing
+                } else {
+                    outgoing
+                }
             }),
             Focus::Output(i) => self.graph.outputs.get(i).map_or(0, |o| {
                 let mapped = self.graph.incoming(Target::Output(o.id)).len();

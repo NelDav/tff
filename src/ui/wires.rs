@@ -13,7 +13,7 @@ pub(super) fn wire_color(graph: &Graph, from: Endpoint) -> Color {
     }
     graph
         .resolve(from)
-        .and_then(|r| graph.input(r.from_node).and_then(|inp| inp.streams.get(r.from_stream_idx)).map(|s| s.kind))
+        .and_then(|r| graph.resolved_stream_kind(&r))
         .map(kind_color)
         .unwrap_or(Color::DarkGray)
 }
@@ -41,7 +41,9 @@ pub(super) fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
             }
             Endpoint::ModifierOut(mid) => {
                 let row = app.graph.outgoing(wire.from).iter().position(|&wi| wi == wire_idx).unwrap_or(0);
-                let offset = app.graph.modifier(mid).map(|m| modifier_outgoing_start_row(&m.kind)).unwrap_or(2);
+                let segment_count = app.graph.incoming(Target::ModifierIn(mid)).len();
+                let offset =
+                    app.graph.modifier(mid).map(|m| modifier_outgoing_start_row(&m.kind, segment_count)).unwrap_or(2);
                 (offset, row) // outgoing rows sit below the field/incoming sections
             }
         };
@@ -56,7 +58,13 @@ pub(super) fn draw_edges(frame: &mut Frame, app: &App, area: Rect) {
         let (dst_row_offset, dst_row) = match wire.to {
             Target::ModifierIn(mid) => {
                 let offset = app.graph.modifier(mid).map(|m| modifier_incoming_row(&m.kind)).unwrap_or(1);
-                (offset, 0u16) // a modifier only ever has one incoming row
+                // Every modifier kind except Concat only ever has one
+                // incoming wire, always landing on the section's first row;
+                // Concat can have any number of segments, so the row is
+                // that wire's position among them, same as an output's
+                // mapped-stream rows below.
+                let row = app.graph.incoming(wire.to).iter().position(|&wi| wi == wire_idx).unwrap_or(0);
+                (offset, row as u16)
             }
             Target::Output(id) => {
                 let row = app.graph.incoming(wire.to).iter().position(|&wi| wi == wire_idx).unwrap_or(0);

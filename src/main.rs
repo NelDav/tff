@@ -165,8 +165,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             // Ctrl+Up/Down reorders the hovered output row; Shift+Up/Down
             // extends a port-selection range; both checked ahead of the
             // plain Up/Down arms below since match picks the first hit.
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_output_row(false),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_output_row(true),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_focused_row(false),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_focused_row(true),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => app.extend_port_selection(false),
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => app.extend_port_selection(true),
             KeyCode::Up => app.cycle_row(false),

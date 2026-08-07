@@ -13,10 +13,13 @@ fn direct_wire_resolves_to_stream_copy() {
     graph.connect(src, Target::Output(out));
 
     let resolved = graph.resolve(src).expect("direct wire should resolve");
-    assert_eq!(resolved.from_node, id);
-    assert_eq!(resolved.from_stream_idx, 0);
-    assert_eq!(resolved.codec, Codec::Copy);
-    assert!(resolved.metadata.is_empty());
+    let Resolved::Stream { from_node, from_stream_idx, .. } = &resolved else {
+        panic!("expected a plain Stream resolution, not a Concat");
+    };
+    assert_eq!(*from_node, id);
+    assert_eq!(*from_stream_idx, 0);
+    assert_eq!(*resolved.codec(), Codec::Copy);
+    assert!(resolved.metadata().is_empty());
 
     let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
@@ -37,7 +40,7 @@ fn convert_modifier_sets_codec_override() {
     graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
 
     let resolved = graph.resolve(Endpoint::ModifierOut(modifier)).unwrap();
-    assert_eq!(resolved.codec, Codec::Encode("libx265".to_string()));
+    assert_eq!(*resolved.codec(), Codec::Encode("libx265".to_string()));
 
     let args = graph.build_ffmpeg_args(&BTreeMap::new());
     let joined = args.join(" ");
@@ -272,8 +275,8 @@ fn chain_of_convert_then_metadata_combines_both_effects() {
     graph.connect(Endpoint::ModifierOut(metadata), Target::Output(out));
 
     let resolved = graph.resolve(Endpoint::ModifierOut(metadata)).unwrap();
-    assert_eq!(resolved.codec, Codec::Encode("libx265".to_string()));
-    assert_eq!(resolved.metadata.get("language").map(String::as_str), Some("jpn"));
+    assert_eq!(*resolved.codec(), Codec::Encode("libx265".to_string()));
+    assert_eq!(resolved.metadata().get("language").map(String::as_str), Some("jpn"));
 }
 
 /// When two modifiers of the same kind sit in a chain, the one closer to
@@ -293,7 +296,7 @@ fn closest_to_output_modifier_wins_on_conflicting_fields() {
     graph.connect(Endpoint::ModifierOut(second), Target::Output(out));
 
     let resolved = graph.resolve(Endpoint::ModifierOut(second)).unwrap();
-    assert_eq!(resolved.codec, Codec::Encode("libx265".to_string()), "the modifier closer to the output should win");
+    assert_eq!(*resolved.codec(), Codec::Encode("libx265".to_string()), "the modifier closer to the output should win");
 }
 
 /// A modifier with nothing feeding its input is a broken chain -- resolving
@@ -440,5 +443,126 @@ fn input_extra_arg_keys_only_include_teletext_options_when_supported() {
     assert!(with.iter().any(|&(k, _, _)| k == "txt_format"), "{with:?}");
     assert!(with.iter().any(|&(k, _, _)| k == "txt_page"), "{with:?}");
     assert!(with.iter().any(|&(k, _, _)| k == "txt_duration"), "{with:?}");
+}
+
+/// Unlike every other modifier kind, a Concat node's input accepts any
+/// number of wires, appended (not replaced) in the order they're
+/// connected -- `Graph::connect`'s doc comment explains why.
+#[test]
+fn connect_appends_to_a_concat_nodes_input_instead_of_replacing() {
+    let mut graph = Graph::new();
+    let a = graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = graph.add_modifier(ModifierKind::Concat);
+
+    graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+
+    let incoming = graph.incoming(Target::ModifierIn(concat));
+    assert_eq!(incoming.len(), 2, "both wires should still be there, not just the second");
+    assert_eq!(graph.wires[incoming[0]].from, Endpoint::Stream { node: a, stream_idx: 0 });
+    assert_eq!(graph.wires[incoming[1]].from, Endpoint::Stream { node: b, stream_idx: 0 });
+}
+
+/// Two video segments joined by a Concat node should resolve to a
+/// `Resolved::Concat`, and the built ffmpeg args should route both
+/// through a single `concat=n=2:v=1:a=0` filter_complex entry, `-map`ped
+/// by its output label -- with no `-c:0 copy` default, since a concat
+/// (like any filtered stream) can't be stream-copied.
+#[test]
+fn concat_modifier_joins_two_video_segments_end_to_end_args() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let a = graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = graph.add_modifier(ModifierKind::Concat);
+    graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::ModifierOut(concat), Target::Output(out));
+
+    let resolved = graph.resolve(Endpoint::ModifierOut(concat)).expect("concat should resolve");
+    let Resolved::Concat { kind, segments, .. } = &resolved else {
+        panic!("expected a Concat resolution");
+    };
+    assert_eq!(*kind, StreamKind::Video);
+    assert_eq!(segments.len(), 2);
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(joined.contains("-filter_complex"), "{joined}");
+    assert!(joined.contains("[0:0][1:0]concat=n=2:v=1:a=0[f0]"), "{joined}");
+    assert!(joined.contains("-map [f0]"), "{joined}");
+    assert!(!joined.contains("-c:0 copy"), "a concat output must not default to copy: {joined}");
+}
+
+/// A Concat node with segments of mismatched kinds (video mixed with
+/// audio) can't be expressed as a single `concat` filter call in v1 scope
+/// -- `resolve` should treat it as a broken chain, same as any other
+/// unsatisfiable connection.
+#[test]
+fn concat_modifier_with_mismatched_segment_kinds_fails_to_resolve() {
+    let mut graph = Graph::new();
+    let id = graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let concat = graph.add_modifier(ModifierKind::Concat);
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(concat)); // video
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::ModifierIn(concat)); // audio
+
+    assert!(graph.resolve(Endpoint::ModifierOut(concat)).is_none());
+}
+
+/// A Concat node with nothing wired into it yet is a broken chain, not an
+/// empty/no-op pass-through (there's no such thing as a `concat` filter
+/// with zero inputs).
+#[test]
+fn concat_modifier_with_no_segments_fails_to_resolve() {
+    let mut graph = Graph::new();
+    let concat = graph.add_modifier(ModifierKind::Concat);
+    assert!(graph.resolve(Endpoint::ModifierOut(concat)).is_none());
+}
+
+/// Reordering a Concat node's segment wires (see `App::move_focused_row`)
+/// should change the join order ffmpeg's `concat` filter actually uses.
+#[test]
+fn reordering_concat_segments_changes_the_filter_complex_join_order() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let a = graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = graph.add_modifier(ModifierKind::Concat);
+    graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::ModifierOut(concat), Target::Output(out));
+
+    let incoming = graph.incoming(Target::ModifierIn(concat));
+    graph.swap_wires(incoming[0], incoming[1]);
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(joined.contains("[1:0][0:0]concat=n=2:v=1:a=0[f0]"), "{joined}");
+}
+
+/// A modifier fed by a Concat node's output (e.g. tagging the joined
+/// result with metadata) should see `Resolved::Concat` accumulate the
+/// same downstream settings a plain `Resolved::Stream` chain would.
+#[test]
+fn modifier_downstream_of_concat_still_applies_its_own_settings() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let a = graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = graph.add_modifier(ModifierKind::Concat);
+    graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+
+    let convert = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
+    graph.connect(Endpoint::ModifierOut(concat), Target::ModifierIn(convert));
+    graph.connect(Endpoint::ModifierOut(convert), Target::Output(out));
+
+    let resolved = graph.resolve(Endpoint::ModifierOut(convert)).expect("chain should resolve");
+    assert_eq!(*resolved.codec(), Codec::Encode("libx265".to_string()));
+    let Resolved::Concat { segments, .. } = &resolved else {
+        panic!("expected the chain to still trace back to a Concat resolution");
+    };
+    assert_eq!(segments.len(), 2);
 }
 

@@ -201,7 +201,8 @@ impl App {
                         ModifierKind::Convert(_)
                         | ModifierKind::Disposition { .. }
                         | ModifierKind::Filter { .. }
-                        | ModifierKind::ChapterEdit { .. } => None,
+                        | ModifierKind::ChapterEdit { .. }
+                        | ModifierKind::Concat => None,
                     })
                     .unwrap_or_default();
                 self.mode = text_input_mode(TextTarget::ModifierMetadataValue { modifier, key }, current, Vec::new());

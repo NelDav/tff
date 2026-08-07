@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::node::FilterName;
-use super::stream::Codec;
+use super::stream::{Codec, StreamKind};
 use super::NodeId;
 
 /// The source side of a connection: either a specific stream on an input
@@ -14,10 +14,11 @@ pub enum Endpoint {
     ModifierOut(NodeId),
 }
 
-/// The destination side of a connection: a modifier's single input slot,
-/// an output file's mapped-stream list (any number of incoming wires), or
-/// an output's chapters slot (like `ModifierIn`, only one wire at a time --
-/// see `Graph::connect`).
+/// The destination side of a connection: a modifier's input slot (a single
+/// wire at a time for every kind except `ModifierKind::Concat`, which
+/// accepts any number, appended in wire order -- see `Graph::connect`), an
+/// output file's mapped-stream list (also any number), or an output's
+/// chapters slot (single wire, like an ordinary modifier's input).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     ModifierIn(NodeId),
@@ -36,23 +37,62 @@ pub struct Wire {
 }
 
 /// The result of walking a chain of wires/modifiers back to its ultimate
-/// source stream: which stream it started from, and the effective codec,
-/// metadata, disposition, and filter chain accumulated from every modifier
-/// along the way. Metadata fields merge across the whole chain (they're
-/// independent named slots), and filters accumulate as an ordered list
-/// (each is a distinct pipeline stage, so e.g. two Scale nodes both apply,
-/// in chain order) -- but codec and disposition are each an all-or-nothing
-/// setting for the stream, so whichever modifier sets one first walking
-/// backward -- i.e. closest to the output -- wins outright, matching how a
-/// real pipeline's last stage wins.
-pub struct Resolved {
-    pub from_node: NodeId,
-    pub from_stream_idx: usize,
-    pub codec: Codec,
-    pub metadata: BTreeMap<String, String>,
-    pub disposition: Option<BTreeSet<String>>,
-    /// In source-to-output order (the order the filters should actually be
-    /// applied), even though this is built up walking backward from the
-    /// output.
-    pub filters: Vec<(FilterName, BTreeMap<String, String>)>,
+/// source(s): either a single real stream (`Stream`), or -- once the chain
+/// passes through a `ModifierKind::Concat` node -- the join of however many
+/// segments feed it (`Concat`), each itself a fully-resolved chain. Either
+/// way, `codec`/`metadata`/`disposition`/`filters` are whatever accumulated
+/// *downstream* of that source (same accumulation rule as before: metadata
+/// merges, filters accumulate in order, codec/disposition are first-wins
+/// walking backward from the output) -- a `Concat` node's own segments are
+/// each resolved independently and never see settings applied after the
+/// concat.
+pub enum Resolved {
+    Stream {
+        from_node: NodeId,
+        from_stream_idx: usize,
+        codec: Codec,
+        metadata: BTreeMap<String, String>,
+        disposition: Option<BTreeSet<String>>,
+        /// In source-to-output order (the order the filters should actually
+        /// be applied), even though this is built up walking backward from
+        /// the output.
+        filters: Vec<(FilterName, BTreeMap<String, String>)>,
+    },
+    Concat {
+        /// The stream kind shared by every segment -- validated when the
+        /// chain was resolved (see `Graph::resolve`), so this is always
+        /// consistent with each segment's own resolved kind.
+        kind: StreamKind,
+        /// In concat order (the order ffmpeg's `concat` filter joins them),
+        /// which is also playback order in the joined result.
+        segments: Vec<Resolved>,
+        codec: Codec,
+        metadata: BTreeMap<String, String>,
+        disposition: Option<BTreeSet<String>>,
+        filters: Vec<(FilterName, BTreeMap<String, String>)>,
+    },
+}
+
+impl Resolved {
+    /// Accessors for the fields both variants carry (whatever was applied
+    /// downstream of this resolved source) -- lets a caller that doesn't
+    /// care which variant it has (e.g. building `-c`/`-metadata`/
+    /// `-disposition` args, which are the same regardless) avoid matching.
+    pub fn codec(&self) -> &Codec {
+        match self {
+            Resolved::Stream { codec, .. } | Resolved::Concat { codec, .. } => codec,
+        }
+    }
+
+    pub fn metadata(&self) -> &BTreeMap<String, String> {
+        match self {
+            Resolved::Stream { metadata, .. } | Resolved::Concat { metadata, .. } => metadata,
+        }
+    }
+
+    pub fn disposition(&self) -> &Option<BTreeSet<String>> {
+        match self {
+            Resolved::Stream { disposition, .. } | Resolved::Concat { disposition, .. } => disposition,
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use super::chapters::{chapter_edit_modifiers_fed_by, sync_chapter_edit_import};
 use super::{App, Focus};
-use crate::graph::{Endpoint, StreamKind, Target};
+use crate::graph::{Endpoint, ModifierKind, NodeId, StreamKind, Target};
 
 impl App {
     /// 'c': on an input, arm the whole pending selection at once if
@@ -64,6 +64,8 @@ impl App {
                     );
                 } else if self.armed.len() == 1 && self.armed.contains(&this_output) {
                     self.armed.remove(&this_output); // disarm
+                } else if matches!(m.kind, ModifierKind::Concat) {
+                    self.connect_concat_segments(mid);
                 } else if self.armed.len() > 1 {
                     self.log.push(format!(
                         "can't connect {} streams to a modifier -- it only accepts one",
@@ -175,7 +177,38 @@ impl App {
                 let Some(m) = self.graph.modifiers.get(i) else {
                     return;
                 };
-                let ep = Endpoint::ModifierOut(m.id);
+                let mid = m.id;
+                // A Concat node's row list is segments (its incoming wires,
+                // one per row) followed by its outgoing wires -- same
+                // combining scheme as an output's mapped-streams-then-
+                // chapters list (see `cycle_row`'s Output arm) -- so
+                // `row_idx` needs splitting between the two regions; every
+                // other modifier kind has no segments section at all, and
+                // `row_idx` indexes its outgoing wires directly, as before.
+                if matches!(m.kind, ModifierKind::Concat) {
+                    let segments = self.graph.incoming(Target::ModifierIn(mid));
+                    if self.row_idx < segments.len() {
+                        self.graph.remove_wire_at(segments[self.row_idx]);
+                        self.log.push("segment removed from concat".to_string());
+                        let new_len = self.graph.incoming(Target::ModifierIn(mid)).len();
+                        if new_len > 0 && self.row_idx >= new_len {
+                            self.row_idx = new_len - 1;
+                        }
+                        return;
+                    }
+                    let outgoing = self.graph.outgoing(Endpoint::ModifierOut(mid));
+                    let Some(&wi) = outgoing.get(self.row_idx - segments.len()) else {
+                        return;
+                    };
+                    self.graph.remove_wire_at(wi);
+                    self.log.push("disconnected".to_string());
+                    let new_total = segments.len() + self.graph.outgoing(Endpoint::ModifierOut(mid)).len();
+                    if new_total > 0 && self.row_idx >= new_total {
+                        self.row_idx = new_total - 1;
+                    }
+                    return;
+                }
+                let ep = Endpoint::ModifierOut(mid);
                 let outgoing = self.graph.outgoing(ep);
                 let Some(&wi) = outgoing.get(self.row_idx) else {
                     return;
@@ -213,17 +246,34 @@ impl App {
         }
     }
 
-    /// Ctrl+Up/Down while an output node is focused: moves the hovered
-    /// mapped-stream row past its neighbor, which reorders the streams in
-    /// the muxed container (see `Graph::swap_wires`). A no-op on the
-    /// chapters row (there's only ever one, nothing to reorder it against)
-    /// or at either edge of the list.
-    pub fn move_output_row(&mut self, forward: bool) {
-        let Focus::Output(i) = self.focus else { return };
-        let Some(output_id) = self.graph.outputs.get(i).map(|o| o.id) else {
-            return;
+    /// Ctrl+Up/Down: moves the hovered row past its neighbor, reordering
+    /// the underlying wires (see `Graph::swap_wires`) -- an output's
+    /// mapped-stream row (reordering the streams in the muxed container),
+    /// or a Concat modifier's segment row (reordering the join order in
+    /// the `concat` filter). A no-op anywhere else: an output's chapters
+    /// row (only ever one, nothing to reorder it against), a Concat's own
+    /// outgoing rows (reordering where its result feeds doesn't mean
+    /// anything), any other modifier kind (single input, nothing to
+    /// reorder), or either edge of whichever list applies.
+    pub fn move_focused_row(&mut self, forward: bool) {
+        let incoming = match self.focus {
+            Focus::Output(i) => {
+                let Some(output_id) = self.graph.outputs.get(i).map(|o| o.id) else {
+                    return;
+                };
+                self.graph.incoming(Target::Output(output_id))
+            }
+            Focus::Modifier(i) => {
+                let Some(m) = self.graph.modifiers.get(i) else {
+                    return;
+                };
+                if !matches!(m.kind, ModifierKind::Concat) {
+                    return;
+                }
+                self.graph.incoming(Target::ModifierIn(m.id))
+            }
+            Focus::Input(_) => return,
         };
-        let incoming = self.graph.incoming(Target::Output(output_id));
         if self.row_idx >= incoming.len() {
             return;
         }
@@ -236,5 +286,55 @@ impl App {
         }
         self.graph.swap_wires(incoming[self.row_idx], incoming[new_row]);
         self.row_idx = new_row;
+    }
+
+    /// 'c' on a Concat modifier with one or more armed sources: appends
+    /// every one of them as a new segment, in `App::armed`'s (stable,
+    /// sorted) iteration order -- rejecting a source outright if it isn't
+    /// video/audio, or if it doesn't match the kind every other segment
+    /// (already connected, or already accepted earlier in this same batch)
+    /// shares, so a Concat node never ends up joining a mix ffmpeg's
+    /// `concat` filter couldn't actually handle (see `resolve`, which
+    /// validates the same invariant when reading the graph back).
+    fn connect_concat_segments(&mut self, mid: NodeId) {
+        let mut expected_kind = self
+            .graph
+            .incoming(Target::ModifierIn(mid))
+            .into_iter()
+            .find_map(|wi| self.endpoint_stream_kind(self.graph.wires[wi].from));
+        let sources: Vec<Endpoint> = std::mem::take(&mut self.armed).into_iter().collect();
+        let n = sources.len();
+        let mut connected = 0usize;
+        for source in sources {
+            match self.endpoint_stream_kind(source) {
+                // Not yet resolvable (e.g. an armed modifier output with
+                // nothing wired into it yet) -- accept optimistically,
+                // same as the single-input connect path does.
+                None => {
+                    self.graph.connect(source, Target::ModifierIn(mid));
+                    connected += 1;
+                }
+                Some(kind) if !ModifierKind::Concat.accepts_stream_kind(kind) => {
+                    self.log.push(format!("concat doesn't accept a {} stream", kind.noun()));
+                }
+                Some(kind) if expected_kind.is_some_and(|e| e != kind) => {
+                    self.log.push(format!(
+                        "concat already has a {} segment -- can't mix in a {} one",
+                        expected_kind.expect("checked Some above").noun(),
+                        kind.noun()
+                    ));
+                }
+                Some(kind) => {
+                    expected_kind = Some(kind);
+                    self.graph.connect(source, Target::ModifierIn(mid));
+                    connected += 1;
+                }
+            }
+        }
+        self.log.push(if connected == n {
+            format!("added {connected} segment(s) to concat")
+        } else {
+            format!("added {connected}/{n} segment(s) to concat (rest rejected, see above)")
+        });
     }
 }

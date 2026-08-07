@@ -475,6 +475,7 @@ impl App {
                     Some("fade") => (filter_modifier(FilterName::Fade), "fade"),
                     Some("rotate") => (filter_modifier(FilterName::Rotate), "rotate"),
                     Some("trim") => (filter_modifier(FilterName::Trim), "trim"),
+                    Some("concat") => (ModifierKind::Concat, "concat"),
                     _ => (ModifierKind::Convert(Codec::Copy), "convert"),
                 };
                 self.graph.add_modifier(kind);
@@ -491,7 +492,8 @@ impl App {
                             ModifierKind::Convert(_)
                             | ModifierKind::Disposition { .. }
                             | ModifierKind::Filter { .. }
-                            | ModifierKind::ChapterEdit { .. } => None,
+                            | ModifierKind::ChapterEdit { .. }
+                            | ModifierKind::Concat => None,
                         })
                         .unwrap_or_default();
                     self.mode = text_input_mode(TextTarget::ModifierMetadataValue { modifier, key }, current, Vec::new());
