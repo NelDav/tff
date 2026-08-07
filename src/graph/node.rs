@@ -60,8 +60,21 @@ pub struct OutputNode {
 /// alone would be cryptic (see `output_extra_arg_keys`'s `ss`/`to`); most
 /// entries just repeat the key since the raw name is already clear enough.
 /// A "custom key..." escape hatch in the picker covers anything else.
-pub fn input_extra_arg_keys() -> &'static [(&'static str, bool, &'static str)] {
-    &[("itsoffset", false, "itsoffset"), ("stream_loop", false, "stream_loop"), ("re", true, "re")]
+///
+/// `txt_format`/`txt_page`/`txt_duration` (the `libzvbi_teletextdec`
+/// decoder's own options, needed to turn a `dvb_teletext` stream into
+/// usable text subtitles) are only included when `has_teletext_decoder` is
+/// true: most distro ffmpeg builds don't have libzvbi compiled in at all,
+/// and offering options ffmpeg would just reject outright as unrecognized
+/// would be actively misleading rather than merely unhelpful.
+pub fn input_extra_arg_keys(has_teletext_decoder: bool) -> Vec<(&'static str, bool, &'static str)> {
+    let mut keys = vec![("itsoffset", false, "itsoffset"), ("stream_loop", false, "stream_loop"), ("re", true, "re")];
+    if has_teletext_decoder {
+        keys.push(("txt_format", false, "teletext format (txt_format)"));
+        keys.push(("txt_page", false, "teletext page (txt_page)"));
+        keys.push(("txt_duration", false, "teletext cue duration ms (txt_duration)"));
+    }
+    keys
 }
 
 /// Curated global *output* options, same shape as `input_extra_arg_keys`.

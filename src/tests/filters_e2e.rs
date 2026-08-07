@@ -730,3 +730,23 @@ File formats:
     assert!(muxers.iter().any(|m| m == "mp4"), "{muxers:?}");
 }
 
+/// `decoders_include_teletext` should reflect whether the libzvbi-based
+/// teletext decoder shows up in `ffmpeg -decoders` output, not any other
+/// unrelated decoder (e.g. `dvbsub`, a real but different subtitle codec
+/// most builds do have even without libzvbi).
+#[test]
+fn decoders_include_teletext_detects_the_teletext_decoder_specifically() {
+    let without = "\
+Decoders:
+ S..... dvbsub               DVB subtitles (codec dvb_subtitle)
+";
+    assert!(!ffmpeg::decoders_include_teletext(without));
+
+    let with = "\
+Decoders:
+ S..... dvbsub               DVB subtitles (codec dvb_subtitle)
+ S..... libzvbi_teletextdec  Libzvbi DVB teletext decoder (codec dvb_teletext)
+";
+    assert!(ffmpeg::decoders_include_teletext(with));
+}
+

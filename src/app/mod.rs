@@ -246,12 +246,21 @@ pub struct App {
     /// pickers fall back to a small curated list.
     available_encoders: Vec<(String, StreamKind)>,
     available_muxers: Vec<String>,
+    /// Whether the configured ffmpeg has the teletext decoder built in --
+    /// queried once at startup, gates whether `txt_format`/`txt_page`/
+    /// `txt_duration` show up as curated input extra-args at all (see
+    /// `ffmpeg::has_teletext_decoder`). `ui` needs to read this too (for
+    /// the extra-arg text-input prompt's label), hence `pub(crate)` rather
+    /// than fully private like `available_encoders`/`available_muxers`,
+    /// which only ever get read from within `app` itself.
+    pub(crate) has_teletext_decoder: bool,
 }
 
 impl App {
     pub fn new() -> Self {
         let available_encoders = ffmpeg::list_encoders().unwrap_or_default();
         let available_muxers = ffmpeg::list_muxers().unwrap_or_default();
+        let has_teletext_decoder = ffmpeg::has_teletext_decoder();
         let mut log = vec!["Press 'a' to add an input file, '?' for help.".to_string()];
         if available_encoders.is_empty() || available_muxers.is_empty() {
             log.push(
@@ -279,6 +288,7 @@ impl App {
             should_quit: false,
             available_encoders,
             available_muxers,
+            has_teletext_decoder,
         }
     }
 

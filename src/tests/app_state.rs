@@ -1553,6 +1553,38 @@ fn activate_focused_on_input_opens_extra_args_field_picker_with_current_values()
     assert_eq!(options.last().unwrap().display, "custom key…");
 }
 
+/// The input extra-args picker should only list the teletext decoder's
+/// options (`txt_format`/`txt_page`/`txt_duration`) when
+/// `App::has_teletext_decoder` says the configured ffmpeg actually has
+/// that decoder -- checked directly against the field here rather than
+/// spawning a real ffmpeg, since `App::new()`'s own query result depends
+/// on whatever's installed on the machine running this test.
+#[test]
+fn extra_args_picker_only_lists_teletext_options_when_the_decoder_is_available() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let idx = app.graph.inputs.iter().position(|n| n.id == id).unwrap();
+    app.focus = Focus::Input(idx);
+
+    app.has_teletext_decoder = false;
+    app.activate_focused();
+    let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert!(!displays.iter().any(|d| d.contains("txt_format")), "{displays:?}");
+    assert!(!displays.iter().any(|d| d.contains("txt_page")), "{displays:?}");
+    assert!(!displays.iter().any(|d| d.contains("txt_duration")), "{displays:?}");
+
+    app.has_teletext_decoder = true;
+    app.activate_focused();
+    let Mode::Picker { options, .. } = &app.mode else { panic!("expected picker mode") };
+    let displays: Vec<&String> = options.iter().map(|o| &o.display).collect();
+    assert!(displays.iter().any(|d| d.contains("txt_format")), "{displays:?}");
+    assert!(displays.iter().any(|d| d.contains("txt_page")), "{displays:?}");
+    assert!(displays.iter().any(|d| d.contains("txt_duration")), "{displays:?}");
+}
+
 /// 'e' on a focused output should behave the same way (same underlying
 /// flow, different curated list and graph accessor).
 #[test]
@@ -1598,7 +1630,7 @@ fn extra_args_picker_shows_friendly_labels_for_ss_and_to() {
     let crate::app::TextTarget::ExtraArgValue { target, key } = target else {
         panic!("expected ExtraArgValue target")
     };
-    assert_eq!(crate::app::extra_arg_label(*target, key), "trim start (ss)");
+    assert_eq!(crate::app::extra_arg_label(*target, key, app.has_teletext_decoder), "trim start (ss)");
 }
 
 /// Picking a curated valueless flag (e.g. "re") should toggle it in place

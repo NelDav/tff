@@ -422,3 +422,23 @@ fn ffmpeg_args_skip_outputs_with_no_resolvable_connection() {
     assert!(!args.contains(&"output2.mkv".to_string()), "empty output should not appear: {args:?}");
 }
 
+/// The teletext decoder's own options (`txt_format`/`txt_page`/
+/// `txt_duration`) should only be offered as curated input extra-args when
+/// the configured ffmpeg actually has that decoder -- offering them
+/// otherwise would just be an option ffmpeg rejects outright as
+/// unrecognized, not merely a no-op.
+#[test]
+fn input_extra_arg_keys_only_include_teletext_options_when_supported() {
+    let without = crate::graph::input_extra_arg_keys(false);
+    assert!(without.iter().any(|&(k, _, _)| k == "itsoffset"), "{without:?}");
+    assert!(!without.iter().any(|&(k, _, _)| k == "txt_format"), "{without:?}");
+    assert!(!without.iter().any(|&(k, _, _)| k == "txt_page"), "{without:?}");
+    assert!(!without.iter().any(|&(k, _, _)| k == "txt_duration"), "{without:?}");
+
+    let with = crate::graph::input_extra_arg_keys(true);
+    assert!(with.iter().any(|&(k, _, _)| k == "itsoffset"), "{with:?}");
+    assert!(with.iter().any(|&(k, _, _)| k == "txt_format"), "{with:?}");
+    assert!(with.iter().any(|&(k, _, _)| k == "txt_page"), "{with:?}");
+    assert!(with.iter().any(|&(k, _, _)| k == "txt_duration"), "{with:?}");
+}
+

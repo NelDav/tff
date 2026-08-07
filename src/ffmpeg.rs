@@ -246,6 +246,25 @@ pub(crate) fn parse_muxers(text: &str) -> Vec<String> {
     muxers
 }
 
+/// Whether the configured ffmpeg (see `binary`) has the libzvbi-based
+/// teletext decoder built in -- most distro ffmpeg packages don't (it's an
+/// optional `--enable-libzvbi` build flag), and without it the decoder's
+/// own private options (`txt_format`/`txt_page`/`txt_duration`) aren't
+/// even recognized as valid flags at all, let alone usable, so pickers use
+/// this to decide whether to offer them as curated input extra-args in the
+/// first place. `false` if the query itself fails for any reason, same
+/// fail-safe default as `list_encoders`/`list_muxers`.
+pub fn has_teletext_decoder() -> bool {
+    let Ok(output) = Command::new(binary("ffmpeg")).args(["-hide_banner", "-decoders"]).output() else {
+        return false;
+    };
+    decoders_include_teletext(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub(crate) fn decoders_include_teletext(decoders_output: &str) -> bool {
+    decoders_output.contains("libzvbi_teletextdec")
+}
+
 /// Launch ffplay on a rendered preview file, in its own window. Runs
 /// detached: unlike `run_args`, nothing here waits for or streams output
 /// from the player process, since it's the user who decides when they're

@@ -120,10 +120,10 @@ pub(super) fn disposition_picker_options(flags: &BTreeSet<String>) -> Vec<Picker
         .collect()
 }
 
-fn curated_extra_arg_keys(target: ExtraArgsTarget) -> &'static [(&'static str, bool, &'static str)] {
+fn curated_extra_arg_keys(target: ExtraArgsTarget, has_teletext_decoder: bool) -> Vec<(&'static str, bool, &'static str)> {
     match target {
-        ExtraArgsTarget::Input(_) => crate::graph::input_extra_arg_keys(),
-        ExtraArgsTarget::Output(_) => crate::graph::output_extra_arg_keys(),
+        ExtraArgsTarget::Input(_) => crate::graph::input_extra_arg_keys(has_teletext_decoder),
+        ExtraArgsTarget::Output(_) => crate::graph::output_extra_arg_keys().to_vec(),
     }
 }
 
@@ -132,8 +132,8 @@ fn curated_extra_arg_keys(target: ExtraArgsTarget) -> &'static [(&'static str, b
 /// one of the curated ones -- a custom key the user typed in has no label
 /// beyond its own name. Used by the text-input prompt so it matches
 /// whatever the picker entry it came from was actually showing.
-pub fn extra_arg_label(target: ExtraArgsTarget, key: &str) -> &str {
-    curated_extra_arg_keys(target)
+pub fn extra_arg_label(target: ExtraArgsTarget, key: &str, has_teletext_decoder: bool) -> &str {
+    curated_extra_arg_keys(target, has_teletext_decoder)
         .iter()
         .find(|&&(k, _, _)| k == key)
         .map_or(key, |&(_, _, label)| label)
@@ -162,10 +162,10 @@ pub(super) fn extra_args_of_mut(graph: &mut Graph, target: ExtraArgsTarget) -> O
 /// `input_extra_arg_keys`'s doc comment), not necessarily the raw `-<key>`
 /// flag name stored under `value` -- picking an entry, and the actual arg
 /// ffmpeg gets, are still keyed by the raw name regardless of label.
-pub(super) fn extra_args_picker_options(graph: &Graph, target: ExtraArgsTarget) -> Vec<PickerEntry> {
+pub(super) fn extra_args_picker_options(graph: &Graph, target: ExtraArgsTarget, has_teletext_decoder: bool) -> Vec<PickerEntry> {
     let empty = BTreeMap::new();
     let fields = extra_args_of(graph, target).unwrap_or(&empty);
-    let curated = curated_extra_arg_keys(target);
+    let curated = curated_extra_arg_keys(target, has_teletext_decoder);
 
     let mut options: Vec<PickerEntry> = curated.iter().map(|&(key, is_boolean, label)| {
         let display = if is_boolean {
@@ -197,7 +197,7 @@ impl App {
         self.mode = Mode::Picker {
             kind: PickerKind::ExtraArgField { target },
             title: "extra ffmpeg args: choose flag".to_string(),
-            options: extra_args_picker_options(&self.graph, target),
+            options: extra_args_picker_options(&self.graph, target, self.has_teletext_decoder),
             selected: 0,
             query: String::new(),
             searching: false,
@@ -382,7 +382,7 @@ impl App {
             let selected_key = real_idx.and_then(|i| options.get(i)).and_then(|e| e.value.clone());
             let is_boolean = selected_key
                 .as_deref()
-                .is_some_and(|k| curated_extra_arg_keys(target).iter().any(|&(ck, b, _)| ck == k && b));
+                .is_some_and(|k| curated_extra_arg_keys(target, self.has_teletext_decoder).iter().any(|&(ck, b, _)| ck == k && b));
             if is_boolean {
                 let key = selected_key.unwrap();
                 if let Some(fields) = extra_args_of_mut(&mut self.graph, target) {
@@ -396,7 +396,7 @@ impl App {
                 self.mode = Mode::Picker {
                     kind: PickerKind::ExtraArgField { target },
                     title,
-                    options: extra_args_picker_options(&self.graph, target),
+                    options: extra_args_picker_options(&self.graph, target, self.has_teletext_decoder),
                     selected,
                     query,
                     searching,

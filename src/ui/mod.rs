@@ -79,7 +79,7 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                 crate::app::TextTarget::ModifierCustomKey(_) => "custom metadata key: ".to_string(),
                 crate::app::TextTarget::ModifierFilterValue { key, .. } => format!("{key}: "),
                 crate::app::TextTarget::ExtraArgValue { target, key } => {
-                    format!("{}: ", crate::app::extra_arg_label(*target, key))
+                    format!("{}: ", crate::app::extra_arg_label(*target, key, app.has_teletext_decoder))
                 }
                 crate::app::TextTarget::ExtraArgCustomKey(_) => "custom extra-arg key: ".to_string(),
                 crate::app::TextTarget::ChapterTime { field, .. } => match field {
