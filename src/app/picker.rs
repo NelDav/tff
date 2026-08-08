@@ -536,7 +536,17 @@ impl App {
                     return;
                 }
 
-                self.mode = text_input_mode(TextTarget::ModifierFilterValue { modifier, key }, current.unwrap_or_default(), Vec::new());
+                // Trim's start/end are stored as plain seconds (see
+                // `text_input`'s `ModifierFilterValue` handling), but
+                // re-editing should show the friendlier HH:MM:SS form back,
+                // same as a chapter's start/end field does.
+                let is_trim_time_field = *name == FilterName::Trim && (key == "start" || key == "end");
+                let prefill = if is_trim_time_field {
+                    current.as_deref().and_then(|v| v.parse::<f64>().ok()).map(crate::graph::format_time).unwrap_or_default()
+                } else {
+                    current.unwrap_or_default()
+                };
+                self.mode = text_input_mode(TextTarget::ModifierFilterValue { modifier, key }, prefill, Vec::new());
             }
             PickerKind::FilterFieldValue { modifier, key } => {
                 if let Some(m) = self.graph.modifier_mut(modifier)

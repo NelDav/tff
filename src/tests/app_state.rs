@@ -1045,6 +1045,112 @@ fn filter_field_picker_confirm_opens_value_input_and_stores_it() {
     assert_eq!(fields.get("width"), Some(&"1280".to_string()));
 }
 
+/// Trim's start/end fields are the one Filter field pair that accepts a
+/// time -- HH:MM:SS/MM:SS with an optional fractional-seconds tail, or
+/// plain seconds -- and should be stored as plain seconds regardless of
+/// which form was typed, since that's the only form that survives being
+/// embedded in the `trim=start=...:end=...` expression (a colon inside
+/// the stored value would collide with the filtergraph's own key=value
+/// separator).
+#[test]
+fn trim_start_field_accepts_hh_mm_ss_with_fractional_seconds() {
+    use crate::app::{App, Focus, Mode, TextTarget};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: BTreeMap::new() });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+    let idx = match &app.mode {
+        Mode::Picker { options, .. } => options.iter().position(|o| o.value.as_deref() == Some("start")).unwrap(),
+        _ => panic!("expected picker mode"),
+    };
+    app.picker_move(idx as isize);
+    app.picker_confirm();
+
+    let Mode::TextInput { target, .. } = &app.mode else {
+        panic!("expected text input mode");
+    };
+    assert!(matches!(target, TextTarget::ModifierFilterValue { key, .. } if key == "start"));
+
+    for c in "1:30.5".chars() {
+        app.text_input_handle_key(key(KeyCode::Char(c)));
+    }
+    app.confirm_text_input();
+
+    let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
+    let ModifierKind::Filter { fields, .. } = &m.kind else { panic!("wrong kind") };
+    assert_eq!(fields.get("start"), Some(&"90.5".to_string()), "1:30.5 should parse to 90.5 plain seconds");
+    assert!(app.log.last().unwrap().contains("00:01:30.500"), "{:?}", app.log.last());
+}
+
+/// Re-opening the value editor for an already-set Trim start/end field
+/// should show it back as HH:MM:SS, not the plain-seconds form it's
+/// stored as -- same round trip a chapter's start/end field gets.
+#[test]
+fn trim_time_field_reprefills_as_hh_mm_ss_not_plain_seconds() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "90.5")]),
+    });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+    let idx = match &app.mode {
+        Mode::Picker { options, .. } => options.iter().position(|o| o.value.as_deref() == Some("start")).unwrap(),
+        _ => panic!("expected picker mode"),
+    };
+    app.picker_move(idx as isize);
+    app.picker_confirm();
+
+    let Mode::TextInput { input, .. } = &app.mode else {
+        panic!("expected text input mode");
+    };
+    assert_eq!(input.value(), "00:01:30.500");
+}
+
+/// A time that doesn't parse at all should be rejected with a log message
+/// rather than silently stored -- an unparseable value embedded in the
+/// filter expression would just break the whole render.
+#[test]
+fn trim_time_field_rejects_unparseable_input() {
+    use crate::app::{App, Focus, Mode};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: BTreeMap::new() });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.activate_modifier();
+    let idx = match &app.mode {
+        Mode::Picker { options, .. } => options.iter().position(|o| o.value.as_deref() == Some("start")).unwrap(),
+        _ => panic!("expected picker mode"),
+    };
+    app.picker_move(idx as isize);
+    app.picker_confirm();
+
+    for c in "not-a-time".chars() {
+        app.text_input_handle_key(key(KeyCode::Char(c)));
+    }
+    app.confirm_text_input();
+
+    let Some(m) = app.graph.modifier(modifier) else { panic!("modifier disappeared") };
+    let ModifierKind::Filter { fields, .. } = &m.kind else { panic!("wrong kind") };
+    assert!(fields.get("start").is_none(), "an unparseable time must not be stored");
+    assert!(app.log.last().unwrap().contains("couldn't parse"), "{:?}", app.log.last());
+}
+
 /// A field with a fixed set of valid values (Rotate's "direction") should
 /// offer a selection picker instead of free-text entry -- ffmpeg only
 /// accepts a handful of exact strings there, so anything else typed is

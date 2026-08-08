@@ -1,12 +1,12 @@
 use crossterm::event::{Event as CrosstermEvent, KeyEvent};
-use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use super::chapters::chapter_edit_chapters_mut;
 use super::picker::{extra_args_of, extra_args_of_mut};
 use super::{App, ChapterColumn, ChapterTimeField, Mode, TextTarget};
 use crate::ffmpeg;
-use crate::graph::ModifierKind;
+use crate::graph::{FilterName, ModifierKind};
 
 /// Paths typed into the text field are passed straight to `ffprobe`/`ffmpeg`
 /// via `Command`, with no shell in between — so `~` never gets expanded and
@@ -43,8 +43,17 @@ fn expand_tilde(s: &str) -> String {
 /// Builds a `Mode::TextInput` with the cursor placed at the end of
 /// `buffer` -- the natural starting position whether the field opens empty
 /// or prefilled with an existing value (e.g. re-editing a metadata field).
-pub(super) fn text_input_mode(target: TextTarget, buffer: String, suggestions: Vec<String>) -> Mode {
-    Mode::TextInput { target, input: Input::new(buffer), suggestions, selected: 0 }
+pub(super) fn text_input_mode(
+    target: TextTarget,
+    buffer: String,
+    suggestions: Vec<String>,
+) -> Mode {
+    Mode::TextInput {
+        target,
+        input: Input::new(buffer),
+        suggestions,
+        selected: 0,
+    }
 }
 
 /// The byte offset in `s` where its `char_idx`-th character starts --
@@ -55,7 +64,10 @@ pub(super) fn text_input_mode(target: TextTarget, buffer: String, suggestions: V
 /// position) falls through to `s.len()`, since there's no char at that
 /// index to report a start byte for.
 pub(crate) fn char_byte_offset(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }
 
 /// Files/directories matching what's typed after the last '/' in `buffer`,
@@ -122,23 +134,32 @@ impl App {
             return;
         };
         self.mode = match target {
-            TextTarget::ChapterTime { modifier, index, field } => {
+            TextTarget::ChapterTime {
+                modifier,
+                index,
+                field,
+            } => {
                 let col = match field {
                     ChapterTimeField::Start => ChapterColumn::Start,
                     ChapterTimeField::End => ChapterColumn::End,
                 };
-                Mode::ChapterTable { modifier: *modifier, row: *index, col }
+                Mode::ChapterTable {
+                    modifier: *modifier,
+                    row: *index,
+                    col,
+                }
             }
-            TextTarget::ChapterTitle { modifier, index } => {
-                Mode::ChapterTable { modifier: *modifier, row: *index, col: ChapterColumn::Title }
-            }
+            TextTarget::ChapterTitle { modifier, index } => Mode::ChapterTable {
+                modifier: *modifier,
+                row: *index,
+                col: ChapterColumn::Title,
+            },
             _ => Mode::Normal,
         };
     }
 
     pub fn confirm_text_input(&mut self) {
-        let Mode::TextInput { target, input, .. } =
-            std::mem::replace(&mut self.mode, Mode::Normal)
+        let Mode::TextInput { target, input, .. } = std::mem::replace(&mut self.mode, Mode::Normal)
         else {
             return;
         };
@@ -152,10 +173,13 @@ impl App {
                 match ffmpeg::probe(&path) {
                     Ok(result) => {
                         let chapter_count = result.chapters.len();
-                        let id = self.graph.add_input(path.clone(), result.streams, result.chapters);
+                        let id =
+                            self.graph
+                                .add_input(path.clone(), result.streams, result.chapters);
                         self.log.push(format!("added input: {path}"));
                         if chapter_count > 0 {
-                            self.log.push(format!("found {chapter_count} chapter(s) in {path}"));
+                            self.log
+                                .push(format!("found {chapter_count} chapter(s) in {path}"));
                         }
                         let idx = self.graph.inputs.len() - 1;
                         debug_assert_eq!(self.graph.inputs[idx].id, id);
@@ -205,16 +229,38 @@ impl App {
                         | ModifierKind::Concat => None,
                     })
                     .unwrap_or_default();
-                self.mode = text_input_mode(TextTarget::ModifierMetadataValue { modifier, key }, current, Vec::new());
+                self.mode = text_input_mode(
+                    TextTarget::ModifierMetadataValue { modifier, key },
+                    current,
+                    Vec::new(),
+                );
             }
             TextTarget::ModifierFilterValue { modifier, key } => {
                 let value = buffer.trim().to_string();
                 if let Some(m) = self.graph.modifier_mut(modifier)
-                    && let ModifierKind::Filter { fields, .. } = &mut m.kind
+                    && let ModifierKind::Filter { name, fields } = &mut m.kind
                 {
+                    // Trim is the only Filter kind with time-valued fields.
+                    let is_trim_time_field =
+                        *name == FilterName::Trim && (key == "start" || key == "end");
                     if value.is_empty() {
                         fields.remove(&key);
                         self.log.push(format!("{key} cleared"));
+                    } else if is_trim_time_field {
+                        match crate::graph::parse_time(&value) {
+                            Some(secs) => {
+                                fields.insert(key.clone(), secs.to_string());
+                                self.log.push(format!(
+                                    "{key} set to {}",
+                                    crate::graph::format_time(secs)
+                                ));
+                            }
+                            None => {
+                                self.log.push(format!(
+                                    "couldn't parse '{value}' as a time -- try seconds (12.5) or HH:MM:SS"
+                                ));
+                            }
+                        }
                     } else {
                         fields.insert(key.clone(), value.clone());
                         self.log.push(format!("{key} set to {value}"));
@@ -238,11 +284,20 @@ impl App {
                 if key.is_empty() {
                     return;
                 }
-                let current =
-                    extra_args_of(&self.graph, target).and_then(|f| f.get(&key).cloned()).unwrap_or_default();
-                self.mode = text_input_mode(TextTarget::ExtraArgValue { target, key }, current, Vec::new());
+                let current = extra_args_of(&self.graph, target)
+                    .and_then(|f| f.get(&key).cloned())
+                    .unwrap_or_default();
+                self.mode = text_input_mode(
+                    TextTarget::ExtraArgValue { target, key },
+                    current,
+                    Vec::new(),
+                );
             }
-            TextTarget::ChapterTime { modifier, index, field } => {
+            TextTarget::ChapterTime {
+                modifier,
+                index,
+                field,
+            } => {
                 match crate::graph::parse_time(&buffer) {
                     Some(secs) => {
                         if let Some(chapter) = chapter_edit_chapters_mut(&mut self.graph, modifier)
@@ -253,7 +308,10 @@ impl App {
                                 ChapterTimeField::End => chapter.end_secs = secs,
                             }
                         }
-                        self.log.push(format!("chapter time set to {}", crate::graph::format_time(secs)));
+                        self.log.push(format!(
+                            "chapter time set to {}",
+                            crate::graph::format_time(secs)
+                        ));
                     }
                     None => {
                         self.log.push(format!(
@@ -268,16 +326,24 @@ impl App {
                     ChapterTimeField::Start => ChapterColumn::Start,
                     ChapterTimeField::End => ChapterColumn::End,
                 };
-                self.mode = Mode::ChapterTable { modifier, row: index, col };
+                self.mode = Mode::ChapterTable {
+                    modifier,
+                    row: index,
+                    col,
+                };
             }
             TextTarget::ChapterTitle { modifier, index } => {
-                if let Some(chapter) =
-                    chapter_edit_chapters_mut(&mut self.graph, modifier).and_then(|cs| cs.get_mut(index))
+                if let Some(chapter) = chapter_edit_chapters_mut(&mut self.graph, modifier)
+                    .and_then(|cs| cs.get_mut(index))
                 {
                     chapter.title = buffer.trim().to_string();
                 }
                 self.log.push("chapter title set".to_string());
-                self.mode = Mode::ChapterTable { modifier, row: index, col: ChapterColumn::Title };
+                self.mode = Mode::ChapterTable {
+                    modifier,
+                    row: index,
+                    col: ChapterColumn::Title,
+                };
             }
         }
     }
@@ -291,7 +357,13 @@ impl App {
     /// `to_input_request` leaves unmapped anyway (they're mode transitions
     /// and suggestion-list navigation, not text edits).
     pub fn text_input_handle_key(&mut self, key: KeyEvent) {
-        if let Mode::TextInput { target, input, suggestions, selected } = &mut self.mode {
+        if let Mode::TextInput {
+            target,
+            input,
+            suggestions,
+            selected,
+        } = &mut self.mode
+        {
             input.handle_event(&CrosstermEvent::Key(key));
             if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
                 *suggestions = path_suggestions(input.value());
