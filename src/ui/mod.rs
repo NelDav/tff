@@ -120,8 +120,13 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
             "↑↓/jk row · ←→/hl/Tab column · Enter edit/add · d delete · Esc close",
             Style::default().fg(Color::Yellow),
         )),
+        // Which player is actually behind the session (mpv, fully relayed
+        // here, vs ffplay, which has no remote control at all -- see
+        // `App::start_scrub`) isn't known to `ui`, so this stays generic;
+        // the log line from starting the session already spelled out
+        // exactly which one and its exact controls.
         Mode::Scrub => TextLine::from(Span::styled(
-            "keys go here, not mpv's window · space play/pause · h/l step frame · Shift+←→ seek 1s · \
+            "space/h-l/Shift+←→ control mpv, if that's the backend (ffplay: use its own window -- see log) · \
              g jump to time · i/o mark start/end · Esc close",
             Style::default().fg(Color::Yellow),
         )),

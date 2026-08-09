@@ -29,6 +29,16 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
         if let Some(path) = app.preview_ready.take() {
             play_preview(terminal, &mut app, &path);
         }
+        // A headless scrub session (mpv rendering `--vo=tct` into this same
+        // terminal, no display available -- see `App::start_scrub`) needs
+        // the whole terminal to itself for as long as it's open, checked
+        // here (before the draw call below) rather than after `handle_key`,
+        // so the iteration that just spawned it never tries to draw
+        // ratatui's own frame over it.
+        if app.scrub_is_headless_mpv() {
+            run_headless_scrub(terminal, &mut app)?;
+            continue;
+        }
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))?
@@ -46,21 +56,74 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Plays a finished preview render. `ffplay` opens its own window and is
-/// left running detached, so the TUI keeps going undisturbed underneath
-/// it; with no display to open one on (a bare SSH session with no X
-/// forwarding, the common case this whole app exists for), there's nowhere
-/// for ffplay to draw, so this falls back to mpv's terminal video output
-/// (`--vo=tct`) directly in this terminal instead -- which means yielding
-/// the TUI's alternate screen for the duration (mpv draws straight to this
-/// process's own stdout) and forcing a full repaint once it's done.
-fn play_preview(terminal: &mut ratatui::DefaultTerminal, app: &mut App, path: &str) {
-    if ffmpeg::has_display() {
-        app.log.push(format!("$ ffplay {path}"));
-        if let Err(e) = ffmpeg::play(path) {
-            app.status = format!("couldn't launch ffplay: {e:#}");
-            app.log.push(app.status.clone());
+/// Drives a headless scrub session's keys directly, bypassing the normal
+/// draw-then-read-one-key cycle above: mpv is writing `--vo=tct` video
+/// frames straight to this same terminal (see `ffmpeg::spawn_scrub_mpv`),
+/// so ratatui can't also be repainting it as a TUI without the two
+/// fighting over the same screen -- this leaves the alternate screen for
+/// the duration (letting mpv's frames show through) while still reading
+/// keys itself (raw mode stays enabled throughout, unlike `play_preview`'s
+/// fully-blocking mpv fallback, since `--input-terminal=no` means mpv
+/// isn't reading this terminal's input at all -- every keystroke is tff's
+/// to relay over the IPC socket, exactly like the windowed mpv/ffplay path
+/// already does through `dispatch_scrub_key`). Returns once the session
+/// closes (Esc/'q', or Ctrl+C requesting quit).
+fn run_headless_scrub(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::Result<()> {
+    execute!(stdout(), LeaveAlternateScreen)?;
+    loop {
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    app.should_quit = true;
+                    app.close_scrub();
+                } else {
+                    dispatch_scrub_key(app, key);
+                }
+            }
+        if app.should_quit || !matches!(app.mode, Mode::Scrub) {
+            break;
         }
+    }
+    Ok(resume_tui(terminal)?)
+}
+
+/// Plays a finished preview render. mpv is the preferred player when it's
+/// installed (proper playback controls, in its own window), with ffplay as
+/// the fallback otherwise; both open their own window and are left running
+/// detached, so the TUI keeps going undisturbed underneath. With no display
+/// to open a window on at all (a bare SSH session with no X forwarding),
+/// there's nowhere for either to draw one, so this falls back to mpv's
+/// terminal video output (`--vo=tct`) directly in this terminal instead --
+/// which means yielding the TUI's alternate screen for the duration (mpv
+/// draws straight to this process's own stdout) and forcing a full repaint
+/// once it's done. ffplay has no such terminal mode, so a missing mpv with
+/// no display leaves nothing left to try.
+fn play_preview(terminal: &mut ratatui::DefaultTerminal, app: &mut App, path: &str) {
+    let mpv_installed = ffmpeg::mpv_is_installed();
+
+    if ffmpeg::has_display() {
+        if mpv_installed {
+            app.log.push(format!("$ mpv {path}"));
+            if let Err(e) = ffmpeg::play_mpv(path) {
+                app.status = format!("couldn't launch mpv: {e:#}");
+                app.log.push(app.status.clone());
+            }
+        } else {
+            app.log.push(format!("$ ffplay {path}"));
+            if let Err(e) = ffmpeg::play(path) {
+                app.status = format!("couldn't launch ffplay: {e:#}");
+                app.log.push(app.status.clone());
+            }
+        }
+        return;
+    }
+
+    if !mpv_installed {
+        app.status = "no display available and mpv isn't installed -- can't play the preview".to_string();
+        app.log.push(app.status.clone());
         return;
     }
 
@@ -209,20 +272,28 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         },
-        Mode::Scrub => match key.code {
-            // Shift+Left/Right is checked ahead of the plain arms below
-            // since match picks the first hit, same as Normal mode's own
-            // Ctrl/Shift-then-plain ordering.
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.scrub_seek_relative(true),
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.scrub_seek_relative(false),
-            KeyCode::Right | KeyCode::Char('l') => app.scrub_step_frame(true),
-            KeyCode::Left | KeyCode::Char('h') => app.scrub_step_frame(false),
-            KeyCode::Char(' ') => app.scrub_play_pause(),
-            KeyCode::Char('g') => app.start_scrub_seek(),
-            KeyCode::Char('i') => app.mark_scrub_point("start"),
-            KeyCode::Char('o') => app.mark_scrub_point("end"),
-            KeyCode::Esc | KeyCode::Char('q') => app.close_scrub(),
-            _ => {}
-        },
+        Mode::Scrub => dispatch_scrub_key(app, key),
+    }
+}
+
+/// Every `Mode::Scrub` key, shared between the normal `handle_key` dispatch
+/// above (the windowed mpv/ffplay case) and `run_headless_scrub`'s own
+/// loop (the headless mpv case) -- the keys mean the same thing either way,
+/// only how the surrounding terminal is being driven differs.
+fn dispatch_scrub_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        // Shift+Left/Right is checked ahead of the plain arms below since
+        // match picks the first hit, same as Normal mode's own
+        // Ctrl/Shift-then-plain ordering.
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.scrub_seek_relative(true),
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.scrub_seek_relative(false),
+        KeyCode::Right | KeyCode::Char('l') => app.scrub_step_frame(true),
+        KeyCode::Left | KeyCode::Char('h') => app.scrub_step_frame(false),
+        KeyCode::Char(' ') => app.scrub_play_pause(),
+        KeyCode::Char('g') => app.start_scrub_seek(),
+        KeyCode::Char('i') => app.mark_scrub_point("start"),
+        KeyCode::Char('o') => app.mark_scrub_point("end"),
+        KeyCode::Esc | KeyCode::Char('q') => app.close_scrub(),
+        _ => {}
     }
 }

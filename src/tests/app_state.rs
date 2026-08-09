@@ -2173,3 +2173,4 @@ fn cycle_row_combines_concat_segments_and_outgoing_rows() {
     assert_eq!(app.row_idx, 0, "should wrap back around to the first segment");
 }
 
+

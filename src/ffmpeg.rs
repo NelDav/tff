@@ -265,10 +265,47 @@ pub(crate) fn decoders_include_teletext(decoders_output: &str) -> bool {
     decoders_output.contains("libzvbi_teletextdec")
 }
 
-/// Launch ffplay on a rendered preview file, in its own window. Runs
-/// detached: unlike `run_args`, nothing here waits for or streams output
-/// from the player process, since it's the user who decides when they're
-/// done looking and closes the window themselves.
+/// Whether the `mpv` binary can actually be run -- checked once per
+/// `play_preview`/`App::start_scrub` call to decide whether mpv (the
+/// preferred player: proper playback controls for preview, full IPC
+/// remote control for scrub) is available at all, falling back to ffplay
+/// otherwise. Actually spawns it (briefly, `--version` exits immediately)
+/// rather than just checking `PATH` some other way, since that's the same
+/// thing that would fail later if this said yes but was wrong.
+pub fn mpv_is_installed() -> bool {
+    Command::new("mpv")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Launch mpv on a rendered preview file, in its own window -- the
+/// preferred player when one's installed (see `mpv_is_installed`); `play`
+/// (ffplay) is the fallback otherwise. Runs detached, same as `play`:
+/// nothing here waits for or streams output from the player process, since
+/// it's the user who decides when they're done looking and closes the
+/// window themselves. No explicit "exit when done" flag needed, unlike
+/// `play`'s `-autoexit`: mpv's own default (`--keep-open=no`) already
+/// closes the window once playback reaches the end of the file.
+pub fn play_mpv(path: &str) -> Result<()> {
+    Command::new("mpv")
+        .args(["--title=tff preview", path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn mpv (is it installed and on PATH?)")?;
+    Ok(())
+}
+
+/// Launch ffplay on a rendered preview file, in its own window -- the
+/// fallback when mpv isn't installed (see `play_mpv`/`mpv_is_installed`).
+/// Runs detached: unlike `run_args`, nothing here waits for or streams
+/// output from the player process, since it's the user who decides when
+/// they're done looking and closes the window themselves.
 pub fn play(path: &str) -> Result<()> {
     Command::new(binary("ffplay"))
         .args(["-hide_banner", "-autoexit", "-window_title", "tff preview", path])
@@ -318,24 +355,35 @@ pub fn play_in_terminal(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Starts an mpv instance in its own window, playing `path` from
-/// `start_secs`, with its IPC server bound to `socket_path` -- lets
-/// `App::start_scrub` control it (seek, frame-step, query position) while
-/// the user watches the actual video, not a terminal approximation of it.
-/// Unlike `play`/`play_in_terminal`, left running detached and driven
-/// entirely through the socket from then on.
+/// Starts an mpv instance playing `path` from `start_secs`, with its IPC
+/// server bound to `socket_path` -- lets `App::start_scrub` control it
+/// (seek, frame-step, query position) while the user watches the actual
+/// video. Left running detached and driven entirely through the socket
+/// from then on, unlike `play`/`play_in_terminal`.
+///
+/// `headless` picks how it renders: `false` opens mpv's own window
+/// (a display is available); `true` renders `--vo=tct` (the same
+/// truecolor-block output `play_in_terminal` uses) straight into this
+/// terminal instead, with `--input-terminal=no` so mpv doesn't also try to
+/// read this terminal's keyboard input itself -- tff's own event loop
+/// keeps that (see `main.rs`'s dedicated headless-scrub loop) and relays
+/// every command over the socket instead, exactly like the windowed path,
+/// so the same `scrub_*` methods serve both.
 #[cfg(unix)]
-pub fn spawn_scrub_mpv(path: &str, socket_path: &str, start_secs: f64) -> Result<std::process::Child> {
+pub fn spawn_scrub_mpv(path: &str, socket_path: &str, start_secs: f64, headless: bool) -> Result<std::process::Child> {
     let _ = std::fs::remove_file(socket_path); // stale socket from a crashed session, if any
+    let mut args = vec![format!("--input-ipc-server={socket_path}"), format!("--start={start_secs}")];
+    if headless {
+        args.push("--vo=tct".to_string());
+        args.push("--input-terminal=no".to_string());
+    } else {
+        args.push("--title=tff scrub".to_string());
+    }
+    args.push(path.to_string());
     Command::new("mpv")
-        .args([
-            format!("--input-ipc-server={socket_path}"),
-            "--title=tff scrub".to_string(),
-            format!("--start={start_secs}"),
-            path.to_string(),
-        ])
+        .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if headless { Stdio::inherit() } else { Stdio::null() })
         .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn mpv (is it installed and on PATH?)")
@@ -345,22 +393,107 @@ pub fn spawn_scrub_mpv(path: &str, socket_path: &str, start_secs: f64) -> Result
 /// this reaches for on Windows (mpv uses a named pipe there instead, a
 /// different API), so scrubbing just isn't available there yet.
 #[cfg(not(unix))]
-pub fn spawn_scrub_mpv(_path: &str, _socket_path: &str, _start_secs: f64) -> Result<std::process::Child> {
+pub fn spawn_scrub_mpv(
+    _path: &str,
+    _socket_path: &str,
+    _start_secs: f64,
+    _headless: bool,
+) -> Result<std::process::Child> {
     bail!("scrubbing isn't supported on this platform yet (mpv's IPC socket is Unix-only)")
 }
 
+/// Starts ffplay in its own window, playing `path` from `start_secs` --
+/// the fallback `App::start_scrub` uses when mpv isn't installed and a
+/// display is available (there's no headless equivalent: ffplay can't
+/// render at all without one, so a missing mpv with no display leaves
+/// scrubbing unavailable entirely). Unlike the mpv path, there's no remote
+/// control at all: ffplay has no IPC/stdin protocol of any kind, so the
+/// user drives playback directly in its window using its own native keys
+/// (space pause, left/right seek, `s` step one frame forward -- there's no
+/// reverse single-frame step, an ffplay limitation, not tff's). Its stderr
+/// is piped back (not silenced, unlike `play`) so `spawn_ffplay_position_reader`
+/// can scrape the live position it prints there, which is the only channel
+/// tff has into what ffplay is doing.
+pub fn spawn_scrub_ffplay(path: &str, start_secs: f64) -> Result<std::process::Child> {
+    Command::new(binary("ffplay"))
+        .args([
+            "-hide_banner".to_string(),
+            "-window_title".to_string(),
+            "tff scrub".to_string(),
+            "-ss".to_string(),
+            start_secs.to_string(),
+            path.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn ffplay (is it installed and on PATH?)")
+}
+
+/// Picks the leading `<seconds>.<fraction>` off one fragment of ffplay's
+/// periodic status output (e.g. `"   12.34 A-V: -0.030 fd=..."`, updated in
+/// place via `\r`, not `\n` -- see `spawn_ffplay_position_reader`, which
+/// splits on both before calling this). `None` for any other line ffplay
+/// prints (banner/version info, the `Input #0 ...` block, etc.), which
+/// don't start with a bare number.
+pub(crate) fn parse_ffplay_position(fragment: &str) -> Option<f64> {
+    let trimmed = fragment.trim_start();
+    let end = trimmed.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    if end == 0 {
+        return None;
+    }
+    trimmed[..end].parse().ok()
+}
+
+/// Reads `stderr` on its own thread for as long as the ffplay process it
+/// belongs to is alive, keeping `position` updated with the latest time
+/// `parse_ffplay_position` can find -- ffplay has no way to be *asked* its
+/// current position, so this passive, continuously-updated estimate (at
+/// most one status interval stale) is what `App::mark_scrub_point` reads
+/// instead of a live query. Exits on its own once the pipe closes (the
+/// process exiting, e.g. via `ScrubSession`'s `Drop`), nothing to join.
+pub fn spawn_ffplay_position_reader(
+    mut stderr: std::process::ChildStderr,
+    position: std::sync::Arc<std::sync::Mutex<Option<f64>>>,
+) {
+    use std::io::Read;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut pending = String::new();
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 {
+                break; // EOF -- the process exited
+            }
+            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+            while let Some(idx) = pending.find(['\r', '\n']) {
+                if let Some(secs) = parse_ffplay_position(&pending[..idx])
+                    && let Ok(mut guard) = position.lock()
+                {
+                    *guard = Some(secs);
+                }
+                pending.drain(..=idx);
+            }
+        }
+    });
+}
+
 /// Best-effort: hands keyboard focus back to whatever window currently has
-/// it (this terminal, if called right before `spawn_scrub_mpv`) a moment
-/// later, since a freshly opened mpv window otherwise grabs focus itself --
-/// window managers focus newly mapped windows by default -- which would
-/// leave every `Mode::Scrub` keypress going to mpv's own bindings instead
-/// of tff's. Needs `xdotool` and an X11 `DISPLAY` (there's no standard
+/// it (this terminal, if called right before a windowed `spawn_scrub_mpv`
+/// or `spawn_scrub_ffplay`) a moment later, since a freshly opened player
+/// window otherwise grabs focus itself -- window managers focus newly
+/// mapped windows by default -- which would leave every `Mode::Scrub`
+/// keypress going to the player's own bindings instead of tff's (mpv can
+/// at least still be relayed commands over IPC regardless of which window
+/// has focus; ffplay has no such channel, so for it this is the *only*
+/// way tff's own g/i/o/Esc keys reach tff at all without a manual
+/// alt-tab). Needs `xdotool` and an X11 `DISPLAY` (there's no standard
 /// equivalent way to reassign focus from an arbitrary client on Wayland);
 /// silently does nothing if either is missing, so the caller should still
 /// tell the user to click back into the terminal themselves as a fallback
 /// (see `App::start_scrub`'s log message). Runs the actual reactivation on
 /// its own thread after a short delay, so tff's own event loop isn't
-/// blocked waiting for mpv's window to finish appearing.
+/// blocked waiting for the player's window to finish appearing.
 #[cfg(unix)]
 pub fn try_refocus_terminal() {
     if std::env::var_os("DISPLAY").is_none() {

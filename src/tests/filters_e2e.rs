@@ -617,6 +617,25 @@ fn binary_from_uses_the_bare_name_or_joins_the_configured_directory() {
     assert!(joined.ends_with(expected_name), "{joined}");
 }
 
+/// A real ffplay status line (`"   12.34 A-V: -0.030 fd=..."`) should yield
+/// its leading time; any other line ffplay prints (banner/version info,
+/// the `Input #0 ...` block, blank fragments between two updates, etc.)
+/// should yield nothing, since `spawn_ffplay_position_reader` calls this
+/// once per `\r`/`\n`-delimited fragment of ffplay's raw stderr and only
+/// some of those are status lines at all.
+#[test]
+fn parse_ffplay_position_reads_the_leading_time_off_a_status_line() {
+    assert_eq!(ffmpeg::parse_ffplay_position("   12.34 A-V: -0.030 fd=   0 aq=    0KB"), Some(12.34));
+    assert_eq!(ffmpeg::parse_ffplay_position("0.00 A-V: -0.030 fd=   0 aq=    0KB"), Some(0.0));
+    assert_eq!(ffmpeg::parse_ffplay_position("ffplay version n8.1.2 Copyright (c) 2003-2026"), None);
+    assert_eq!(
+        ffmpeg::parse_ffplay_position("Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'test.mp4':"),
+        None
+    );
+    assert_eq!(ffmpeg::parse_ffplay_position(""), None);
+    assert_eq!(ffmpeg::parse_ffplay_position("   "), None);
+}
+
 /// mpv exiting non-zero -- whether because it's not installed, its own
 /// install is broken, or simply because /dev/null isn't a real media file
 /// -- should surface as an Err from play_in_terminal, not silently report
