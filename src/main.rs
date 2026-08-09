@@ -200,12 +200,28 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('x') => app.delete_focused_node(),
             KeyCode::Char('r') => app.start_render(),
             KeyCode::Char('p') => app.start_preview(),
+            KeyCode::Char('s') => app.start_scrub(),
             KeyCode::PageUp => app.scroll_log(false),
             KeyCode::PageDown => app.scroll_log(true),
             KeyCode::Esc => {
                 app.armed.clear();
                 app.selected.clear();
             }
+            _ => {}
+        },
+        Mode::Scrub => match key.code {
+            // Shift+Left/Right is checked ahead of the plain arms below
+            // since match picks the first hit, same as Normal mode's own
+            // Ctrl/Shift-then-plain ordering.
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => app.scrub_seek_relative(true),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => app.scrub_seek_relative(false),
+            KeyCode::Right | KeyCode::Char('l') => app.scrub_step_frame(true),
+            KeyCode::Left | KeyCode::Char('h') => app.scrub_step_frame(false),
+            KeyCode::Char(' ') => app.scrub_play_pause(),
+            KeyCode::Char('g') => app.start_scrub_seek(),
+            KeyCode::Char('i') => app.mark_scrub_point("start"),
+            KeyCode::Char('o') => app.mark_scrub_point("end"),
+            KeyCode::Esc | KeyCode::Char('q') => app.close_scrub(),
             _ => {}
         },
     }

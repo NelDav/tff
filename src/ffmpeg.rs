@@ -318,6 +318,160 @@ pub fn play_in_terminal(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Starts an mpv instance in its own window, playing `path` from
+/// `start_secs`, with its IPC server bound to `socket_path` -- lets
+/// `App::start_scrub` control it (seek, frame-step, query position) while
+/// the user watches the actual video, not a terminal approximation of it.
+/// Unlike `play`/`play_in_terminal`, left running detached and driven
+/// entirely through the socket from then on.
+#[cfg(unix)]
+pub fn spawn_scrub_mpv(path: &str, socket_path: &str, start_secs: f64) -> Result<std::process::Child> {
+    let _ = std::fs::remove_file(socket_path); // stale socket from a crashed session, if any
+    Command::new("mpv")
+        .args([
+            format!("--input-ipc-server={socket_path}"),
+            "--title=tff scrub".to_string(),
+            format!("--start={start_secs}"),
+            path.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn mpv (is it installed and on PATH?)")
+}
+
+/// mpv's IPC server binds a Unix domain socket -- there's no equivalent
+/// this reaches for on Windows (mpv uses a named pipe there instead, a
+/// different API), so scrubbing just isn't available there yet.
+#[cfg(not(unix))]
+pub fn spawn_scrub_mpv(_path: &str, _socket_path: &str, _start_secs: f64) -> Result<std::process::Child> {
+    bail!("scrubbing isn't supported on this platform yet (mpv's IPC socket is Unix-only)")
+}
+
+/// Best-effort: hands keyboard focus back to whatever window currently has
+/// it (this terminal, if called right before `spawn_scrub_mpv`) a moment
+/// later, since a freshly opened mpv window otherwise grabs focus itself --
+/// window managers focus newly mapped windows by default -- which would
+/// leave every `Mode::Scrub` keypress going to mpv's own bindings instead
+/// of tff's. Needs `xdotool` and an X11 `DISPLAY` (there's no standard
+/// equivalent way to reassign focus from an arbitrary client on Wayland);
+/// silently does nothing if either is missing, so the caller should still
+/// tell the user to click back into the terminal themselves as a fallback
+/// (see `App::start_scrub`'s log message). Runs the actual reactivation on
+/// its own thread after a short delay, so tff's own event loop isn't
+/// blocked waiting for mpv's window to finish appearing.
+#[cfg(unix)]
+pub fn try_refocus_terminal() {
+    if std::env::var_os("DISPLAY").is_none() {
+        return;
+    }
+    let Ok(output) = Command::new("xdotool").arg("getactivewindow").output() else {
+        return; // xdotool not installed -- nothing this can do
+    };
+    if !output.status.success() {
+        return;
+    }
+    let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if window_id.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let _ = Command::new("xdotool").args(["windowactivate", &window_id]).status();
+    });
+}
+
+#[cfg(not(unix))]
+pub fn try_refocus_terminal() {}
+
+/// One line of an mpv IPC reply: either an unsolicited event notification
+/// (`event` set, e.g. `{"event":"pause"}`, fired by the user interacting
+/// with mpv's own window between our commands) or a genuine reply to
+/// something we sent (`data` set to whatever that command returns, `null`
+/// for a fire-and-forget one like `seek`). See `mpv_command`.
+#[cfg(unix)]
+#[derive(Deserialize)]
+struct MpvReply {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+/// Sends one command to the mpv instance listening on `socket_path` (see
+/// `spawn_scrub_mpv`) and returns whatever it replies with. Opens a fresh
+/// connection per call rather than keeping one alive across the scrub
+/// session -- simpler lifetime (nothing to reconnect if mpv restarts) at
+/// the cost of a reconnect per command, which is fine for keys pressed one
+/// at a time. Retries the connect briefly since the socket file may not
+/// exist yet for a moment right after `spawn_scrub_mpv` returns.
+#[cfg(unix)]
+pub fn mpv_command(socket_path: &str, command: &[serde_json::Value]) -> Result<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let mut stream = None;
+    for _ in 0..20 {
+        match UnixStream::connect(socket_path) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let mut stream =
+        stream.context("couldn't reach mpv's IPC socket -- is the scrub session still running?")?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    writeln!(stream, "{}", serde_json::json!({ "command": command }))?;
+    stream.flush()?;
+
+    for line in BufReader::new(stream).lines() {
+        let line = line.context("lost connection to mpv while waiting for a reply")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply: MpvReply = serde_json::from_str(&line).context("couldn't parse mpv's reply")?;
+        if reply.event.is_some() {
+            continue; // not our command's reply -- keep reading
+        }
+        return Ok(reply.data.unwrap_or(serde_json::Value::Null));
+    }
+    bail!("mpv closed the connection without replying")
+}
+
+#[cfg(not(unix))]
+pub fn mpv_command(_socket_path: &str, _command: &[serde_json::Value]) -> Result<serde_json::Value> {
+    bail!("scrubbing isn't supported on this platform yet (mpv's IPC socket is Unix-only)")
+}
+
+pub fn mpv_get_time_pos(socket_path: &str) -> Result<f64> {
+    mpv_command(socket_path, &[serde_json::json!("get_property"), serde_json::json!("time-pos")])?
+        .as_f64()
+        .context("mpv didn't report a numeric time-pos (is anything loaded?)")
+}
+
+pub fn mpv_seek_absolute(socket_path: &str, secs: f64) -> Result<()> {
+    mpv_command(socket_path, &[serde_json::json!("seek"), serde_json::json!(secs), serde_json::json!("absolute")])
+        .map(|_| ())
+}
+
+pub fn mpv_seek_relative(socket_path: &str, delta_secs: f64) -> Result<()> {
+    mpv_command(socket_path, &[serde_json::json!("seek"), serde_json::json!(delta_secs), serde_json::json!("relative")])
+        .map(|_| ())
+}
+
+pub fn mpv_frame_step(socket_path: &str, forward: bool) -> Result<()> {
+    let cmd = if forward { "frame-step" } else { "frame-back-step" };
+    mpv_command(socket_path, &[serde_json::json!(cmd)]).map(|_| ())
+}
+
+pub fn mpv_toggle_pause(socket_path: &str) -> Result<()> {
+    mpv_command(socket_path, &[serde_json::json!("cycle"), serde_json::json!("pause")]).map(|_| ())
+}
+
 /// Spawn ffmpeg with the given arguments, streaming stdout+stderr lines
 /// through `tx` as they arrive, and a final "__DONE__<code>" sentinel line.
 /// Intended to run on its own thread; owns everything it needs ('static).

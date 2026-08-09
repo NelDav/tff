@@ -47,7 +47,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect) {
     let line = TextLine::from(
-        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  ←→ scroll text  Shift+←→ resize  a add-node  o output-path  c arm/connect  d disconnect  e edit  f container  x delete-node  r render  p preview  q quit ",
+        " tff — node-based ffmpeg  │  Tab focus  ↑↓ row  hjkl move  ←→ scroll text  Shift+←→ resize  a add-node  o output-path  c arm/connect  d disconnect  e edit  f container  x delete-node  r render  p preview  s scrub (trim node)  q quit ",
     )
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_widget(Paragraph::new(line), area);
@@ -87,6 +87,7 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
                     crate::app::ChapterTimeField::End => "end (HH:MM:SS or seconds): ".to_string(),
                 },
                 crate::app::TextTarget::ChapterTitle { .. } => "chapter title: ".to_string(),
+                crate::app::TextTarget::ScrubSeek => "jump to (HH:MM:SS or seconds): ".to_string(),
             };
             // A reversed-video block over whatever's at the cursor (or a
             // blank block past the last character) shows the insertion
@@ -117,6 +118,11 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Mode::ChapterTable { .. } => TextLine::from(Span::styled(
             "↑↓/jk row · ←→/hl/Tab column · Enter edit/add · d delete · Esc close",
+            Style::default().fg(Color::Yellow),
+        )),
+        Mode::Scrub => TextLine::from(Span::styled(
+            "keys go here, not mpv's window · space play/pause · h/l step frame · Shift+←→ seek 1s · \
+             g jump to time · i/o mark start/end · Esc close",
             Style::default().fg(Color::Yellow),
         )),
         Mode::Normal => {

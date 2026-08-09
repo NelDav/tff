@@ -154,6 +154,7 @@ impl App {
                 row: *index,
                 col: ChapterColumn::Title,
             },
+            TextTarget::ScrubSeek => Mode::Scrub,
             _ => Mode::Normal,
         };
     }
@@ -344,6 +345,18 @@ impl App {
                     row: index,
                     col: ChapterColumn::Title,
                 };
+            }
+            TextTarget::ScrubSeek => {
+                match crate::graph::parse_time(&buffer) {
+                    Some(secs) => self.scrub_seek_absolute(secs),
+                    None => {
+                        self.log.push(format!(
+                            "couldn't parse '{}' as a time -- try seconds (12.5) or HH:MM:SS",
+                            buffer.trim()
+                        ));
+                    }
+                }
+                self.mode = Mode::Scrub;
             }
         }
     }

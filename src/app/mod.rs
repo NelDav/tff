@@ -4,6 +4,7 @@ mod navigation;
 mod nodes;
 mod picker;
 mod render;
+mod scrub;
 mod text_input;
 
 pub use chapters::ChapterColumn;
@@ -67,6 +68,11 @@ pub enum TextTarget {
         modifier: NodeId,
         index: usize,
     },
+    /// Typing an absolute time to seek the active scrub session's mpv
+    /// instance to (see `Mode::Scrub`). No fields: there's only ever one
+    /// scrub session (`App::scrub`) at a time, so there's nothing to
+    /// disambiguate.
+    ScrubSeek,
 }
 
 /// Which of a chapter's two time fields a `ChapterTime` text-input session
@@ -178,6 +184,17 @@ pub enum Mode {
         row: usize,
         col: ChapterColumn,
     },
+    /// A live scrub session (see `scrub::ScrubSession`, held on `App::scrub`
+    /// while this is active -- that's where the modifier being scrubbed is
+    /// tracked, not here) driving an external mpv window -- playback and
+    /// mark-in/mark-out keys are only meaningful while this is the mode, so
+    /// they get their own dedicated bindings in `main.rs` rather than
+    /// living alongside Normal mode's graph-navigation ones. Reached via
+    /// 's' on a focused Trim modifier with a connected, non-`Concat` source
+    /// (see `App::start_scrub`). Focus can't change while this is active
+    /// (`main.rs` gives this mode no navigation keys), so it stays pinned
+    /// on the modifier being scrubbed for the whole session.
+    Scrub,
 }
 
 pub struct App {
@@ -254,6 +271,12 @@ pub struct App {
     /// than fully private like `available_encoders`/`available_muxers`,
     /// which only ever get read from within `app` itself.
     pub(crate) has_teletext_decoder: bool,
+    /// The live mpv process/socket behind an active `Mode::Scrub` session,
+    /// if any -- `None` outside of one. See `scrub::ScrubSession`. Only
+    /// `app` itself ever constructs or mutates a `ScrubSession`, but
+    /// `pub(crate)` (rather than fully private) so tests can assert one
+    /// wasn't started, same reasoning as `has_teletext_decoder`.
+    pub(crate) scrub: Option<scrub::ScrubSession>,
 }
 
 impl App {
@@ -289,6 +312,7 @@ impl App {
             available_encoders,
             available_muxers,
             has_teletext_decoder,
+            scrub: None,
         }
     }
 

@@ -1151,6 +1151,87 @@ fn trim_time_field_rejects_unparseable_input() {
     assert!(app.log.last().unwrap().contains("couldn't parse"), "{:?}", app.log.last());
 }
 
+/// 's' with anything other than a Trim modifier focused should refuse to
+/// start a scrub session, before ever touching a process/socket -- these
+/// all exercise the validation path only, so no real mpv is involved.
+#[test]
+fn start_scrub_requires_a_trim_modifier_focused() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    app.focus = Focus::Output(0);
+    app.start_scrub();
+    assert!(app.log.last().unwrap().contains("focus a trim node first"), "{:?}", app.log.last());
+
+    let modifier = app.graph.add_modifier(ModifierKind::Metadata { fields: BTreeMap::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+    app.start_scrub();
+    assert!(app.log.last().unwrap().contains("only a trim node can be scrubbed"), "{:?}", app.log.last());
+}
+
+/// A Trim modifier with nothing wired into its input has no source to
+/// scrub -- should be rejected the same way every other "connect this
+/// first" action is.
+#[test]
+fn start_scrub_requires_a_connected_source() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: BTreeMap::new() });
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.start_scrub();
+
+    assert!(app.log.last().unwrap().contains("connect a stream to this node first"), "{:?}", app.log.last());
+    assert!(app.scrub.is_none(), "no session should have started");
+}
+
+/// A Trim node whose upstream chain is broken (a modifier with nothing
+/// feeding *it*) has no resolvable source either.
+#[test]
+fn start_scrub_rejects_a_broken_chain() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let upstream = app.graph.add_modifier(ModifierKind::Convert(Codec::Copy)); // nothing wired into this
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: BTreeMap::new() });
+    app.graph.connect(Endpoint::ModifierOut(upstream), Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.start_scrub();
+
+    assert!(app.log.last().unwrap().contains("broken chain"), "{:?}", app.log.last());
+    assert!(app.scrub.is_none(), "no session should have started");
+}
+
+/// A Trim node fed by a Concat node's output has no single file to open
+/// in mpv (the joined timeline only exists as a virtual filtergraph, not
+/// a file on disk) -- should be refused with a clear, actionable message
+/// rather than failing obscurely trying to resolve a path.
+#[test]
+fn start_scrub_rejects_a_concat_upstream_source() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let a = app.graph.add_input("a.mp4".to_string(), video_stream(), Vec::new());
+    let b = app.graph.add_input("b.mp4".to_string(), video_stream(), Vec::new());
+    let concat = app.graph.add_modifier(ModifierKind::Concat);
+    app.graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    app.graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+    let modifier = app.graph.add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: BTreeMap::new() });
+    app.graph.connect(Endpoint::ModifierOut(concat), Target::ModifierIn(modifier));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+    app.focus = Focus::Modifier(modifier_idx);
+
+    app.start_scrub();
+
+    assert!(app.log.last().unwrap().contains("can't scrub a concatenated source"), "{:?}", app.log.last());
+    assert!(app.scrub.is_none(), "no session should have started");
+}
+
 /// A field with a fixed set of valid values (Rotate's "direction") should
 /// offer a selection picker instead of free-text entry -- ffmpeg only
 /// accepts a handful of exact strings there, so anything else typed is
