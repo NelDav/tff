@@ -261,6 +261,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('e') => app.activate_focused(),
             KeyCode::Char('f') => app.open_container_picker(),
             KeyCode::Char('x') => app.delete_focused_node(),
+            KeyCode::Char('y') => app.duplicate_focused_node(),
             KeyCode::Char('r') => app.start_render(),
             KeyCode::Char('p') => app.start_preview(),
             KeyCode::Char('s') => app.start_scrub(),

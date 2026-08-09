@@ -1504,6 +1504,132 @@ fn add_output_node_appends_and_focuses_it() {
     assert!(matches!(app.focus, Focus::Output(1)));
 }
 
+/// 'y' on a focused input should append a second input node with the same
+/// path/streams/chapters/extra_args (a fresh re-derivation, not literally
+/// the same `Vec`s), leave the original untouched, and focus the new one --
+/// an input has nothing "incoming" to copy, so this is the whole check.
+#[test]
+fn duplicate_focused_node_on_input_copies_config_not_wires() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input(
+        "in.mp4".to_string(),
+        video_audio_streams(),
+        vec![Chapter::new(0.0, 10.0, "one".to_string())],
+    );
+    app.graph.input_mut(id).unwrap().extra_args = filter_fields(&[("itsoffset", "1.5")]);
+    let out = app.graph.outputs[0].id;
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+
+    app.focus = Focus::Input(0);
+    app.duplicate_focused_node();
+
+    assert_eq!(app.graph.inputs.len(), 2);
+    assert!(matches!(app.focus, Focus::Input(1)));
+    let (original, duplicate) = (&app.graph.inputs[0], &app.graph.inputs[1]);
+    assert_eq!(duplicate.path, original.path);
+    assert_eq!(duplicate.streams.len(), original.streams.len(), "including the derived chapter-stream row");
+    assert_eq!(duplicate.chapters.len(), 1);
+    assert_eq!(duplicate.extra_args.get("itsoffset"), Some(&"1.5".to_string()));
+    assert_eq!(app.graph.outgoing(Endpoint::Stream { node: duplicate.id, stream_idx: 0 }).len(), 0, "no wires copied");
+    assert_eq!(
+        app.graph.outgoing(Endpoint::Stream { node: original.id, stream_idx: 0 }).len(),
+        1,
+        "original's own wire must be untouched"
+    );
+}
+
+/// 'y' on a focused modifier should append a second one of the same kind
+/// with the same fields, wired to the same source(s) the original has (so
+/// e.g. duplicating a Concat node copies every one of its segments), but
+/// not wired to anywhere the original's *output* already feeds.
+#[test]
+fn duplicate_focused_node_on_modifier_copies_kind_and_incoming_wires() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = app.graph.add_modifier(ModifierKind::Metadata { fields: metadata_fields(&[("language", "eng")]) });
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    let out = app.graph.outputs[0].id;
+    app.graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+    let modifier_idx = app.graph.modifiers.iter().position(|m| m.id == modifier).unwrap();
+
+    app.focus = Focus::Modifier(modifier_idx);
+    app.duplicate_focused_node();
+
+    assert_eq!(app.graph.modifiers.len(), 2);
+    assert!(matches!(app.focus, Focus::Modifier(1)));
+    let duplicate_id = app.graph.modifiers[1].id;
+    let ModifierKind::Metadata { fields } = &app.graph.modifiers[1].kind else { panic!("wrong kind") };
+    assert_eq!(fields.get("language"), Some(&"eng".to_string()));
+    assert_eq!(
+        app.graph.incoming(Target::ModifierIn(duplicate_id)).len(),
+        1,
+        "the incoming wire should be copied"
+    );
+    assert!(app.graph.outgoing(Endpoint::ModifierOut(duplicate_id)).is_empty(), "no outgoing wire copied");
+    assert_eq!(
+        app.graph.outgoing(Endpoint::ModifierOut(modifier)).len(),
+        1,
+        "original's own outgoing wire must be untouched"
+    );
+}
+
+/// 'y' on a focused output should append a second one with the same
+/// container/extra_args and every mapped stream (plus chapters, if any)
+/// the original has, but a distinct default path so the two don't
+/// silently collide.
+#[test]
+fn duplicate_focused_node_on_output_copies_settings_and_incoming_wires() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    let id = app.graph.add_input(
+        "in.mp4".to_string(),
+        video_stream(),
+        vec![Chapter::new(0.0, 10.0, "one".to_string())],
+    );
+    let out = app.graph.outputs[0].id;
+    app.graph.outputs[0].path = "output.mkv".to_string();
+    app.graph.outputs[0].container = Some("matroska".to_string());
+    app.graph.outputs[0].extra_args = filter_fields(&[("movflags", "+faststart")]);
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::OutputChapters(out));
+
+    app.focus = Focus::Output(0);
+    app.duplicate_focused_node();
+
+    assert_eq!(app.graph.outputs.len(), 2);
+    assert!(matches!(app.focus, Focus::Output(1)));
+    let duplicate = &app.graph.outputs[1];
+    assert_eq!(duplicate.path, "output-copy.mkv", "should get a distinct default path, not collide with the original");
+    assert_eq!(duplicate.container, Some("matroska".to_string()));
+    assert_eq!(duplicate.extra_args.get("movflags"), Some(&"+faststart".to_string()));
+    assert_eq!(app.graph.incoming(Target::Output(duplicate.id)).len(), 1);
+    assert_eq!(app.graph.incoming(Target::OutputChapters(duplicate.id)).len(), 1);
+    assert_eq!(app.graph.incoming(Target::Output(out)).len(), 1, "original's own mapping must be untouched");
+}
+
+/// Duplicating an output whose default "-copy" path is already taken by a
+/// third output should keep incrementing until it finds a free one.
+#[test]
+fn duplicate_focused_node_on_output_increments_past_an_existing_copy_path() {
+    use crate::app::{App, Focus};
+
+    let mut app = App::new();
+    app.graph.outputs[0].path = "output.mkv".to_string();
+    app.graph.add_output();
+    app.graph.outputs[1].path = "output-copy.mkv".to_string();
+
+    app.focus = Focus::Output(0);
+    app.duplicate_focused_node();
+
+    assert_eq!(app.graph.outputs.len(), 3);
+    assert_eq!(app.graph.outputs[2].path, "output-copy2.mkv");
+}
+
 /// Picker escape/search machinery is generic over picker kind -- verify it
 /// works correctly when opened via the modifier-based codec picker.
 #[test]

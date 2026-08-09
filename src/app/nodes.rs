@@ -2,7 +2,7 @@ use super::chapters::{chapter_edit_modifiers_fed_by, sync_chapter_edit_import};
 use super::picker::{disposition_picker_options, field_picker_options, picker_options, prioritize_and_extend, selected_index};
 use super::text_input::{path_suggestions, text_input_mode};
 use super::{App, ExtraArgsTarget, Focus, Mode, PickerEntry, PickerKind, TextTarget};
-use crate::graph::{Codec, Endpoint, ModifierKind, NodeId, StreamKind, Target};
+use crate::graph::{Codec, Endpoint, ModifierKind, NodeId, OutputNode, StreamKind, Target};
 
 impl App {
     /// Reached via the 'a' node picker's "input file..." entry -- prompts
@@ -334,5 +334,130 @@ impl App {
                 );
             }
         }
+    }
+
+    /// 'y': duplicate the focused node -- same settings (path/streams/
+    /// chapters/extra_args for an input, kind/fields for a modifier, path/
+    /// container/extra_args for an output), positioned just below-right of
+    /// the original and focused immediately, mirroring the other "add a
+    /// node" actions. A modifier's or output's *incoming* wire(s) are
+    /// copied too (so a duplicate starts already wired to the same
+    /// source(s) -- the usual reason to duplicate one of these is "same
+    /// input, slightly different settings", and an output's chapters wire
+    /// comes along the same way), but outgoing wires never are, and
+    /// neither are an input's (it has none to speak of): a duplicate that
+    /// quietly fanned its result into whatever the original already feeds
+    /// would create a second, easy-to-miss parallel path into that same
+    /// destination.
+    pub fn duplicate_focused_node(&mut self) {
+        match self.focus {
+            Focus::Input(i) => {
+                let Some(node) = self.graph.inputs.get(i) else { return };
+                let path = node.path.clone();
+                // Passed back through `add_input` raw (no synthetic
+                // chapter-stream entry, no `extra_args`) -- it derives that
+                // entry itself from `chapters`, so re-including one already
+                // baked into `node.streams` would double it up.
+                let streams: Vec<_> =
+                    node.streams.iter().filter(|s| s.kind != StreamKind::Chapter).cloned().collect();
+                let chapters = node.chapters.clone();
+                let extra_args = node.extra_args.clone();
+                let pos = (node.pos.0 + 2.0, node.pos.1 + 2.0);
+                let width = node.width;
+
+                let id = self.graph.add_input(path, streams, chapters);
+                if let Some(new_node) = self.graph.input_mut(id) {
+                    new_node.extra_args = extra_args;
+                    new_node.pos = pos;
+                    new_node.width = width;
+                }
+                self.set_focus_index(self.graph.inputs.len() - 1);
+                self.log.push("duplicated input node".to_string());
+            }
+            Focus::Modifier(i) => {
+                let Some(node) = self.graph.modifiers.get(i) else { return };
+                let old_id = node.id;
+                let kind = node.kind.clone();
+                let pos = (node.pos.0 + 2.0, node.pos.1 + 2.0);
+                let width = node.width;
+                let incoming: Vec<Endpoint> = self
+                    .graph
+                    .incoming(Target::ModifierIn(old_id))
+                    .into_iter()
+                    .map(|wi| self.graph.wires[wi].from)
+                    .collect();
+
+                let id = self.graph.add_modifier(kind);
+                if let Some(new_node) = self.graph.modifier_mut(id) {
+                    new_node.pos = pos;
+                    new_node.width = width;
+                }
+                for from in incoming {
+                    self.graph.connect(from, Target::ModifierIn(id));
+                }
+                self.set_focus_index(self.graph.inputs.len() + self.graph.modifiers.len() - 1);
+                self.log.push("duplicated modifier node".to_string());
+            }
+            Focus::Output(i) => {
+                let Some(node) = self.graph.outputs.get(i) else { return };
+                let old_id = node.id;
+                let path = duplicate_output_path(&node.path, &self.graph.outputs);
+                let container = node.container.clone();
+                let extra_args = node.extra_args.clone();
+                let pos = (node.pos.0 + 2.0, node.pos.1 + 2.0);
+                let width = node.width;
+                let incoming: Vec<Endpoint> = self
+                    .graph
+                    .incoming(Target::Output(old_id))
+                    .into_iter()
+                    .map(|wi| self.graph.wires[wi].from)
+                    .collect();
+                let chapter_from = self
+                    .graph
+                    .incoming(Target::OutputChapters(old_id))
+                    .into_iter()
+                    .next()
+                    .map(|wi| self.graph.wires[wi].from);
+
+                let id = self.graph.add_output();
+                if let Some(new_node) = self.graph.output_mut(id) {
+                    new_node.path = path;
+                    new_node.container = container;
+                    new_node.extra_args = extra_args;
+                    new_node.pos = pos;
+                    new_node.width = width;
+                }
+                for from in incoming {
+                    self.graph.connect(from, Target::Output(id));
+                }
+                if let Some(from) = chapter_from {
+                    self.graph.connect(from, Target::OutputChapters(id));
+                }
+                self.set_focus_index(self.node_count() - 1);
+                self.log.push("duplicated output node".to_string());
+            }
+        }
+    }
+}
+
+/// A duplicate output's default path: the original's with "-copy" (or
+/// "-copy2", "-copy3", ...) inserted before the extension, stopping at the
+/// first variant not already used by another output -- two outputs writing
+/// to the exact same path isn't something ffmpeg can do sensibly, so the
+/// duplicate needs *some* distinct starting point even though 'o' can
+/// always retarget it afterward.
+fn duplicate_output_path(original: &str, existing: &[OutputNode]) -> String {
+    let (stem, ext) = match original.rfind('.') {
+        Some(idx) if idx > 0 => (&original[..idx], &original[idx..]),
+        _ => (original, ""),
+    };
+    let mut n = 1;
+    loop {
+        let suffix = if n == 1 { "-copy".to_string() } else { format!("-copy{n}") };
+        let candidate = format!("{stem}{suffix}{ext}");
+        if !existing.iter().any(|o| o.path == candidate) {
+            return candidate;
+        }
+        n += 1;
     }
 }
