@@ -591,9 +591,23 @@ pub fn mpv_seek_absolute(socket_path: &str, secs: f64) -> Result<()> {
         .map(|_| ())
 }
 
+/// A relative seek defaults to mpv's "keyframes" precision mode (fast, but
+/// snaps to the nearest keyframe rather than landing exactly `delta_secs`
+/// away -- verified against `man mpv`'s `seek` entry: "By default,
+/// keyframes is used for relative, relative-percent, and absolute-percent
+/// seeks, while exact is used for absolute seeks"). For hunting a trim
+/// point, landing exactly where asked matters more than the extra
+/// decoding work exact seeking costs, so this asks for `relative+exact`
+/// explicitly rather than taking the imprecise default -- without it, how
+/// far Shift+Left/Right actually moves depends on how far apart the
+/// source's keyframes happen to be, which is exactly the "sometimes
+/// doesn't seem to go back a second" inconsistency this fixes.
 pub fn mpv_seek_relative(socket_path: &str, delta_secs: f64) -> Result<()> {
-    mpv_command(socket_path, &[serde_json::json!("seek"), serde_json::json!(delta_secs), serde_json::json!("relative")])
-        .map(|_| ())
+    mpv_command(
+        socket_path,
+        &[serde_json::json!("seek"), serde_json::json!(delta_secs), serde_json::json!("relative+exact")],
+    )
+    .map(|_| ())
 }
 
 pub fn mpv_frame_step(socket_path: &str, forward: bool) -> Result<()> {
@@ -603,6 +617,25 @@ pub fn mpv_frame_step(socket_path: &str, forward: bool) -> Result<()> {
 
 pub fn mpv_toggle_pause(socket_path: &str) -> Result<()> {
     mpv_command(socket_path, &[serde_json::json!("cycle"), serde_json::json!("pause")]).map(|_| ())
+}
+
+/// Explicitly sets mpv's pause state (as opposed to `mpv_toggle_pause`,
+/// which flips whatever it currently is) -- `App::start_scrub` uses this to
+/// start every mpv session paused. Verified directly against a real mpv
+/// instance that this matters a great deal: with playback still running,
+/// a "seek back 1s"/frame-back-step only nets whatever it manages to claw
+/// back before normal forward playback erodes it again by the time the
+/// next command arrives, which can leave backward navigation looking
+/// almost entirely broken (repeated `-1s` seeks *creeping forward* was
+/// observed in that test) even though the seek itself lands exactly right
+/// every time once actually paused. Starting paused via `--pause` on the
+/// command line was tried first and rejected: verified to leave the
+/// player in a state where every subsequent seek silently no-ops (`time-pos`
+/// never changes) -- setting the property over IPC after the process is
+/// already up and running, as this does, doesn't have that problem.
+pub fn mpv_set_pause(socket_path: &str, pause: bool) -> Result<()> {
+    mpv_command(socket_path, &[serde_json::json!("set_property"), serde_json::json!("pause"), serde_json::json!(pause)])
+        .map(|_| ())
 }
 
 /// Spawn ffmpeg with the given arguments, streaming stdout+stderr lines

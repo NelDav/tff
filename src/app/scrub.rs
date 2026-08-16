@@ -141,6 +141,21 @@ impl App {
         let socket_path = std::env::temp_dir().join(format!("tff-scrub-{mid}.sock")).to_string_lossy().into_owned();
         match ffmpeg::spawn_scrub_mpv(&path, &socket_path, start_secs, !has_display) {
             Ok(child) => {
+                // Starts paused: with playback still running, a backward
+                // seek/frame-step only nets whatever it claws back before
+                // normal forward playback erodes it again by the time the
+                // next command arrives -- verified directly that this can
+                // leave backward navigation looking almost entirely broken
+                // (repeated "-1s" seeks net *creeping forward*), even
+                // though each one lands exactly right once actually
+                // paused. Forward navigation never had this problem
+                // (it's reinforced by, not fighting, live playback), which
+                // is why only backward ever seemed unreliable. Space still
+                // toggles play/pause normally from here if the user wants
+                // to watch a stretch before pinpointing a spot.
+                if let Err(e) = ffmpeg::mpv_set_pause(&socket_path, true) {
+                    self.log.push(format!("couldn't pause mpv on start: {e:#}"));
+                }
                 self.scrub =
                     Some(ScrubSession { modifier_id: mid, path, child, backend: ScrubBackend::Mpv { socket_path, headless: !has_display } });
                 self.mode = Mode::Scrub;
