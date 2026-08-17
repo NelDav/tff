@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use super::node::FilterName;
 use super::stream::{Codec, StreamKind};
 use super::NodeId;
@@ -8,7 +10,8 @@ use super::NodeId;
 /// file, or the (single, always-transformed) output of a modifier node.
 /// Ordered so a set of these (see `App::armed`/`App::selected`) has a
 /// stable iteration order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Endpoint {
     Stream { node: NodeId, stream_idx: usize },
     ModifierOut(NodeId),
@@ -19,7 +22,8 @@ pub enum Endpoint {
 /// accepts any number, appended in wire order -- see `Graph::connect`), an
 /// output file's mapped-stream list (also any number), or an output's
 /// chapters slot (single wire, like an ordinary modifier's input).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Target {
     ModifierIn(NodeId),
     Output(NodeId),
@@ -30,7 +34,7 @@ pub enum Target {
 /// -- all transformation happens in the modifier nodes along the chain a
 /// wire is part of, resolved by walking backward from an output (see
 /// `Graph::resolve`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Wire {
     pub from: Endpoint,
     pub to: Target,

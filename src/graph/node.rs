@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use super::chapter::Chapter;
 use super::stream::{Codec, StreamInfo, StreamKind};
 use super::NodeId;
@@ -29,8 +31,18 @@ pub struct InputNode {
     pub extra_args: BTreeMap<String, String>,
     pub pos: (f64, f64),
     pub width: u16,
+    /// Set when this node was reconstructed from a saved project file and
+    /// the file at `path` couldn't be re-probed (moved, deleted, on a
+    /// filesystem that isn't mounted right now, ...) -- `streams`/
+    /// `chapters` are then whatever was saved rather than fresh probe
+    /// results, and `ui` renders the node grayed out to flag that they
+    /// might be stale. Always `false` for a node added the normal way
+    /// (`add_input`, which always probes successfully before a node is
+    /// ever created at all). See `Graph::from_project_file`.
+    pub file_missing: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct OutputNode {
     pub id: NodeId,
     pub path: String,
@@ -140,7 +152,8 @@ pub fn disposition_flags() -> &'static [&'static str] {
 /// A filter-based effect: unlike Convert/Metadata/Disposition (which only
 /// ever emit `-c`/`-metadata`/`-disposition` stream-specifier flags), these
 /// need a real `-filter_complex` graph, built in `build_output_section`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FilterName {
     /// Delay a track by N seconds to fix an audio/video sync offset.
     Shift,
@@ -325,7 +338,8 @@ impl FilterName {
 }
 
 /// What a modifier node does to whatever stream flows through it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ModifierKind {
     Convert(Codec),
     /// Arbitrary `-metadata:s:<i> key=value` pairs, keyed by field name.
@@ -398,6 +412,7 @@ impl ModifierKind {
 /// stream and an output, with exactly one incoming connection (it only
 /// ever transforms a single stream at a time) but any number of outgoing
 /// ones, so the same converted/tagged result can feed several outputs.
+#[derive(Serialize, Deserialize)]
 pub struct ModifierNode {
     pub id: NodeId,
     pub kind: ModifierKind,

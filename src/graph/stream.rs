@@ -1,6 +1,9 @@
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamKind {
     Video,
     Audio,
@@ -45,7 +48,8 @@ impl StreamKind {
 /// encoder name. The name is an owned `String` because the real option
 /// list is discovered at runtime from `ffmpeg -encoders`
 /// (see `ffmpeg::list_encoders`), not fixed at compile time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Codec {
     Copy,
     Encode(String),
@@ -88,7 +92,7 @@ impl Codec {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamInfo {
     /// Absolute stream index within the source file, as reported by ffprobe.
     pub index: usize,

@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use super::NodeId;
 
 /// One chapter marker. Ordering in a `ModifierKind::ChapterEdit` node's
@@ -6,7 +8,7 @@ use super::NodeId;
 /// chapter's start from the *last* entry's end, which matches the natural
 /// workflow of building a chapter list forward through the timeline
 /// without needing to re-sort.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Chapter {
     pub start_secs: f64,
     pub end_secs: f64,

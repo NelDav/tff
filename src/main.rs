@@ -1,6 +1,7 @@
 mod app;
 mod ffmpeg;
 mod graph;
+mod project;
 #[cfg(test)]
 mod tests;
 mod ui;
@@ -248,8 +249,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char(' ') => app.toggle_port_selection(),
             // Ctrl+A selects every port on the focused node; checked ahead
             // of the plain 'a' arm below (add-node picker) since match
-            // picks the first hit.
+            // picks the first hit. Ctrl+S/Ctrl+O (save/load project) are
+            // likewise checked ahead of the plain 's' (scrub) and 'o'
+            // (edit output path) arms below.
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => app.select_all_ports(),
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_save_project(),
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => app.start_load_project(),
             KeyCode::Char('h') => app.move_focused_node(-1.0, 0.0),
             KeyCode::Char('l') => app.move_focused_node(1.0, 0.0),
             KeyCode::Char('k') => app.move_focused_node(0.0, -1.0),

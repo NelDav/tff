@@ -3,6 +3,7 @@ mod connect;
 mod navigation;
 mod nodes;
 mod picker;
+mod project;
 mod render;
 mod scrub;
 mod text_input;
@@ -73,6 +74,11 @@ pub enum TextTarget {
     /// scrub session (`App::scrub`) at a time, so there's nothing to
     /// disambiguate.
     ScrubSeek,
+    /// Typing the path to save the current graph to (see `App::start_save_project`).
+    SaveProjectPath,
+    /// Typing the path to load a graph from, replacing the current one
+    /// (see `App::start_load_project`).
+    LoadProjectPath,
 }
 
 /// Which of a chapter's two time fields a `ChapterTime` text-input session

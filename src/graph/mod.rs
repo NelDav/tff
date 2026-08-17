@@ -1,5 +1,6 @@
 mod chapter;
 mod node;
+mod project;
 mod stream;
 mod wire;
 
@@ -8,6 +9,7 @@ pub use node::{
     disposition_flags, input_extra_arg_keys, metadata_keys_for, output_extra_arg_keys, FilterName, InputNode,
     ModifierKind, ModifierNode, OutputNode,
 };
+pub use project::{ProjectFile, SavedInput, PROJECT_FORMAT_VERSION};
 pub use stream::{Codec, StreamInfo, StreamKind};
 pub use wire::{Endpoint, Resolved, Target, Wire};
 
@@ -26,6 +28,24 @@ fn extra_arg_tokens(args: &BTreeMap<String, String>) -> impl Iterator<Item = Str
         }
         tokens
     })
+}
+
+/// Appends the synthetic `StreamKind::Chapter` entry `add_input`'s own doc
+/// comment describes (when `chapters` is non-empty) to a *raw* probed/saved
+/// stream list -- shared by `add_input` and `Graph::from_project_file` so a
+/// project file only ever needs to carry the raw list (see
+/// `project::SavedInput`), not a second, easy-to-desync copy of this
+/// derivation.
+fn streams_with_chapter_marker(mut streams: Vec<StreamInfo>, chapters: &[Chapter]) -> Vec<StreamInfo> {
+    if !chapters.is_empty() {
+        streams.push(StreamInfo {
+            index: 0, // unused for chapters -- there's no per-file stream index to map by
+            kind: StreamKind::Chapter,
+            codec: chapters.len().to_string(),
+            lang: None,
+        });
+    }
+    streams
 }
 
 pub struct Graph {
@@ -56,18 +76,11 @@ impl Graph {
     /// `StreamKind::Chapter` entry is appended to `streams` so the chapter
     /// list becomes one more wireable port on this node, exactly like a
     /// real video/audio stream.
-    pub fn add_input(&mut self, path: String, mut streams: Vec<StreamInfo>, chapters: Vec<Chapter>) -> NodeId {
+    pub fn add_input(&mut self, path: String, streams: Vec<StreamInfo>, chapters: Vec<Chapter>) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
         let file_index = self.inputs.len();
-        if !chapters.is_empty() {
-            streams.push(StreamInfo {
-                index: 0, // unused for chapters -- there's no per-file stream index to map by
-                kind: StreamKind::Chapter,
-                codec: chapters.len().to_string(),
-                lang: None,
-            });
-        }
+        let streams = streams_with_chapter_marker(streams, &chapters);
         let y = 2.0 + (self.inputs.len() as f64) * 12.0;
         self.inputs.push(InputNode {
             id,
@@ -78,6 +91,7 @@ impl Graph {
             extra_args: BTreeMap::new(),
             pos: (2.0, y),
             width: 34,
+            file_missing: false,
         });
         id
     }
@@ -663,5 +677,76 @@ impl Graph {
         }
         args.extend(section);
         Some(args)
+    }
+
+    /// Snapshots this graph into the serializable shape `crate::project`
+    /// writes to disk -- see `ProjectFile`/`SavedInput` for what's kept and
+    /// why (notably: an input's *raw* stream list, not the one with the
+    /// synthetic chapter-stream entry already applied).
+    pub fn to_project_file(&self) -> ProjectFile {
+        ProjectFile {
+            version: PROJECT_FORMAT_VERSION,
+            inputs: self.inputs.iter().map(SavedInput::from_node).collect(),
+            modifiers: self
+                .modifiers
+                .iter()
+                .map(|m| ModifierNode { id: m.id, kind: m.kind.clone(), pos: m.pos, width: m.width })
+                .collect(),
+            outputs: self
+                .outputs
+                .iter()
+                .map(|o| OutputNode {
+                    id: o.id,
+                    path: o.path.clone(),
+                    container: o.container.clone(),
+                    extra_args: o.extra_args.clone(),
+                    pos: o.pos,
+                    width: o.width,
+                })
+                .collect(),
+            wires: self.wires.clone(),
+            next_id: self.next_id,
+        }
+    }
+
+    /// Rebuilds a `Graph` from a loaded `ProjectFile`. `reprobe` is called
+    /// once per saved input with its path -- `Some((streams, chapters))` on
+    /// a successful fresh probe (used in place of whatever was saved, so a
+    /// file re-encoded since the last save is picked up correctly), `None`
+    /// if it couldn't be probed at all (moved, deleted, ...), in which case
+    /// the *saved* streams/chapters are used instead and the node is
+    /// flagged `file_missing` so `ui` can render it accordingly -- the
+    /// graph's structure and wires stay fully intact either way, since
+    /// wires only reference node ids, never stream data directly. `Graph`
+    /// stays free of file I/O itself, same convention `build_ffmpeg_args`'s
+    /// `chapter_files` parameter already follows -- `crate::project::load`
+    /// is what actually calls `ffmpeg::probe` and passes the result here.
+    pub fn from_project_file(file: ProjectFile, mut reprobe: impl FnMut(&str) -> Option<(Vec<StreamInfo>, Vec<Chapter>)>) -> Graph {
+        let mut inputs = Vec::with_capacity(file.inputs.len());
+        for (file_index, saved) in file.inputs.into_iter().enumerate() {
+            let (raw_streams, chapters, file_missing) = match reprobe(&saved.path) {
+                Some((streams, chapters)) => (streams, chapters, false),
+                None => (saved.streams, saved.chapters, true),
+            };
+            let streams = streams_with_chapter_marker(raw_streams, &chapters);
+            inputs.push(InputNode {
+                id: saved.id,
+                path: saved.path,
+                file_index,
+                streams,
+                chapters,
+                extra_args: saved.extra_args,
+                pos: saved.pos,
+                width: saved.width,
+                file_missing,
+            });
+        }
+        Graph {
+            inputs,
+            modifiers: file.modifiers,
+            outputs: file.outputs,
+            wires: file.wires,
+            next_id: file.next_id,
+        }
     }
 }

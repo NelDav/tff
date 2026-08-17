@@ -4,7 +4,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use super::chapters::chapter_edit_chapters_mut;
 use super::picker::{extra_args_of, extra_args_of_mut};
-use super::{App, ChapterColumn, ChapterTimeField, Mode, TextTarget};
+use super::{App, ChapterColumn, ChapterTimeField, Focus, Mode, TextTarget};
 use crate::ffmpeg;
 use crate::graph::{FilterName, ModifierKind};
 
@@ -358,6 +358,42 @@ impl App {
                 }
                 self.mode = Mode::Scrub;
             }
+            TextTarget::SaveProjectPath => {
+                let path = clean_path_input(&buffer);
+                if path.is_empty() {
+                    return;
+                }
+                match crate::project::save(&self.graph, &path) {
+                    Ok(()) => self.log.push(format!("saved project to {path}")),
+                    Err(e) => self.log.push(format!("couldn't save project: {e:#}")),
+                }
+            }
+            TextTarget::LoadProjectPath => {
+                let path = clean_path_input(&buffer);
+                if path.is_empty() {
+                    return;
+                }
+                match crate::project::load(&path) {
+                    Ok(result) => {
+                        self.graph = result.graph;
+                        self.focus = Focus::Output(0);
+                        self.row_idx = 0;
+                        self.armed.clear();
+                        self.selected.clear();
+                        self.selection_anchor = None;
+                        self.text_scroll = 0;
+                        self.log.push(format!("loaded project from {path}"));
+                        if !result.missing_inputs.is_empty() {
+                            self.log.push(format!(
+                                "{} input file(s) couldn't be found and are shown grayed out: {}",
+                                result.missing_inputs.len(),
+                                result.missing_inputs.join(", ")
+                            ));
+                        }
+                    }
+                    Err(e) => self.log.push(format!("couldn't load project: {e:#}")),
+                }
+            }
         }
     }
 
@@ -378,7 +414,13 @@ impl App {
         } = &mut self.mode
         {
             input.handle_event(&CrosstermEvent::Key(key));
-            if matches!(target, TextTarget::NewInputPath | TextTarget::OutputPath(_)) {
+            if matches!(
+                target,
+                TextTarget::NewInputPath
+                    | TextTarget::OutputPath(_)
+                    | TextTarget::SaveProjectPath
+                    | TextTarget::LoadProjectPath
+            ) {
                 *suggestions = path_suggestions(input.value());
                 *selected = 0;
             }

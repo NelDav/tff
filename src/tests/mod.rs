@@ -6,6 +6,7 @@ mod filters_e2e;
 mod graph_model;
 mod node_view;
 mod path_autocomplete;
+mod project_save_load;
 mod ui_rendering;
 
 use std::collections::{BTreeMap, BTreeSet};

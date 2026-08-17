@@ -60,7 +60,12 @@ pub(crate) fn input_node_text_extent(app: &App, node: &InputNode) -> (String, Ve
         lines.push(format!("○ {}{suffix}", stream.label()));
     }
     let basename = node.path.rsplit('/').next().unwrap_or(&node.path);
-    (format!(" [{}] {} ", node.file_index, basename), lines)
+    let title = if node.file_missing {
+        format!(" [{}] {} (file not found) ", node.file_index, basename)
+    } else {
+        format!(" [{}] {} ", node.file_index, basename)
+    };
+    (title, lines)
 }
 
 /// A `ModifierKind::Concat` node's segment list, in concat order: one
@@ -369,7 +374,20 @@ fn draw_input_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
-    let border_color = if focused { Color::Yellow } else { Color::White };
+    // A node reconstructed from a project file whose source couldn't be
+    // re-probed (moved, deleted, ...) reads back as `streams`/`chapters`
+    // frozen at whatever was last saved -- grayed out here (border and
+    // every stream row, not just a corner note) so that staleness is
+    // obvious at a glance rather than something only noticed after wiring
+    // it in and wondering why nothing renders. Still yellow when focused,
+    // same as any other node, so focus stays visible.
+    let border_color = if focused {
+        Color::Yellow
+    } else if node.file_missing {
+        Color::DarkGray
+    } else {
+        Color::White
+    };
 
     let mut lines = Vec::new();
     if !node.extra_args.is_empty() {
@@ -393,6 +411,8 @@ fn draw_input_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize
             Color::Yellow
         } else if is_selected {
             Color::Cyan
+        } else if node.file_missing {
+            Color::DarkGray
         } else {
             kind_color(stream.kind)
         };
@@ -410,7 +430,11 @@ fn draw_input_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize
 
     let basename = node.path.rsplit('/').next().unwrap_or(&node.path);
     let scroll = if focused { app.text_scroll } else { 0 };
-    let title = format!(" [{}] {} ", node.file_index, basename);
+    let title = if node.file_missing {
+        format!(" [{}] {} (file not found) ", node.file_index, basename)
+    } else {
+        format!(" [{}] {} ", node.file_index, basename)
+    };
     let inner_width = rect.width.saturating_sub(2);
     let block = Block::default()
         .borders(Borders::ALL)
