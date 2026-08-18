@@ -307,6 +307,66 @@ fn filter_trim_shortens_duration_and_resets_timestamps_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression test for a real render that came back truncated: two Trim
+/// segments of the *same* input, spaced apart, feeding a `Concat` node.
+/// Before `SeekInputs` existed, every segment shared the input's one
+/// whole-file `-i`, so ffmpeg had to decode the entire file in a single
+/// linear pass and buffer every not-yet-consumed later segment in memory
+/// until `concat` finished draining the earlier ones -- on a long real
+/// file that's an unbounded amount of RAM, and the observed failure mode
+/// was the process dying partway through, leaving an output that was
+/// exactly the first segment's length and no more. This uses a short
+/// source (so the *old* code would still have completed fine -- the point
+/// here isn't reproducing the OOM, which needs a much bigger gap than a
+/// test fixture can afford, but confirming the second segment's content
+/// actually made it into the output at all) with two 2s segments 4s apart,
+/// concatenated: the output's duration should reflect *both* segments
+/// (~4s), not just the first (~2s).
+#[test]
+fn concat_of_two_trim_segments_from_the_same_input_renders_both_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("tff-test-concat-trim-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 10, 160, 120);
+    let out_path = dir.join("out.mkv");
+
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
+    let video_idx = streams.iter().position(|s| s.kind == StreamKind::Video).unwrap();
+    let id = graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
+    let first = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "0"), ("end", "2")]),
+    });
+    let second = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "6"), ("end", "8")]),
+    });
+    let concat = graph.add_modifier(ModifierKind::Concat);
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(first));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: video_idx }, Target::ModifierIn(second));
+    graph.connect(Endpoint::ModifierOut(first), Target::ModifierIn(concat));
+    graph.connect(Endpoint::ModifierOut(second), Target::ModifierIn(concat));
+    graph.connect(Endpoint::ModifierOut(concat), Target::Output(out));
+    graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+
+    assert_eq!(run_graph_and_wait(&graph).as_deref(), Some("0"), "ffmpeg did not exit cleanly");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let duration: f64 =
+        String::from_utf8_lossy(&probe.stdout).trim().strip_prefix("duration=").unwrap().parse().unwrap();
+    assert!(
+        (3.5..4.5).contains(&duration),
+        "expected both 2s segments to make it into the concatenated output (~4s total), got {duration} \
+         -- a duration near 2s would mean only the first segment rendered"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The fast, copy-eligible alternative to Trim's filter-based cut: `ss`/
 /// `to` set as an output's own extra args. Being output-scoped, they
 /// naturally apply to *every* stream mapped into that output (video and

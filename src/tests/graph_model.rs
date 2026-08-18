@@ -197,6 +197,98 @@ fn filter_trim_uses_atrim_and_asetpts_for_audio() {
     assert!(joined.contains("atrim=start=2,asetpts=PTS-STARTPTS"), "{joined}");
 }
 
+/// A stream whose *entire* filter chain is a single configured Trim gets
+/// routed through a dedicated, seeked `-i` (see `SeekInputs`) instead of
+/// the input node's shared whole-file one -- the fix for a real render
+/// that OOM'd (see `concat_of_two_trim_segments_from_the_same_input_
+/// renders_both_end_to_end` in `filters_e2e` for the full story). The
+/// plain `-i` (index 0) stays for anything else that might need it; the
+/// trimmed stream's filter_complex entry should reference a *second* `-i`
+/// (index 1), seeked to the trim's own window with a margin added past
+/// `end`, and `-copyts` so the trim filter's own absolute start/end values
+/// keep meaning what they always meant.
+#[test]
+fn trim_only_filter_chain_opens_a_dedicated_seeked_input() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let modifier = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "10"), ("end", "20")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(modifier));
+    graph.connect(Endpoint::ModifierOut(modifier), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(joined.contains("-ss 10 -to 22 -copyts -i in.mp4"), "{joined}");
+    assert!(joined.contains("[1:0]trim=start=10:end=20,setpts=PTS-STARTPTS[f0]"), "{joined}");
+    assert!(joined.contains("-map [f0]"), "{joined}");
+    // The plain whole-file `-i` is still there, unaffected.
+    let i_count = args.iter().filter(|a| *a == "-i").count();
+    assert_eq!(i_count, 2, "expected the plain -i plus one dedicated seek -i: {joined}");
+}
+
+/// Two different streams of the *same* input trimmed to the identical
+/// `[start, end]` window -- e.g. a video and audio segment cut to the same
+/// real-time range, the common case a Concat-based cut produces -- should
+/// share one dedicated seek `-i` rather than each opening their own.
+#[test]
+fn identical_trim_windows_on_the_same_input_share_one_dedicated_seek_input() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_audio_streams(), Vec::new());
+    let video_trim = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "5"), ("end", "9")]),
+    });
+    let audio_trim = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "5"), ("end", "9")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(video_trim));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::ModifierIn(audio_trim));
+    graph.connect(Endpoint::ModifierOut(video_trim), Target::Output(out));
+    graph.connect(Endpoint::ModifierOut(audio_trim), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    // Only one dedicated seek input should have been opened for the shared
+    // (5, 9) window -- so only the plain -i plus exactly one more.
+    let i_count = args.iter().filter(|a| *a == "-i").count();
+    assert_eq!(i_count, 2, "expected the two identical trim windows to share one dedicated -i: {joined}");
+    assert!(joined.contains("[1:0]trim=start=5:end=9,setpts=PTS-STARTPTS"), "{joined}");
+    assert!(joined.contains("[1:1]atrim=start=5:end=9,asetpts=PTS-STARTPTS"), "{joined}");
+}
+
+/// A Trim stacked with another filter on the same stream is more than the
+/// simple case `SeekInputs` handles -- it should keep using the input
+/// node's shared whole-file `-i`, exactly as before that optimization
+/// existed, rather than risk seeking past frames a *different* filter in
+/// the chain still needed.
+#[test]
+fn trim_combined_with_another_filter_keeps_using_the_shared_input() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    let trim = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "10"), ("end", "20")]),
+    });
+    let scale = graph
+        .add_modifier(ModifierKind::Filter { name: FilterName::Scale, fields: filter_fields(&[("width", "640")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(trim));
+    graph.connect(Endpoint::ModifierOut(trim), Target::ModifierIn(scale));
+    graph.connect(Endpoint::ModifierOut(scale), Target::Output(out));
+
+    let args = graph.build_ffmpeg_args(&BTreeMap::new());
+    let joined = args.join(" ");
+    assert!(!joined.contains("-copyts"), "a stacked filter chain shouldn't get a dedicated seek input: {joined}");
+    assert!(joined.contains("[0:0]trim=start=10:end=20,setpts=PTS-STARTPTS,scale=w=640:h=-1"), "{joined}");
+    let i_count = args.iter().filter(|a| *a == "-i").count();
+    assert_eq!(i_count, 1, "expected just the plain -i, no dedicated seek input: {joined}");
+}
+
 #[test]
 fn unconfigured_trim_modifier_is_a_no_op() {
     let mut graph = Graph::new();

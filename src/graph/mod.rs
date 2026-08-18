@@ -30,6 +30,88 @@ fn extra_arg_tokens(args: &BTreeMap<String, String>) -> impl Iterator<Item = Str
     })
 }
 
+/// A defensive cushion added past a Trim segment's own `end` when bounding
+/// its dedicated `-i` with `-to` (see `SeekInputs`) -- covers any rounding
+/// slack in ffmpeg's own accurate-seek/stop handling so the `trim`/`atrim`
+/// filter downstream, which still does the real frame-exact cut, never
+/// risks being hand a source that's one frame short of what it asked for.
+const SEEK_INPUT_END_MARGIN_SECS: f64 = 2.0;
+
+/// `end` plus `SEEK_INPUT_END_MARGIN_SECS`, or `end` unchanged if it isn't
+/// plain decimal seconds (e.g. `HH:MM:SS`, which the Trim filter's fields
+/// also accept, being ffmpeg's own duration syntax) -- `-to` takes either
+/// form, but only the numeric one can have a margin added here.
+fn padded_seek_end(end: &str) -> String {
+    match end.trim().parse::<f64>() {
+        Ok(secs) => (secs + SEEK_INPUT_END_MARGIN_SECS).to_string(),
+        Err(_) => end.to_string(),
+    }
+}
+
+/// Accumulates extra `-i` occurrences opened only for a single Trim
+/// segment's own `[start, end]` window, instead of every trimmed stream
+/// sharing one input's single whole-file `-i` (see `resolve_source`'s use
+/// of this). That sharing is what a real render was found to OOM on: with
+/// several widely-spaced Trim segments of one long file all feeding a
+/// `Concat`, ffmpeg has to decode the *entire* file in one linear pass
+/// (there's only one `-i` to read from) and buffer every not-yet-consumed
+/// later segment's raw frames in memory until `concat` finishes draining
+/// the earlier ones in order -- for a multi-hour file that's far more RAM
+/// than a typical machine has. Giving each segment its own `-i`, seeked
+/// (`-ss`) and bounded (`-to`) to just its own window, means ffmpeg only
+/// ever has to hold that one segment's frames at a time.
+///
+/// `-copyts` on each of these keeps the original absolute timestamps
+/// intact through the seek (verified against `man ffmpeg`: every option
+/// used here is per-file, resetting between `-i`s, so this can't leak into
+/// any other input) -- the `trim`/`atrim` filter's `start=`/`end=` values
+/// are absolute source timestamps, and still does the real, frame-exact
+/// cut exactly as it did with a shared, unseeked input; this is purely an
+/// optimization for how much dead time ffmpeg has to decode-and-discard
+/// (and, critically, buffer) to get there.
+///
+/// Deduped by `(input node id, start, end)` so two streams trimmed to the
+/// identical window (e.g. a video and its audio track cut to the same
+/// real-time range, the common case) share one dedicated input rather than
+/// each opening their own.
+struct SeekInputs {
+    next_index: usize,
+    by_key: BTreeMap<(NodeId, String, String), usize>,
+    args: Vec<String>,
+}
+
+impl SeekInputs {
+    fn new(next_index: usize) -> Self {
+        SeekInputs { next_index, by_key: BTreeMap::new(), args: Vec::new() }
+    }
+
+    /// Returns the file index of a dedicated `-i` seeked/bounded to
+    /// `[start, end]` of `input`'s file, allocating a new one on first use
+    /// for this exact key.
+    fn get_or_insert(&mut self, input: &InputNode, start: Option<&str>, end: Option<&str>) -> usize {
+        let key = (input.id, start.unwrap_or("").to_string(), end.unwrap_or("").to_string());
+        if let Some(&idx) = self.by_key.get(&key) {
+            return idx;
+        }
+        let idx = self.next_index;
+        self.next_index += 1;
+        self.args.extend(extra_arg_tokens(&input.extra_args));
+        if let Some(s) = start {
+            self.args.push("-ss".to_string());
+            self.args.push(s.to_string());
+        }
+        if let Some(e) = end {
+            self.args.push("-to".to_string());
+            self.args.push(padded_seek_end(e));
+        }
+        self.args.push("-copyts".to_string());
+        self.args.push("-i".to_string());
+        self.args.push(input.path.clone());
+        self.by_key.insert(key, idx);
+        idx
+    }
+}
+
 /// Appends the synthetic `StreamKind::Chapter` entry `add_input`'s own doc
 /// comment describes (when `chapters` is non-empty) to a *raw* probed/saved
 /// stream list -- shared by `add_input` and `Graph::from_project_file` so a
@@ -408,14 +490,37 @@ impl Graph {
     /// always reported as needing a filter_complex entry, since ffmpeg's
     /// `concat` filter has no other way to run. Labels are always unique
     /// (`build_output_section`'s doc comment explains why).
-    fn resolve_source(&self, r: &Resolved, filter_complex: &mut Vec<String>) -> Option<(String, StreamKind, bool)> {
+    ///
+    /// When a `Resolved::Stream`'s *entire* filter chain is a single Trim
+    /// with a configured `start`/`end` -- the common case, and the one a
+    /// `Concat` node's segments always are -- the source it's read from is
+    /// a dedicated, seeked `-i` (see `SeekInputs`) instead of the input
+    /// node's own shared whole-file one, so ffmpeg doesn't have to decode
+    /// and buffer the entire file to get there. Anything more complex (a
+    /// Trim stacked with another filter, or a filter chain that isn't Trim
+    /// at all) keeps using the shared `-i` unchanged -- always correct,
+    /// just without this particular optimization.
+    fn resolve_source(
+        &self,
+        r: &Resolved,
+        filter_complex: &mut Vec<String>,
+        seek_inputs: &mut SeekInputs,
+    ) -> Option<(String, StreamKind, bool)> {
         match r {
             Resolved::Stream { from_node, from_stream_idx, filters, .. } => {
                 let input = self.input(*from_node)?;
                 let stream = input.streams.get(*from_stream_idx)?;
-                let source = format!("{}:{}", input.file_index, stream.index);
                 let expr_parts: Vec<String> =
                     filters.iter().filter_map(|(name, fields)| name.expression(stream.kind, fields)).collect();
+                let file_index = match filters.as_slice() {
+                    [(FilterName::Trim, fields)] if !expr_parts.is_empty() => {
+                        let start = fields.get("start").map(String::as_str);
+                        let end = fields.get("end").map(String::as_str);
+                        seek_inputs.get_or_insert(input, start, end)
+                    }
+                    _ => input.file_index,
+                };
+                let source = format!("{file_index}:{}", stream.index);
                 if expr_parts.is_empty() {
                     Some((format!("[{source}]"), stream.kind, false))
                 } else {
@@ -432,7 +537,7 @@ impl Graph {
                 };
                 let mut refs = String::new();
                 for seg in segments {
-                    let (label, ..) = self.resolve_source(seg, filter_complex)?;
+                    let (label, ..) = self.resolve_source(seg, filter_complex, seek_inputs)?;
                     refs.push_str(&label);
                 }
                 let concat_label = format!("f{}", filter_complex.len());
@@ -473,6 +578,7 @@ impl Graph {
         extra_args: &[String],
         filter_complex: &mut Vec<String>,
         chapter_input: Option<usize>,
+        seek_inputs: &mut SeekInputs,
     ) -> Option<Vec<String>> {
         let resolved: Vec<Resolved> = self
             .incoming(Target::Output(output.id))
@@ -494,7 +600,7 @@ impl Graph {
         // `Resolved::Stream` with a non-empty filter chain.
         let mut was_filtered = Vec::with_capacity(resolved.len());
         for r in &resolved {
-            let Some((label, _kind, filtered)) = self.resolve_source(r, filter_complex) else {
+            let Some((label, _kind, filtered)) = self.resolve_source(r, filter_complex, seek_inputs) else {
                 was_filtered.push(false);
                 continue;
             };
@@ -613,6 +719,7 @@ impl Graph {
             }
         }
         let mut filter_complex = Vec::new();
+        let mut seek_inputs = SeekInputs::new(next_input_index);
         let mut sections = Vec::new();
         for output in &self.outputs {
             let chapter_input = match chapter_sources.get(&output.id) {
@@ -620,10 +727,16 @@ impl Graph {
                 Some(ChapterSource::Edited { modifier_id }) => chapter_modifier_index.get(modifier_id).copied(),
                 None => None,
             };
-            if let Some(section) = self.build_output_section(output, None, &[], &mut filter_complex, chapter_input) {
+            if let Some(section) =
+                self.build_output_section(output, None, &[], &mut filter_complex, chapter_input, &mut seek_inputs)
+            {
                 sections.push(section);
             }
         }
+        // Dedicated Trim-segment seek inputs (see `SeekInputs`) are more
+        // `-i`s, so -- like the chapter ones above -- they have to land
+        // before -filter_complex references any of their file indices.
+        args.extend(seek_inputs.args);
         // -filter_complex is a single global graph (not one per output), so
         // it has to land once, before any -map references one of its
         // labels -- everything upstream of this point is still valid
@@ -658,19 +771,30 @@ impl Graph {
             args.push("-i".to_string());
             args.push(input.path.clone());
         }
+        let mut next_input_index = self.inputs.len();
         let chapter_input = match self.output_chapters(output.id) {
             Some(ChapterSource::FromInput { input_file_index }) => Some(input_file_index),
             Some(ChapterSource::Edited { modifier_id }) => chapter_files.get(&modifier_id).map(|path| {
-                let idx = self.inputs.len();
+                let idx = next_input_index;
                 args.push("-i".to_string());
                 args.push(path.clone());
+                next_input_index += 1;
                 idx
             }),
             None => None,
         };
         let mut filter_complex = Vec::new();
+        let mut seek_inputs = SeekInputs::new(next_input_index);
         let extra = vec!["-t".to_string(), duration_secs.to_string()];
-        let section = self.build_output_section(output, Some(preview_path), &extra, &mut filter_complex, chapter_input)?;
+        let section = self.build_output_section(
+            output,
+            Some(preview_path),
+            &extra,
+            &mut filter_complex,
+            chapter_input,
+            &mut seek_inputs,
+        )?;
+        args.extend(seek_inputs.args);
         if !filter_complex.is_empty() {
             args.push("-filter_complex".to_string());
             args.push(filter_complex.join(";"));
