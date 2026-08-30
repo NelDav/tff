@@ -677,6 +677,29 @@ fn binary_from_uses_the_bare_name_or_joins_the_configured_directory() {
     assert!(joined.ends_with(expected_name), "{joined}");
 }
 
+/// `classify_log_line` reads back the `[level]` tag `LOGLEVEL_ARGS` asks
+/// ffmpeg to prefix every severe-enough line with -- `[warning]` maps to
+/// `Warning`; `[error]`/`[fatal]`/`[panic]` all fold into `Error` (rarer,
+/// but a user watching the log cares about them the same way); anything
+/// untagged (info-level output, or a line tff pushed itself, like the `$
+/// ffmpeg ...` echo) is `None`. Also checked against the exact real-world
+/// shape ffmpeg emits for a message with its own `[context @ 0x...]`
+/// prefix (the tag lands *after* that, not at line start) -- verified live
+/// against a real ffmpeg run before writing this.
+#[test]
+fn classify_log_line_reads_back_the_loglevel_tag() {
+    assert_eq!(ffmpeg::classify_log_line("[warning] Non-monotonic DTS"), Some(ffmpeg::LogSeverity::Warning));
+    assert_eq!(
+        ffmpeg::classify_log_line("[h264 @ 0x55fef56b98c0] [error] mmco: unref short failure"),
+        Some(ffmpeg::LogSeverity::Error)
+    );
+    assert_eq!(ffmpeg::classify_log_line("[fatal] could not open input"), Some(ffmpeg::LogSeverity::Error));
+    assert_eq!(ffmpeg::classify_log_line("[panic] assertion failed"), Some(ffmpeg::LogSeverity::Error));
+    assert_eq!(ffmpeg::classify_log_line("[info] Input #0, matroska,webm, from 'in.mp4':"), None);
+    assert_eq!(ffmpeg::classify_log_line("$ ffmpeg -y -i in.mp4 out.mkv"), None);
+    assert_eq!(ffmpeg::classify_log_line("ffmpeg exited with code 0"), None);
+}
+
 /// A real ffplay status line (`"   12.34 A-V: -0.030 fd=..."`) should yield
 /// its leading time; any other line ffplay prints (banner/version info,
 /// the `Input #0 ...` block, blank fragments between two updates, etc.)

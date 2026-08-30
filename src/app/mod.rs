@@ -250,6 +250,14 @@ pub struct App {
     /// `scroll_log_horizontal`.
     pub log_hscroll: u16,
     pub log: Vec<String>,
+    /// How many `[warning]`/`[error]`-tagged lines (see `ffmpeg::
+    /// classify_log_line`) the in-flight (or most recently finished) ffmpeg
+    /// run has produced -- reset to `0` at the start of every `start_render`/
+    /// `start_preview`, incremented as matching lines arrive in
+    /// `poll_ffmpeg`, and folded into the status line's summary once the
+    /// run finishes (see `App::log_issue_summary`).
+    pub log_warnings: u32,
+    pub log_errors: u32,
     pub status: String,
     pub running: bool,
     rx: Option<Receiver<String>>,
@@ -309,6 +317,8 @@ impl App {
             log_scroll: None,
             log_hscroll: 0,
             log,
+            log_warnings: 0,
+            log_errors: 0,
             status: String::new(),
             running: false,
             rx: None,

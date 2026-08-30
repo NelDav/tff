@@ -176,9 +176,22 @@ fn draw_status_line(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Colors a log line by ffmpeg's own severity tag (see `ffmpeg::
+/// classify_log_line`) -- red for `[error]`/`[fatal]`/`[panic]`, yellow for
+/// `[warning]`, and the pane's default style for anything untagged
+/// (info-level ffmpeg output, or a line tff pushed itself).
+fn log_line_style(line: &str) -> Style {
+    match crate::ffmpeg::classify_log_line(line) {
+        Some(crate::ffmpeg::LogSeverity::Warning) => Style::default().fg(Color::Yellow),
+        Some(crate::ffmpeg::LogSeverity::Error) => Style::default().fg(Color::Red),
+        None => Style::default(),
+    }
+}
+
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     let (start, end) = app.visible_log_range();
-    let lines: Vec<TextLine> = app.log[start..end].iter().map(|l| TextLine::from(l.as_str())).collect();
+    let lines: Vec<TextLine> =
+        app.log[start..end].iter().map(|l| TextLine::from(Span::styled(l.as_str(), log_line_style(l)))).collect();
     let title = match (app.log_scroll.is_some(), app.log_hscroll > 0) {
         (true, true) => " log (scrolled -- PgDn/Ctrl+Left to catch up) ".to_string(),
         (true, false) => " log (scrolled -- PgDn to catch up) ".to_string(),

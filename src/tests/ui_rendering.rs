@@ -577,6 +577,42 @@ fn ui_log_pane_scrolls_horizontally_to_reveal_a_long_lines_tail() {
     assert!(scrolled_screen.contains("scrolled right"), "expected a scrolled-right hint:\n{scrolled_screen}");
 }
 
+/// A `[warning]`-tagged log line should render in yellow, a `[error]`-tagged
+/// one in red (see `ffmpeg::classify_log_line`), and a plain untagged line
+/// (like tff's own `$ ffmpeg ...` echo) in neither -- checked per-line via
+/// the buffer's own foreground color, not just that the text made it to
+/// screen.
+#[test]
+fn ui_log_pane_colors_lines_by_ffmpeg_severity_tag() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+
+    let mut app = App::new();
+    app.log.clear();
+    app.log.push("$ ffmpeg -y -i in.mp4 out.mkv".to_string());
+    app.log.push("[warning] Non-monotonic DTS".to_string());
+    app.log.push("[error] mmco: unref short failure".to_string());
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let row_text = |y: u16| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+    let row_has_color = |y: u16, color: Color| (0..buffer.area.width).any(|x| buffer[(x, y)].fg == color);
+
+    let plain_row = (0..buffer.area.height).find(|&y| row_text(y).contains("ffmpeg -y -i")).expect("plain line");
+    let warning_row =
+        (0..buffer.area.height).find(|&y| row_text(y).contains("Non-monotonic DTS")).expect("warning line");
+    let error_row =
+        (0..buffer.area.height).find(|&y| row_text(y).contains("mmco: unref short")).expect("error line");
+
+    assert!(!row_has_color(plain_row, Color::Yellow) && !row_has_color(plain_row, Color::Red), "plain line should be uncolored");
+    assert!(row_has_color(warning_row, Color::Yellow), "expected the warning line colored yellow");
+    assert!(row_has_color(error_row, Color::Red), "expected the error line colored red");
+}
+
 /// A Concat modifier's box should list every connected segment as its own
 /// numbered row (in wire/join order), unlike every other modifier kind's
 /// single "← ..." incoming line.

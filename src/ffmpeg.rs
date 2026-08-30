@@ -638,6 +638,43 @@ pub fn mpv_set_pause(socket_path: &str, pause: bool) -> Result<()> {
         .map(|_| ())
 }
 
+/// Prepended to every spawned ffmpeg invocation, ahead of the graph's own
+/// args -- not part of the "real" command (kept out of the `$ ffmpeg ...`
+/// line `render.rs` logs, so a user copy-pasting that line gets the exact
+/// same command tff ran, minus this purely internal aid). `-loglevel
+/// level` keeps ffmpeg's default verbosity (still shows info/warning/error
+/// exactly as before) but adds a `[level]` tag -- e.g. `[warning]`,
+/// `[error]` -- to every line severe enough to carry one, which is the
+/// only reliable way to tell a warning from an error in ffmpeg's own
+/// stderr: there's no other structural marker, and matching on message
+/// wording would be a losing game against ffmpeg's own message text
+/// (verified live: "mmco: unref short failure" reads like a warning but
+/// ffmpeg itself tags it `[error]`). See `classify_log_line`, which reads
+/// this tag back out.
+const LOGLEVEL_ARGS: [&str; 2] = ["-loglevel", "level"];
+
+/// A log line's severity, as ffmpeg itself tagged it via the `[level]`
+/// prefix `LOGLEVEL_ARGS` requests -- `None` for anything untagged
+/// (info/verbose/debug/trace, or a line tff pushed itself, like the `$
+/// ffmpeg ...` echo or `ffmpeg exited with code N`). `Fatal`/`Panic` fold
+/// into `Error`: rarer, but still something a user watching the log
+/// pane cares about exactly the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogSeverity {
+    Warning,
+    Error,
+}
+
+pub fn classify_log_line(line: &str) -> Option<LogSeverity> {
+    if line.contains("[warning]") {
+        Some(LogSeverity::Warning)
+    } else if line.contains("[error]") || line.contains("[fatal]") || line.contains("[panic]") {
+        Some(LogSeverity::Error)
+    } else {
+        None
+    }
+}
+
 /// Spawn ffmpeg with the given arguments, streaming stdout+stderr lines
 /// through `tx` as they arrive, and a final "__DONE__<code>" sentinel line.
 /// Intended to run on its own thread; owns everything it needs ('static).
@@ -650,6 +687,7 @@ pub fn run_args(args: Vec<String>, tx: Sender<String>) {
 
 fn run_args_inner(args: &[String], tx: &Sender<String>) -> Result<()> {
     let mut child = Command::new(binary("ffmpeg"))
+        .args(LOGLEVEL_ARGS)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

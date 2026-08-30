@@ -1822,6 +1822,50 @@ fn poll_ffmpeg_hands_off_a_finished_preview_via_preview_ready() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A run that fails outright (here, ffmpeg refusing a nonexistent input
+/// file, a real, deterministic, near-instant way to get `[error]`/`[fatal]`
+/// -tagged lines out of a real ffmpeg process -- see `ffmpeg::
+/// classify_log_line`) should have `poll_ffmpeg` count every one of them
+/// into `log_errors`, color them in the log (checked indirectly here via
+/// `classify_log_line`, since this test has no terminal to render into),
+/// and fold the count into the final status line alongside the exit code,
+/// exactly the summary `App::log_issue_summary` builds.
+#[test]
+fn poll_ffmpeg_counts_tagged_error_lines_and_summarizes_them_in_the_status() {
+    use crate::app::App;
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("/no/such/file-tff-test-only.mkv".to_string(), video_stream(), Vec::new());
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+
+    app.start_render();
+    assert!(app.running);
+    assert_eq!(app.log_errors, 0, "nothing counted yet -- the process has barely started");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.running && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.poll_ffmpeg();
+    }
+
+    assert!(!app.running, "the failing render did not finish in time");
+    assert!(app.log_errors > 0, "opening a nonexistent input should produce at least one [error]/[fatal] line");
+    assert_eq!(app.log_warnings, 0);
+    assert!(
+        app.log.iter().any(|l| crate::ffmpeg::classify_log_line(l) == Some(crate::ffmpeg::LogSeverity::Error)),
+        "at least one logged line should itself classify as an error: {:?}",
+        app.log
+    );
+    let expected_suffix = format!("({} error{})", app.log_errors, if app.log_errors == 1 { "" } else { "s" });
+    assert!(
+        app.status.contains(&expected_suffix),
+        "status should summarize the error count: {} (expected to contain {expected_suffix:?})",
+        app.status
+    );
+    assert!(app.status.starts_with("ffmpeg exited with code"), "{}", app.status);
+}
+
 /// 'e' with a modifier focused should dispatch to the same thing
 /// `activate_modifier` does directly -- one key, "edit this node,"
 /// regardless of what kind of node is focused.

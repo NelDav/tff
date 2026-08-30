@@ -59,6 +59,8 @@ impl App {
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
         self.rx = Some(rx);
         self.running = true;
+        self.log_warnings = 0;
+        self.log_errors = 0;
         self.status = "running ffmpeg...".to_string();
         let args = self.graph.build_ffmpeg_args(&chapter_files);
         self.log.push(format!("$ ffmpeg {}", args.join(" ")));
@@ -111,12 +113,31 @@ impl App {
         let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
         self.rx = Some(rx);
         self.running = true;
+        self.log_warnings = 0;
+        self.log_errors = 0;
         self.status = format!("rendering {PREVIEW_SECONDS}s preview...");
         self.preview_target = Some(preview_path);
         self.log.push(format!("$ ffmpeg {}", args.join(" ")));
         thread::spawn(move || {
             ffmpeg::run_args(args, tx);
         });
+    }
+
+    /// A trailing summary of how many `[warning]`/`[error]`-tagged lines
+    /// (see `ffmpeg::classify_log_line`) the run just counted -- appended to
+    /// the final status text in `poll_ffmpeg` so a clean-looking "exited
+    /// with code 0" doesn't quietly hide the fact that ffmpeg complained
+    /// along the way. Empty string (nothing appended) when there's nothing
+    /// to report.
+    fn log_issue_summary(&self) -> String {
+        match (self.log_warnings, self.log_errors) {
+            (0, 0) => String::new(),
+            (w, 0) => format!(" ({w} warning{})", if w == 1 { "" } else { "s" }),
+            (0, e) => format!(" ({e} error{})", if e == 1 { "" } else { "s" }),
+            (w, e) => {
+                format!(" ({w} warning{}, {e} error{})", if w == 1 { "" } else { "s" }, if e == 1 { "" } else { "s" })
+            }
+        }
     }
 
     pub fn poll_ffmpeg(&mut self) {
@@ -126,22 +147,28 @@ impl App {
             if let Some(code) = line.strip_prefix("__DONE__") {
                 done = Some(code.to_string());
             } else {
+                match ffmpeg::classify_log_line(&line) {
+                    Some(ffmpeg::LogSeverity::Warning) => self.log_warnings += 1,
+                    Some(ffmpeg::LogSeverity::Error) => self.log_errors += 1,
+                    None => {}
+                }
                 self.log.push(line);
             }
         }
         if let Some(code) = done {
             self.running = false;
             self.rx = None;
+            let summary = self.log_issue_summary();
             if let Some(path) = self.preview_target.take() {
                 if code == "0" {
-                    self.status = "preview ready".to_string();
+                    self.status = format!("preview ready{summary}");
                     self.preview_ready = Some(path);
                 } else {
-                    self.status = format!("preview render failed (exit code {code})");
+                    self.status = format!("preview render failed (exit code {code}){summary}");
                     self.log.push(self.status.clone());
                 }
             } else {
-                self.status = format!("ffmpeg exited with code {code}");
+                self.status = format!("ffmpeg exited with code {code}{summary}");
                 self.log.push(self.status.clone());
             }
         }
