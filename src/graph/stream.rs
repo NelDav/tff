@@ -99,6 +99,23 @@ pub struct StreamInfo {
     pub kind: StreamKind,
     pub codec: String,
     pub lang: Option<String>,
+    /// This stream's own duration in seconds, as reported by ffprobe --
+    /// `None` if ffprobe didn't report one (some containers/codecs don't
+    /// carry a per-stream duration; a chapter "stream" never has one, see
+    /// `add_input`). The base case `Graph::expected_output_duration` builds
+    /// every output's estimate from -- see its own doc comment for how a
+    /// `Trim`/`Concat`/etc. in the chain adjusts it from there.
+    ///
+    /// Deliberately `#[serde(skip)]`, not saved in a project file: unlike
+    /// `codec`/`lang`, which are worth preserving so a moved/missing input
+    /// still shows sensible info (see `InputNode::file_missing`), a stale
+    /// duration has no such use -- `Graph::from_project_file` re-probes
+    /// every input fresh on load and only falls back to the saved fields
+    /// when that fails, and a genuinely missing file can't be rendered
+    /// (and therefore can't need a progress estimate) regardless of
+    /// whether a duration was saved for it.
+    #[serde(skip)]
+    pub duration: Option<f64>,
 }
 
 impl StreamInfo {

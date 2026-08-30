@@ -39,21 +39,21 @@ fn is_wire_glyph(c: char) -> bool {
 }
 
 fn video_stream() -> Vec<StreamInfo> {
-    vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None }]
+    vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: None }]
 }
 
 fn video_audio_streams() -> Vec<StreamInfo> {
     vec![
-        StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None },
-        StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None },
+        StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: None },
+        StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None, duration: None },
     ]
 }
 
 fn three_streams() -> Vec<StreamInfo> {
     vec![
-        StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None },
-        StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None },
-        StreamInfo { index: 2, kind: StreamKind::Subtitle, codec: "srt".to_string(), lang: None },
+        StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: None },
+        StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None, duration: None },
+        StreamInfo { index: 2, kind: StreamKind::Subtitle, codec: "srt".to_string(), lang: None, duration: None },
     ]
 }
 

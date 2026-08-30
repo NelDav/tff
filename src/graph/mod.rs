@@ -48,6 +48,37 @@ fn padded_seek_end(end: &str) -> String {
     }
 }
 
+/// How a duration-affecting filter changes a stream's own length, given its
+/// duration just *before* this filter (`Graph::endpoint_duration` walks
+/// backward, applying each filter in the chain from source to output as it
+/// unwinds). Only `Trim` (cuts to a window) and `Shift` (delays/advances
+/// the whole stream, extending or shrinking its total length by the same
+/// amount -- see `FilterName::expression`'s own doc comment on `Shift` for
+/// why) actually change duration; every other filter this app has
+/// (Scale/Crop/Rotate/Volume/Fade) passes `base` through unchanged.
+/// Malformed/missing field values fall back to a sensible no-op default
+/// (an absent `start` is `0`, same as ffmpeg's own `trim` filter; an
+/// unparseable `seconds` doesn't shift at all) rather than propagating
+/// `None` -- consistent with `resolve_source`, which never rejects a whole
+/// chain over one bad field either.
+fn duration_after_filter(name: FilterName, fields: &BTreeMap<String, String>, base: f64) -> f64 {
+    match name {
+        FilterName::Trim => {
+            let start = fields.get("start").and_then(|s| parse_time(s)).unwrap_or(0.0);
+            let end = fields.get("end").and_then(|s| parse_time(s));
+            match end {
+                Some(end) => (end - start).max(0.0),
+                None => (base - start).max(0.0),
+            }
+        }
+        FilterName::Shift => {
+            let seconds = fields.get("seconds").and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
+            (base + seconds).max(0.0)
+        }
+        FilterName::Volume | FilterName::Scale | FilterName::Crop | FilterName::Fade | FilterName::Rotate => base,
+    }
+}
+
 /// Accumulates extra `-i` occurrences opened only for a single Trim
 /// segment's own `[start, end]` window, instead of every trimmed stream
 /// sharing one input's single whole-file `-i` (see `resolve_source`'s use
@@ -125,6 +156,7 @@ fn streams_with_chapter_marker(mut streams: Vec<StreamInfo>, chapters: &[Chapter
             kind: StreamKind::Chapter,
             codec: chapters.len().to_string(),
             lang: None,
+            duration: None,
         });
     }
     streams
@@ -394,6 +426,66 @@ impl Graph {
                     current = incoming.from;
                 }
             }
+        }
+    }
+
+    /// Best-effort estimate of the wall-clock duration rendering `output`
+    /// will take, in seconds -- the length of whichever of its mapped
+    /// streams ends up longest, since ffmpeg (without `-shortest`) keeps
+    /// encoding until every mapped stream is done. `None` if nothing's
+    /// mapped, or if *any* mapped stream's own duration can't be pinned
+    /// down (an unprobed source, a `ChapterEdit` in the chain, ...) --
+    /// deliberately all-or-nothing rather than silently maxing over just
+    /// the known ones, since the one that's unknown could well be the
+    /// longest. Meant to turn ffmpeg's own `time=` progress reports into an
+    /// actual percentage; not persisted anywhere, since it's cheap to
+    /// recompute and a stale estimate has no use once the underlying
+    /// duration data (`StreamInfo::duration`, itself never saved either)
+    /// is gone.
+    pub fn expected_output_duration(&self, output_id: NodeId) -> Option<f64> {
+        let mut hops = 0usize;
+        self.incoming(Target::Output(output_id))
+            .into_iter()
+            .map(|wi| self.endpoint_duration(self.wires[wi].from, &mut hops))
+            .collect::<Option<Vec<f64>>>()?
+            .into_iter()
+            .reduce(f64::max)
+    }
+
+    /// `hops` is the same shared, non-resetting cycle guard `resolve_hopped`
+    /// uses, for the same reason (a `Concat` segment cycling back through
+    /// another segment shouldn't be able to recurse forever).
+    fn endpoint_duration(&self, ep: Endpoint, hops: &mut usize) -> Option<f64> {
+        const MAX_HOPS: usize = 10_000;
+        *hops += 1;
+        if *hops > MAX_HOPS {
+            return None; // cycle guard
+        }
+        match ep {
+            Endpoint::Stream { node, stream_idx } => self.input(node)?.streams.get(stream_idx)?.duration,
+            Endpoint::ModifierOut(mid) => match &self.modifier(mid)?.kind {
+                ModifierKind::Concat => {
+                    let segment_wires = self.incoming(Target::ModifierIn(mid));
+                    if segment_wires.is_empty() {
+                        return None;
+                    }
+                    segment_wires.into_iter().map(|wi| self.endpoint_duration(self.wires[wi].from, hops)).sum()
+                }
+                ModifierKind::Filter { name, fields } => {
+                    let wi = self.incoming(Target::ModifierIn(mid)).into_iter().next()?;
+                    let base = self.endpoint_duration(self.wires[wi].from, hops)?;
+                    Some(duration_after_filter(*name, fields, base))
+                }
+                // ChapterEdit never produces a real mapped media stream
+                // (see resolve_hopped's own doc comment for the same
+                // reasoning); Convert/Metadata/Disposition don't change
+                // duration, so they just pass their upstream's through.
+                ModifierKind::ChapterEdit { .. } => None,
+                ModifierKind::Convert(_) | ModifierKind::Metadata { .. } | ModifierKind::Disposition { .. } => {
+                    let wi = self.incoming(Target::ModifierIn(mid)).into_iter().next()?;
+                    self.endpoint_duration(self.wires[wi].from, hops)
+                }
+            },
         }
     }
 

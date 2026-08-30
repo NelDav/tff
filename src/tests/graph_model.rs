@@ -184,7 +184,7 @@ fn filter_trim_uses_atrim_and_asetpts_for_audio() {
     let out = graph.outputs[0].id;
     let id = graph.add_input(
         "in.mp4".to_string(),
-        vec![StreamInfo { index: 0, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None }],
+        vec![StreamInfo { index: 0, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None, duration: None }],
         Vec::new(),
     );
     let modifier = graph
@@ -259,6 +259,162 @@ fn identical_trim_windows_on_the_same_input_share_one_dedicated_seek_input() {
     assert_eq!(i_count, 2, "expected the two identical trim windows to share one dedicated -i: {joined}");
     assert!(joined.contains("[1:0]trim=start=5:end=9,setpts=PTS-STARTPTS"), "{joined}");
     assert!(joined.contains("[1:1]atrim=start=5:end=9,asetpts=PTS-STARTPTS"), "{joined}");
+}
+
+/// A stream with no duration-affecting filter in its chain should report
+/// its source's own probed duration unchanged -- Convert/Metadata/
+/// Disposition don't touch duration.
+#[test]
+fn expected_output_duration_passes_through_unaffected_by_non_duration_filters() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(120.0) }],
+        Vec::new(),
+    );
+    let convert = graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx265".to_string())));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(convert));
+    graph.connect(Endpoint::ModifierOut(convert), Target::Output(out));
+
+    assert_eq!(graph.expected_output_duration(out), Some(120.0));
+}
+
+/// A Trim with both `start`/`end` set should shorten duration to exactly
+/// their difference, regardless of the source's own duration.
+#[test]
+fn expected_output_duration_reflects_a_trim_window() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(120.0) }],
+        Vec::new(),
+    );
+    let trim = graph.add_modifier(ModifierKind::Filter {
+        name: FilterName::Trim,
+        fields: filter_fields(&[("start", "10"), ("end", "30")]),
+    });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(trim));
+    graph.connect(Endpoint::ModifierOut(trim), Target::Output(out));
+
+    assert_eq!(graph.expected_output_duration(out), Some(20.0));
+}
+
+/// A Trim with only `start` set should shorten duration to the source's
+/// own duration minus that start (ffmpeg's own default: `end` unset means
+/// "to the end").
+#[test]
+fn expected_output_duration_with_only_a_trim_start_subtracts_it_from_the_source_duration() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(120.0) }],
+        Vec::new(),
+    );
+    let trim = graph.add_modifier(ModifierKind::Filter { name: FilterName::Trim, fields: filter_fields(&[("start", "20")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(trim));
+    graph.connect(Endpoint::ModifierOut(trim), Target::Output(out));
+
+    assert_eq!(graph.expected_output_duration(out), Some(100.0));
+}
+
+/// A Concat's duration is the sum of its segments' own resolved durations.
+#[test]
+fn expected_output_duration_sums_concat_segments() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let a = graph.add_input(
+        "a.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(30.0) }],
+        Vec::new(),
+    );
+    let b = graph.add_input(
+        "b.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(45.0) }],
+        Vec::new(),
+    );
+    let concat = graph.add_modifier(ModifierKind::Concat);
+    graph.connect(Endpoint::Stream { node: a, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::Stream { node: b, stream_idx: 0 }, Target::ModifierIn(concat));
+    graph.connect(Endpoint::ModifierOut(concat), Target::Output(out));
+
+    assert_eq!(graph.expected_output_duration(out), Some(75.0));
+}
+
+/// A Shift extends (positive) or shrinks (negative) total duration by its
+/// own `seconds` amount -- see `FilterName::expression`'s doc comment on
+/// `Shift` for why it actually does that to the real rendered output, not
+/// just conceptually.
+#[test]
+fn expected_output_duration_reflects_a_shift() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(60.0) }],
+        Vec::new(),
+    );
+    let shift =
+        graph.add_modifier(ModifierKind::Filter { name: FilterName::Shift, fields: filter_fields(&[("seconds", "5")]) });
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(shift));
+    graph.connect(Endpoint::ModifierOut(shift), Target::Output(out));
+
+    assert_eq!(graph.expected_output_duration(out), Some(65.0));
+}
+
+/// When more than one stream is mapped into the same output, its overall
+/// duration should be the *longest* of them (ffmpeg, without `-shortest`,
+/// keeps encoding until every mapped stream is done) -- not the shortest,
+/// the sum, or the first one found.
+#[test]
+fn expected_output_duration_is_the_longest_of_several_mapped_streams() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![
+            StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(30.0) },
+            StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None, duration: Some(45.0) },
+        ],
+        Vec::new(),
+    );
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::Output(out));
+
+    assert_eq!(graph.expected_output_duration(out), Some(45.0));
+}
+
+/// If *any* mapped stream's duration can't be determined, the whole
+/// output's estimate should be `None` rather than silently maxing over
+/// just the known ones -- the unknown one could be the longest.
+#[test]
+fn expected_output_duration_is_none_if_any_mapped_stream_duration_is_unknown() {
+    let mut graph = Graph::new();
+    let out = graph.outputs[0].id;
+    let id = graph.add_input(
+        "in.mp4".to_string(),
+        vec![
+            StreamInfo { index: 0, kind: StreamKind::Video, codec: "h264".to_string(), lang: None, duration: Some(30.0) },
+            StreamInfo { index: 1, kind: StreamKind::Audio, codec: "aac".to_string(), lang: None, duration: None },
+        ],
+        Vec::new(),
+    );
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+    graph.connect(Endpoint::Stream { node: id, stream_idx: 1 }, Target::Output(out));
+
+    assert_eq!(graph.expected_output_duration(out), None);
+}
+
+/// Nothing mapped at all should report `None`, not `0.0` -- an empty
+/// output isn't "instant," it's just not something a progress bar applies
+/// to.
+#[test]
+fn expected_output_duration_is_none_with_nothing_mapped() {
+    let graph = Graph::new();
+    let out = graph.outputs[0].id;
+    assert_eq!(graph.expected_output_duration(out), None);
 }
 
 /// A Trim stacked with another filter on the same stream is more than the

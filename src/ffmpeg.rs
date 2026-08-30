@@ -47,6 +47,8 @@ struct ProbeOutput {
     streams: Vec<ProbeStream>,
     #[serde(default)]
     chapters: Vec<ProbeChapter>,
+    #[serde(default)]
+    format: Option<ProbeFormat>,
 }
 
 #[derive(Deserialize)]
@@ -54,8 +56,24 @@ struct ProbeStream {
     index: usize,
     codec_type: String,
     codec_name: Option<String>,
+    /// A string, not a number -- ffprobe's JSON writer always quotes it,
+    /// even though it's numeric. Reliably present for some containers
+    /// (verified live: MP4) but not others (verified live: Matroska, which
+    /// only reports a *container*-level duration -- see `ProbeFormat` and
+    /// `probe`'s own use of it as the fallback for exactly this case).
+    #[serde(default)]
+    duration: Option<String>,
     #[serde(default)]
     tags: Option<ProbeTags>,
+}
+
+/// The one piece of `-show_format`'s output `probe` actually needs: a
+/// container-level duration to fall back to when a stream doesn't report
+/// its own (see `ProbeStream::duration`'s doc comment).
+#[derive(Deserialize)]
+struct ProbeFormat {
+    #[serde(default)]
+    duration: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +111,7 @@ pub fn probe(path: &str) -> Result<ProbeResult> {
             "-v", "error",
             "-show_streams",
             "-show_chapters",
+            "-show_format",
             "-of", "json",
             path,
         ])
@@ -113,11 +132,19 @@ pub fn probe(path: &str) -> Result<ProbeResult> {
         bail!("ffprobe found no streams or chapters in '{path}'");
     }
 
+    // Falls back to the container-level duration when a stream doesn't
+    // report its own -- verified live against a real Matroska file, which
+    // never does (only MP4-family containers reliably did, in every file
+    // checked); using the file's overall duration for every one of its
+    // streams in that case is still a solid estimate for the vast majority
+    // of real files, where every stream spans the same overall timeline.
+    let format_duration = parsed.format.and_then(|f| f.duration).and_then(|d| d.trim().parse::<f64>().ok());
     let streams = parsed
         .streams
         .into_iter()
         .map(|s| StreamInfo {
             index: s.index,
+            duration: s.duration.and_then(|d| d.trim().parse::<f64>().ok()).or(format_duration),
             kind: match s.codec_type.as_str() {
                 "video" => StreamKind::Video,
                 "audio" => StreamKind::Audio,

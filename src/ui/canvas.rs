@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use super::describe_endpoint;
 use crate::app::{App, Focus};
-use crate::graph::{Endpoint, InputNode, ModifierKind, ModifierNode, NodeId, OutputNode, StreamKind, Target};
+use crate::graph::{format_time, Endpoint, InputNode, ModifierKind, ModifierNode, NodeId, OutputNode, StreamKind, Target};
 
 /// Drops the first `scroll` characters of `text` -- used to horizontally
 /// scroll a focused node's title (see `App::scroll_node_text`), since a
@@ -178,6 +178,9 @@ pub(crate) fn modifier_node_text_extent(app: &App, node: &ModifierNode) -> (Stri
 
 pub(crate) fn output_node_text_extent(app: &App, index: usize, node: &OutputNode) -> (String, Vec<String>) {
     let mut lines = Vec::new();
+    if let Some(secs) = app.graph.expected_output_duration(node.id) {
+        lines.push(format!("expected length: {}", format_time(secs)));
+    }
     for (key, value) in &node.extra_args {
         lines.push(if value.is_empty() { format!("-{key}") } else { format!("-{key} {value}") });
     }
@@ -211,7 +214,6 @@ pub(crate) fn output_node_text_extent(app: &App, index: usize, node: &OutputNode
             None => "chapters <- (?)".to_string(),
         });
     }
-
     let container_tag = match &node.container {
         Some(name) => format!(" [{name}]"),
         None => String::new(),
@@ -247,6 +249,21 @@ fn output_body_rows(incoming_count: usize, has_chapters: bool) -> usize {
     // At least one row for the mapped streams (even with none connected,
     // that's a "(nothing mapped)" placeholder row -- see `draw_output_node`).
     incoming_count.max(1) + usize::from(has_chapters)
+}
+
+/// An output's upper section: an "expected length: HH:MM:SS" line (see
+/// `Graph::expected_output_duration`) first, if known, then one row per
+/// extra arg, then a divider -- shown whenever *either* of those has
+/// anything to show, unlike every other node kind's upper section (see
+/// `extra_args_field_rows`), which only ever depends on extra_args.
+/// Neither line is folded into `output_body_rows`, which drives
+/// `row_idx`-based row cycling: nothing here is a connection, nothing
+/// wires to it, and `App::cycle_row` never needs to land on it.
+fn output_upper_section_rows(expected_duration: Option<f64>, extra_args: &std::collections::BTreeMap<String, String>) -> u16 {
+    if expected_duration.is_none() && extra_args.is_empty() {
+        return 0;
+    }
+    u16::from(expected_duration.is_some()) + extra_args.len() as u16 + 1 // +1 divider
 }
 
 /// A Metadata modifier's box has an upper section (one row per field it
@@ -592,8 +609,11 @@ fn draw_modifier_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: us
 fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usize, node: &OutputNode) {
     let incoming = app.graph.incoming(Target::Output(node.id));
     let chapter_wires = app.graph.incoming(Target::OutputChapters(node.id));
-    let rows =
-        node_rows(output_body_rows(incoming.len(), !chapter_wires.is_empty()), extra_args_field_rows(&node.extra_args));
+    let expected_duration = app.graph.expected_output_duration(node.id);
+    let rows = node_rows(
+        output_body_rows(incoming.len(), !chapter_wires.is_empty()),
+        output_upper_section_rows(expected_duration, &node.extra_args),
+    );
     let Some(rect) = node_rect(canvas_area, node.pos, node.width, rows) else {
         return;
     };
@@ -601,7 +621,13 @@ fn draw_output_node(frame: &mut Frame, canvas_area: Rect, app: &App, index: usiz
     let border_color = if focused { Color::Yellow } else { Color::Cyan };
 
     let mut lines = Vec::new();
-    if !node.extra_args.is_empty() {
+    if expected_duration.is_some() || !node.extra_args.is_empty() {
+        if let Some(secs) = expected_duration {
+            lines.push(TextLine::styled(
+                format!("expected length: {}", format_time(secs)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         for (key, value) in &node.extra_args {
             let text = if value.is_empty() { format!("-{key}") } else { format!("-{key} {value}") };
             lines.push(TextLine::from(text));

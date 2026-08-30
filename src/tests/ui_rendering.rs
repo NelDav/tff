@@ -251,6 +251,65 @@ fn ui_omits_the_chapters_row_entirely_when_unconnected() {
     assert!(!screen.contains("chapters"), "{screen}");
 }
 
+/// An output whose mapped stream has a known duration should show an
+/// "expected length" line (see `Graph::expected_output_duration`) as the
+/// very first row of its upper section (the one that otherwise only shows
+/// up for extra ffmpeg flags) -- ahead of any extra arg and the divider
+/// below them -- not down among its connections. One whose duration can't
+/// be determined (no probed duration at all here) should show no such
+/// line rather than a misleading "00:00:00".
+#[test]
+fn ui_shows_expected_length_as_the_first_row_of_the_upper_section() {
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let rows = |app: &App| {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<String>>()
+    };
+    let find = |rows: &[String], needle: &str| rows.iter().position(|r| r.contains(needle));
+
+    let mut app = App::new();
+    let out = app.graph.outputs[0].id;
+    let id = app.graph.add_input("in.mp4".to_string(), video_stream(), Vec::new());
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::Output(out));
+
+    let unknown_rows = rows(&app);
+    assert!(!unknown_rows.iter().any(|r| r.contains("expected length")), "{unknown_rows:?}");
+
+    app.graph.inputs[0].streams[0].duration = Some(3725.0); // 01:02:05
+    app.graph.outputs[0].extra_args = filter_fields(&[("movflags", "+faststart")]);
+    let known_rows = rows(&app);
+
+    let duration_row = find(&known_rows, "expected length: 01:02:05").expect("duration line");
+    let extra_arg_row = find(&known_rows, "movflags").expect("extra arg line");
+    // The row right after the last extra-args line is the divider, per
+    // `draw_output_node`'s own sequential push order -- checked for an
+    // actual run of box-drawing dashes rather than just any '─' anywhere on
+    // screen, since a crossing wire elbow can also contain one.
+    let divider_row = extra_arg_row + 1;
+    // "in.mp4" alone would also match the *input* node's own title -- this
+    // is the fuller text only the output's own connection line has.
+    let connection_row = find(&known_rows, "h264 <- [0] in.mp4").expect("mapped connection line");
+
+    assert_eq!(
+        duration_row + 1,
+        extra_arg_row,
+        "expected the duration line immediately followed by the extra arg (no gap), i.e. as the box's own first row: {known_rows:?}"
+    );
+    assert!(
+        known_rows[divider_row].matches('─').count() >= 10,
+        "expected a real divider (a run of dashes) right after the extra arg: {:?}",
+        known_rows[divider_row]
+    );
+    assert!(divider_row < connection_row, "expected the divider before the connections: {known_rows:?}");
+}
+
 /// A modifier node should render its incoming source summary and its
 /// outgoing connection(s), and a wire leaving a non-Copy Convert node
 /// should carry that codec as a badge.
@@ -379,7 +438,7 @@ fn wires_are_colored_by_resolved_stream_kind() {
 
     let mut app = App::new();
     let out = app.graph.outputs[0].id;
-    let mk = |kind: StreamKind| vec![StreamInfo { index: 0, kind, codec: "c".to_string(), lang: None }];
+    let mk = |kind: StreamKind| vec![StreamInfo { index: 0, kind, codec: "c".to_string(), lang: None, duration: None }];
     let v = app.graph.add_input("v.mp4".to_string(), mk(StreamKind::Video), Vec::new());
     let a = app.graph.add_input("a.m4a".to_string(), mk(StreamKind::Audio), Vec::new());
     let s = app.graph.add_input("s.srt".to_string(), mk(StreamKind::Subtitle), Vec::new());
