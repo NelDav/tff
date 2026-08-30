@@ -152,7 +152,22 @@ impl App {
                     Some(ffmpeg::LogSeverity::Error) => self.log_errors += 1,
                     None => {}
                 }
-                self.log.push(line);
+                // A progress line (see `PROGRESS_LINE_PREFIX`'s doc comment)
+                // overwrites the log's current last entry instead of adding
+                // a new one, but only if that entry is itself a progress
+                // line -- checked by looking at the stored prefix directly,
+                // not a separate flag, so a real message pushed from
+                // anywhere else in between two progress updates (any of the
+                // many other `self.log.push(...)` call sites across
+                // `app/*.rs`) correctly starts a fresh line rather than
+                // being silently overwritten by the next one.
+                if line.starts_with(ffmpeg::PROGRESS_LINE_PREFIX)
+                    && self.log.last().is_some_and(|l| l.starts_with(ffmpeg::PROGRESS_LINE_PREFIX))
+                {
+                    *self.log.last_mut().expect("just checked Some above") = line;
+                } else {
+                    self.log.push(line);
+                }
             }
         }
         if let Some(code) = done {

@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
@@ -685,6 +685,74 @@ pub fn run_args(args: Vec<String>, tx: Sender<String>) {
     }
 }
 
+/// Prepended (by `poll_ffmpeg`, on the receiving end) to a line
+/// `stream_raw_lines` reported as ending in a bare `\r` -- ffmpeg's own way
+/// of asking a terminal to overwrite the current line in place, used for
+/// its periodic `frame=... fps=... time=...` progress reports. Kept as a
+/// prefix on the stored line itself (rather than a separate `App` flag that
+/// every one of the many other, unrelated `self.log.push(...)` call sites
+/// scattered across `app/*.rs` would have to remember to reset) so
+/// `poll_ffmpeg` can tell "is the log's current last entry itself an
+/// overwritable progress line" just by looking at that one stored string,
+/// correctly even if something else pushed a real line in between two
+/// progress updates. `ui::draw_log` strips it back off before display.
+pub(crate) const PROGRESS_LINE_PREFIX: &str = "__PROGRESS__";
+
+/// Reads `reader` byte by byte, splitting into lines on *either* `\n` or a
+/// bare `\r` (one not immediately followed by `\n`) -- unlike
+/// `BufRead::lines()`, which only ever splits on `\n`. This matters because
+/// ffmpeg's own periodic progress reports (`frame=... fps=... time=...`)
+/// are separated by a bare `\r`, not `\n` -- verified directly against a
+/// real, slow-enough render: several `frame=...` updates showed up joined
+/// by `\r`, with no `\n` anywhere between them. `lines()` alone would glue
+/// every one of those, plus any ordinary `[level]`-tagged message that
+/// happens to land between two of them, into one single ever-growing line.
+///
+/// `on_line` is called once per split-out line: `true` for a bare-`\r`
+/// line (ephemeral -- see `PROGRESS_LINE_PREFIX`), `false` for an ordinary
+/// `\n`-terminated one (a real `\r\n` pair counts as this case too -- that's
+/// just a normal line ending, not ffmpeg asking for an overwrite). Returning
+/// `false` from `on_line` stops reading early (mirrors `Sender::send`
+/// failing because the receiver was dropped).
+pub(crate) fn stream_raw_lines(reader: impl Read, mut on_line: impl FnMut(String, bool) -> bool) {
+    let mut bytes = BufReader::new(reader).bytes().map_while(Result::ok);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut carry: Option<u8> = None;
+    while let Some(byte) = carry.take().or_else(|| bytes.next()) {
+        match byte {
+            b'\r' => match bytes.next() {
+                Some(b'\n') => {
+                    if !on_line(String::from_utf8_lossy(&buf).into_owned(), false) {
+                        return;
+                    }
+                    buf.clear();
+                }
+                Some(other) => {
+                    if !on_line(String::from_utf8_lossy(&buf).into_owned(), true) {
+                        return;
+                    }
+                    buf.clear();
+                    carry = Some(other);
+                }
+                None => {
+                    let _ = on_line(String::from_utf8_lossy(&buf).into_owned(), true);
+                    return;
+                }
+            },
+            b'\n' => {
+                if !on_line(String::from_utf8_lossy(&buf).into_owned(), false) {
+                    return;
+                }
+                buf.clear();
+            }
+            other => buf.push(other),
+        }
+    }
+    if !buf.is_empty() {
+        let _ = on_line(String::from_utf8_lossy(&buf).into_owned(), false);
+    }
+}
+
 fn run_args_inner(args: &[String], tx: &Sender<String>) -> Result<()> {
     let mut child = Command::new(binary("ffmpeg"))
         .args(LOGLEVEL_ARGS)
@@ -701,19 +769,17 @@ fn run_args_inner(args: &[String], tx: &Sender<String>) -> Result<()> {
 
     let tx_err = tx.clone();
     let err_thread = std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if tx_err.send(line).is_err() {
-                break;
-            }
-        }
+        stream_raw_lines(stderr, |line, ephemeral| {
+            let line = if ephemeral { format!("{PROGRESS_LINE_PREFIX}{line}") } else { line };
+            tx_err.send(line).is_ok()
+        });
     });
     let tx_out = tx.clone();
     let out_thread = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx_out.send(line).is_err() {
-                break;
-            }
-        }
+        stream_raw_lines(stdout, |line, ephemeral| {
+            let line = if ephemeral { format!("{PROGRESS_LINE_PREFIX}{line}") } else { line };
+            tx_out.send(line).is_ok()
+        });
     });
 
     let status = child.wait().context("failed to wait on ffmpeg")?;

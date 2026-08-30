@@ -700,6 +700,47 @@ fn classify_log_line_reads_back_the_loglevel_tag() {
     assert_eq!(ffmpeg::classify_log_line("ffmpeg exited with code 0"), None);
 }
 
+/// `stream_raw_lines` has to split on a bare `\r` the same as on `\n`
+/// (real ffmpeg output verified live to actually do this for its periodic
+/// progress reports -- see its own doc comment), but must NOT treat a real
+/// `\r\n` pair as two lines (that's just an ordinary line ending, not
+/// ffmpeg asking for an overwrite), and has to flush whatever's left in its
+/// buffer at EOF even with no trailing terminator at all.
+#[test]
+fn stream_raw_lines_splits_on_bare_cr_but_not_a_real_crlf_pair() {
+    let input = b"frame=1\rframe=2\rframe=3\nreal line\r\nanother real line\ntrailing, no terminator".to_vec();
+    let mut got: Vec<(String, bool)> = Vec::new();
+    ffmpeg::stream_raw_lines(std::io::Cursor::new(input), |line, ephemeral| {
+        got.push((line, ephemeral));
+        true
+    });
+    assert_eq!(
+        got,
+        vec![
+            ("frame=1".to_string(), true),
+            ("frame=2".to_string(), true),
+            ("frame=3".to_string(), false),
+            ("real line".to_string(), false),
+            ("another real line".to_string(), false),
+            ("trailing, no terminator".to_string(), false),
+        ]
+    );
+}
+
+/// Returning `false` from the callback (mirroring `Sender::send` failing
+/// because the receiver was dropped) should stop reading immediately,
+/// rather than continuing to scan the rest of the input.
+#[test]
+fn stream_raw_lines_stops_early_when_the_callback_returns_false() {
+    let input = b"one\ntwo\nthree\n".to_vec();
+    let mut got: Vec<String> = Vec::new();
+    ffmpeg::stream_raw_lines(std::io::Cursor::new(input), |line, _ephemeral| {
+        got.push(line);
+        got.len() < 2
+    });
+    assert_eq!(got, vec!["one".to_string(), "two".to_string()]);
+}
+
 /// A real ffplay status line (`"   12.34 A-V: -0.030 fd=..."`) should yield
 /// its leading time; any other line ffplay prints (banner/version info,
 /// the `Input #0 ...` block, blank fragments between two updates, etc.)

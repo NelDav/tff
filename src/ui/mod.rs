@@ -190,8 +190,18 @@ fn log_line_style(line: &str) -> Style {
 
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     let (start, end) = app.visible_log_range();
-    let lines: Vec<TextLine> =
-        app.log[start..end].iter().map(|l| TextLine::from(Span::styled(l.as_str(), log_line_style(l)))).collect();
+    let lines: Vec<TextLine> = app.log[start..end]
+        .iter()
+        .map(|l| {
+            // Strip the internal overwrite-in-place marker (see
+            // `ffmpeg::PROGRESS_LINE_PREFIX`'s doc comment) before display
+            // -- it's `poll_ffmpeg`'s own bookkeeping, never meant to be
+            // seen, and leaving it in would also throw off log_hscroll's
+            // column alignment against every other, unprefixed line.
+            let text = l.strip_prefix(crate::ffmpeg::PROGRESS_LINE_PREFIX).unwrap_or(l);
+            TextLine::from(Span::styled(text, log_line_style(text)))
+        })
+        .collect();
     let title = match (app.log_scroll.is_some(), app.log_hscroll > 0) {
         (true, true) => " log (scrolled -- PgDn/Ctrl+Left to catch up) ".to_string(),
         (true, false) => " log (scrolled -- PgDn to catch up) ".to_string(),

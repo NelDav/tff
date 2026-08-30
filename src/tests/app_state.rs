@@ -1866,6 +1866,74 @@ fn poll_ffmpeg_counts_tagged_error_lines_and_summarizes_them_in_the_status() {
     assert!(app.status.starts_with("ffmpeg exited with code"), "{}", app.status);
 }
 
+/// ffmpeg's periodic progress reports (`frame=... fps=... time=...`) are
+/// separated by a bare `\r`, not `\n` (see `ffmpeg::stream_raw_lines`'s doc
+/// comment) -- `poll_ffmpeg` has to fold every one of those into a single,
+/// continuously-overwritten log entry rather than letting them either (a)
+/// glue into one ever-growing line (the original bug report this whole
+/// feature started from) or (b) each become their own permanent line
+/// (correct-looking but floods the log over a long render). Forces several
+/// updates to actually happen within a real, short render via a tiny
+/// `-stats_period` (a real ffmpeg option, set directly through the output
+/// node's `extra_args` escape hatch -- see `output_extra_arg_keys`'s doc
+/// comment for why it isn't in the curated picker list, though the
+/// underlying data model accepts any key) combined with a slow-enough
+/// preset that the render can't finish before several of them land.
+#[test]
+fn poll_ffmpeg_folds_repeated_progress_updates_into_one_overwritten_line() {
+    use crate::app::App;
+
+    let dir = std::env::temp_dir().join(format!("tff-test-progress-fold-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source_path = make_test_source(&dir, 1, 1280, 720);
+    let out_path = dir.join("out.mkv");
+
+    let mut app = App::new();
+    let streams = ffmpeg::probe(source_path.to_str().unwrap()).unwrap().streams;
+    let id = app.graph.add_input(source_path.to_str().unwrap().to_string(), streams, Vec::new());
+    let convert = app.graph.add_modifier(ModifierKind::Convert(Codec::Encode("libx264".to_string())));
+    let out = app.graph.outputs[0].id;
+    app.graph.connect(Endpoint::Stream { node: id, stream_idx: 0 }, Target::ModifierIn(convert));
+    app.graph.connect(Endpoint::ModifierOut(convert), Target::Output(out));
+    app.graph.outputs[0].path = out_path.to_str().unwrap().to_string();
+    app.graph.outputs[0].extra_args = filter_fields(&[("preset", "veryslow"), ("stats_period", "0.05")]);
+
+    app.start_render();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.running && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.poll_ffmpeg();
+    }
+    assert!(!app.running, "render did not finish in time");
+    assert!(app.status.starts_with("ffmpeg exited with code 0"), "{}", app.status);
+
+    // The original bug: several `[info]`-tagged progress reports glued
+    // into one giant line with no separator at all.
+    assert!(
+        app.log.iter().all(|l| l.matches("frame=").count() <= 1),
+        "no single log line should contain more than one progress report: {:?}",
+        app.log
+    );
+    // The log-spam alternative to that bug: every progress update kept as
+    // its own permanent line instead of overwriting the last one.
+    let progress_lines = app.log.iter().filter(|l| l.contains("frame=")).count();
+    assert!(
+        progress_lines <= 3,
+        "expected repeated progress updates to overwrite one line, not accumulate ({progress_lines} found): {:?}",
+        app.log
+    );
+    // The overwrite marker is purely poll_ffmpeg's own bookkeeping (see
+    // `ffmpeg::PROGRESS_LINE_PREFIX`) -- `ui::draw_log` strips it for
+    // display, but nothing should scrub it out of the stored log itself.
+    assert!(
+        app.log.iter().any(|l| l.starts_with(crate::ffmpeg::PROGRESS_LINE_PREFIX)),
+        "expected at least one stored line to still carry the internal marker: {:?}",
+        app.log
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 'e' with a modifier focused should dispatch to the same thing
 /// `activate_modifier` does directly -- one key, "edit this node,"
 /// regardless of what kind of node is focused.
